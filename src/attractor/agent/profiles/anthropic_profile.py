@@ -81,6 +81,36 @@ class AnthropicProfile:
         """Return the 200K context window size for Claude."""
         return 200_000
 
+    @property
+    def supports_reasoning(self) -> bool:
+        """Return True — Claude supports extended thinking."""
+        return True
+
+    @property
+    def supports_streaming(self) -> bool:
+        """Return True — Claude supports streaming responses."""
+        return True
+
+    @property
+    def supports_parallel_tool_calls(self) -> bool:
+        """Return True — Claude supports parallel tool call execution."""
+        return True
+
+    def provider_options(self) -> dict | None:
+        """Return Anthropic-specific options including beta headers.
+
+        Returns:
+            Dict with beta headers for extended thinking and 128K output.
+        """
+        return {
+            "anthropic": {
+                "beta_headers": [
+                    "extended-thinking-2025-04-14",
+                    "output-128k-2025-02-19",
+                ],
+            },
+        }
+
     def get_tools(self) -> list[ToolDefinition]:
         """Return the tool definitions for this profile."""
         return list(self.tool_definitions)

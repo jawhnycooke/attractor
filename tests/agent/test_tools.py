@@ -1,9 +1,11 @@
-"""Tests for core tools against a temporary directory."""
+"""Tests for core tools and tool registry against a temporary directory."""
 
 import pytest
 
 from attractor.agent.environment import LocalExecutionEnvironment
 from attractor.agent.tools.core_tools import (
+    READ_FILE_DEF,
+    WRITE_FILE_DEF,
     edit_file,
     glob_tool,
     grep_tool,
@@ -11,6 +13,7 @@ from attractor.agent.tools.core_tools import (
     shell,
     write_file,
 )
+from attractor.agent.tools.registry import ToolRegistry
 
 
 @pytest.fixture
@@ -152,3 +155,44 @@ class TestGlob:
     async def test_glob_no_match(self, env, tmp_path) -> None:
         result = await glob_tool({"pattern": "*.rs"}, env)
         assert "No files matched" in result.output
+
+
+class TestToolRegistryUnregister:
+    def test_unregister_removes_tool(self) -> None:
+        registry = ToolRegistry()
+        registry.register("read_file", read_file, READ_FILE_DEF)
+        assert registry.has_tool("read_file")
+        assert any(d.name == "read_file" for d in registry.definitions())
+
+        registry.unregister("read_file")
+        assert not registry.has_tool("read_file")
+        assert all(d.name != "read_file" for d in registry.definitions())
+
+    def test_unregister_not_found_is_noop(self) -> None:
+        registry = ToolRegistry()
+        registry.register("write_file", write_file, WRITE_FILE_DEF)
+
+        # Should not raise
+        registry.unregister("nonexistent")
+        assert registry.has_tool("write_file")
+
+    def test_unregister_updates_definitions_and_names(self) -> None:
+        registry = ToolRegistry()
+        registry.register("read_file", read_file, READ_FILE_DEF)
+        registry.register("write_file", write_file, WRITE_FILE_DEF)
+        assert len(registry.definitions()) == 2
+        assert set(registry.tool_names()) == {"read_file", "write_file"}
+
+        registry.unregister("read_file")
+        assert len(registry.definitions()) == 1
+        assert registry.tool_names() == ["write_file"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_after_unregister_returns_error(self, env) -> None:
+        registry = ToolRegistry()
+        registry.register("read_file", read_file, READ_FILE_DEF)
+        registry.unregister("read_file")
+
+        result = await registry.dispatch("read_file", {"path": "x.txt"}, env)
+        assert result.is_error
+        assert "unknown tool" in result.output

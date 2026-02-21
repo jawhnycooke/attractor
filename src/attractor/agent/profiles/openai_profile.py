@@ -78,6 +78,33 @@ class OpenAIProfile:
         """Return the 128K context window size for GPT models."""
         return 128_000
 
+    @property
+    def supports_reasoning(self) -> bool:
+        """Return True — OpenAI reasoning models support reasoning."""
+        return True
+
+    @property
+    def supports_streaming(self) -> bool:
+        """Return True — OpenAI supports streaming responses."""
+        return True
+
+    @property
+    def supports_parallel_tool_calls(self) -> bool:
+        """Return True — OpenAI supports parallel tool call execution."""
+        return True
+
+    def provider_options(self) -> dict | None:
+        """Return OpenAI-specific options including reasoning config.
+
+        Returns:
+            Dict with reasoning effort configuration for reasoning models.
+        """
+        return {
+            "openai": {
+                "reasoning": {"effort": "medium"},
+            },
+        }
+
     def get_tools(self) -> list[ToolDefinition]:
         """Return the tool definitions for this profile."""
         return list(self.tool_definitions)

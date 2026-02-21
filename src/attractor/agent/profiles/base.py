@@ -15,7 +15,7 @@ class ProviderProfile(Protocol):
     that determines which tools are available and how the system prompt is
     structured.
 
-    Concrete implementations must provide all four properties. The
+    Concrete implementations must provide all properties. The
     ``get_tools`` and ``format_system_prompt`` methods have default
     implementations that can be overridden if needed.
     """
@@ -41,6 +41,30 @@ class ProviderProfile(Protocol):
     @property
     def context_window_size(self) -> int:
         """Maximum context window size in tokens for this profile."""
+        ...
+
+    @property
+    def supports_reasoning(self) -> bool:
+        """Whether the provider supports reasoning/thinking capabilities."""
+        ...
+
+    @property
+    def supports_streaming(self) -> bool:
+        """Whether the provider supports streaming responses."""
+        ...
+
+    @property
+    def supports_parallel_tool_calls(self) -> bool:
+        """Whether the provider supports parallel tool call execution."""
+        ...
+
+    def provider_options(self) -> dict | None:
+        """Return provider-specific configuration passed alongside requests.
+
+        Returns:
+            A dict of provider-specific options, or None if no special
+            options are needed.
+        """
         ...
 
     def get_tools(self) -> list[ToolDefinition]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -31,7 +32,7 @@ from attractor.agent.tools.core_tools import (
     write_file,
 )
 from attractor.agent.tools.apply_patch import APPLY_PATCH_DEF, apply_patch
-from attractor.agent.tools.registry import ToolRegistry
+from attractor.agent.tools.registry import ToolRegistry, ToolResult
 from attractor.agent.tools.subagent import (
     CLOSE_AGENT_DEF,
     SEND_INPUT_DEF,
@@ -43,6 +44,13 @@ from attractor.agent.tools.subagent import (
     wait_agent,
 )
 from attractor.agent.truncation import TruncationConfig
+from attractor.agent.turns import (
+    AssistantTurn,
+    SteeringTurn,
+    ToolResultsTurn,
+    Turn,
+    UserTurn,
+)
 from attractor.llm.models import Message, ReasoningEffort
 
 # ---------------------------------------------------------------------------
@@ -120,17 +128,20 @@ class Session:
         *,
         _depth: int = 0,
     ) -> None:
+        self.id: str = str(uuid.uuid4())
         self._profile = profile
         self._env = environment
         self._config = config
         self._llm = llm_client
         self._state = SessionState.IDLE
         self._history: list[Message] = []
+        self._turns: list[Turn] = []
         self._follow_up_queue: list[str] = []
         self._reasoning_effort = config.reasoning_effort
         self._registry = self._build_registry()
         self._loop_detector = LoopDetector()
         self._current_loop: AgentLoop | None = None
+        self._abort_event = asyncio.Event()
         self._depth = _depth
 
         # Install session factory on the environment for subagent spawning
@@ -165,6 +176,18 @@ class Session:
             _depth=self._depth + 1,
         )
 
+    def _event(
+        self,
+        event_type: AgentEventType,
+        data: dict[str, object] | None = None,
+    ) -> AgentEvent:
+        """Create an AgentEvent tagged with this session's ID."""
+        return AgentEvent(
+            type=event_type,
+            data=data or {},
+            session_id=self.id,
+        )
+
     @property
     def state(self) -> SessionState:
         """Current session lifecycle state."""
@@ -174,6 +197,11 @@ class Session:
     def conversation_history(self) -> list[Message]:
         """Snapshot of the conversation history (defensive copy)."""
         return list(self._history)
+
+    @property
+    def turns(self) -> list[Turn]:
+        """Snapshot of the typed turn history (defensive copy)."""
+        return list(self._turns)
 
     def _build_registry(self) -> ToolRegistry:
         """Wire up tool handlers based on the active profile."""
@@ -207,6 +235,10 @@ class Session:
 
         This is the main entry point. The session processes the input
         through the agentic loop, emitting events for every step.
+
+        Accepts submissions from IDLE or AWAITING_INPUT states.
+        AWAITING_INPUT → PROCESSING is the normal transition when the
+        user responds to a model question.
         """
         if self._state == SessionState.CLOSED:
             raise RuntimeError("Session is closed")
@@ -217,10 +249,7 @@ class Session:
         emitter = EventEmitter()
 
         emitter.emit(
-            AgentEvent(
-                type=AgentEventType.SESSION_START,
-                data={"state": self._state.value},
-            )
+            self._event(AgentEventType.SESSION_START, {"state": self._state.value})
         )
 
         loop_config = LoopConfig(
@@ -246,6 +275,7 @@ class Session:
             emitter=emitter,
             config=loop_config,
             loop_detector=self._loop_detector,
+            abort_event=self._abort_event,
         )
         self._current_loop = loop
 
@@ -256,35 +286,105 @@ class Session:
                 await loop.run(user_input, self._history)
 
                 # Process follow-up queue
-                while self._follow_up_queue:
+                while self._follow_up_queue and not self._abort_event.is_set():
                     follow_up = self._follow_up_queue.pop(0)
                     await loop.run(follow_up, self._history)
 
             except Exception as exc:
                 emitter.emit(
-                    AgentEvent(
-                        type=AgentEventType.ERROR,
-                        data={"error": str(exc), "phase": "session"},
+                    self._event(
+                        AgentEventType.ERROR,
+                        {"error": str(exc), "phase": "session"},
                     )
                 )
             finally:
-                self._state = SessionState.IDLE
                 self._current_loop = None
+
+                if self._abort_event.is_set():
+                    self._state = SessionState.CLOSED
+                elif self._follow_up_queue:
+                    # Follow-ups remain — stay IDLE for next submit
+                    self._state = SessionState.IDLE
+                else:
+                    # Natural completion with no follow-ups queued:
+                    # signal that the model is awaiting user input.
+                    self._state = SessionState.AWAITING_INPUT
+
                 emitter.emit(
-                    AgentEvent(
-                        type=AgentEventType.SESSION_END,
-                        data={"state": self._state.value},
+                    self._event(
+                        AgentEventType.SESSION_END,
+                        {"state": self._state.value},
                     )
                 )
                 emitter.close()
 
         task = asyncio.create_task(_run_loop())
 
+        pending_tool_results: list[ToolResult] = []
+
         async for event in emitter:
+            # Track typed turns from events
+            self._record_turn_from_event(event, pending_tool_results)
             yield event
+
+        # Flush any remaining tool results
+        if pending_tool_results:
+            self._turns.append(ToolResultsTurn(results=list(pending_tool_results)))
+            pending_tool_results.clear()
 
         # Ensure the task is fully done
         await task
+
+    def _record_turn_from_event(
+        self,
+        event: AgentEvent,
+        pending_tool_results: list[ToolResult],
+    ) -> None:
+        """Build typed Turn records from agent events.
+
+        Tool results are batched: TOOL_CALL_END events accumulate in
+        *pending_tool_results* until a non-tool event flushes them into
+        a single ToolResultsTurn.
+        """
+        # Tool-related events: accumulate results, skip non-terminal events
+        _TOOL_EVENTS = {
+            AgentEventType.TOOL_CALL_START,
+            AgentEventType.TOOL_CALL_OUTPUT_DELTA,
+            AgentEventType.TOOL_CALL_END,
+        }
+
+        if event.type == AgentEventType.TOOL_CALL_END:
+            pending_tool_results.append(
+                ToolResult(
+                    output=event.data.get("output", ""),
+                    is_error=bool(event.data.get("is_error", False)),
+                    full_output=event.data.get("full_output", ""),
+                )
+            )
+            return
+
+        if event.type in _TOOL_EVENTS:
+            return
+
+        # Flush pending tool results on any non-tool event
+        if pending_tool_results:
+            self._turns.append(
+                ToolResultsTurn(results=list(pending_tool_results))
+            )
+            pending_tool_results.clear()
+
+        if event.type == AgentEventType.USER_INPUT:
+            self._turns.append(
+                UserTurn(content=event.data.get("text", ""))
+            )
+        elif event.type == AgentEventType.ASSISTANT_TEXT_END:
+            self._turns.append(
+                AssistantTurn(content=event.data.get("text", ""))
+            )
+        elif event.type == AgentEventType.STEERING_INJECTED:
+            self._turns.append(
+                SteeringTurn(content=event.data.get("text", ""))
+            )
 
     def steer(self, message: str) -> None:
         """Queue a steering message to inject after the current tool round.
@@ -305,6 +405,17 @@ class Session:
     def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
         """Change reasoning effort for the next LLM call."""
         self._reasoning_effort = effort
+
+    def abort(self) -> None:
+        """Abort the session: cancel the running loop and transition to CLOSED.
+
+        Sets the abort event so the loop exits at the next check point.
+        If the session is not currently processing, the state transitions
+        to CLOSED immediately.
+        """
+        self._abort_event.set()
+        if self._state != SessionState.PROCESSING:
+            self._state = SessionState.CLOSED
 
     async def shutdown(self) -> None:
         """Graceful shutdown — close environment and mark session closed."""

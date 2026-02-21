@@ -1,9 +1,11 @@
 """Tests for Session lifecycle with a mocked LLM client."""
 
+import uuid
+
 import pytest
 
 from attractor.agent.environment import LocalExecutionEnvironment
-from attractor.agent.events import AgentEventType
+from attractor.agent.events import AgentEvent, AgentEventType
 from attractor.agent.profiles.anthropic_profile import AnthropicProfile
 from attractor.agent.session import Session, SessionConfig, SessionState
 from attractor.llm.models import (
@@ -140,7 +142,8 @@ class TestSessionLifecycle:
         async for _ in session.submit("test"):
             pass
 
-        assert session.state == SessionState.IDLE
+        # After natural completion with no follow-ups, session awaits input
+        assert session.state == SessionState.AWAITING_INPUT
 
         await session.shutdown()
         assert session.state == SessionState.CLOSED
@@ -205,8 +208,8 @@ class TestSessionLifecycle:
         assert any("Do this next" in t for t in second_request_texts)
 
     @pytest.mark.asyncio
-    async def test_awaiting_input_state_transition(self, env) -> None:
-        """Submitting from AWAITING_INPUT should transition through PROCESSING back to IDLE."""
+    async def test_awaiting_input_to_processing_transition(self, env) -> None:
+        """Submitting from AWAITING_INPUT should transition through PROCESSING."""
         client = MockLLMClient([_text_response("ok")])
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
@@ -216,13 +219,13 @@ class TestSessionLifecycle:
         assert session.state == SessionState.AWAITING_INPUT
 
         # Submitting input from AWAITING_INPUT should transition to PROCESSING
-        # and eventually back to IDLE after completion
+        # and then to AWAITING_INPUT again after natural completion
         observed_states: list[SessionState] = []
         async for _ in session.submit("user answer"):
             observed_states.append(session.state)
 
         assert SessionState.PROCESSING in observed_states
-        assert session.state == SessionState.IDLE
+        assert session.state == SessionState.AWAITING_INPUT
 
     @pytest.mark.asyncio
     async def test_processing_state_during_execution(self, env) -> None:
@@ -239,13 +242,11 @@ class TestSessionLifecycle:
         # During execution we should have seen PROCESSING at some point
         # (the SESSION_START event fires right after state = PROCESSING)
         assert SessionState.PROCESSING in observed_states
-        # After completion, state should be IDLE
-        assert session.state == SessionState.IDLE
+        # After natural completion, state is AWAITING_INPUT
+        assert session.state == SessionState.AWAITING_INPUT
 
     @pytest.mark.asyncio
     async def test_set_reasoning_effort(self, env) -> None:
-        from attractor.llm.models import ReasoningEffort
-
         captured_requests: list[Request] = []
 
         class CapturingClient(MockLLMClient):
@@ -264,3 +265,211 @@ class TestSessionLifecycle:
         # Verify reasoning_effort was passed through to the LLM request
         assert len(captured_requests) == 1
         assert captured_requests[0].reasoning_effort == ReasoningEffort.HIGH
+
+
+class TestSessionId:
+    @pytest.mark.asyncio
+    async def test_session_id_is_valid_uuid(self, env) -> None:
+        """Session.id should be a valid UUID4 string assigned at creation."""
+        client = MockLLMClient()
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        # Should not raise — confirms it is a valid UUID
+        parsed = uuid.UUID(session.id)
+        assert str(parsed) == session.id
+        assert parsed.version == 4
+
+    @pytest.mark.asyncio
+    async def test_session_id_unique_per_session(self, env) -> None:
+        """Each session should get a distinct UUID."""
+        client = MockLLMClient()
+        config = SessionConfig(model_id="test-model")
+        s1 = Session(AnthropicProfile(), env, config, client)
+        s2 = Session(AnthropicProfile(), env, config, client)
+
+        assert s1.id != s2.id
+
+    @pytest.mark.asyncio
+    async def test_session_id_in_emitted_events(self, env) -> None:
+        """All events emitted by Session should carry the session's ID."""
+        client = MockLLMClient([_text_response("Hello!")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        events: list[AgentEvent] = []
+        async for event in session.submit("Hi"):
+            events.append(event)
+
+        # SESSION_START and SESSION_END are emitted by Session._event()
+        session_events = [
+            e
+            for e in events
+            if e.type in (AgentEventType.SESSION_START, AgentEventType.SESSION_END)
+        ]
+        assert len(session_events) == 2
+        for event in session_events:
+            assert event.session_id == session.id
+
+
+class TestAwaitingInput:
+    @pytest.mark.asyncio
+    async def test_natural_completion_transitions_to_awaiting_input(self, env) -> None:
+        """After a text-only response with no follow-ups, state should be AWAITING_INPUT."""
+        client = MockLLMClient([_text_response("What would you like me to do?")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        async for _ in session.submit("Help me"):
+            pass
+
+        assert session.state == SessionState.AWAITING_INPUT
+
+    @pytest.mark.asyncio
+    async def test_awaiting_input_to_processing_on_submit(self, env) -> None:
+        """Submitting from AWAITING_INPUT should go through PROCESSING."""
+        client = MockLLMClient(
+            [_text_response("What file?"), _text_response("Done.")]
+        )
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        # First submit → ends in AWAITING_INPUT
+        async for _ in session.submit("Help"):
+            pass
+        assert session.state == SessionState.AWAITING_INPUT
+
+        # Second submit from AWAITING_INPUT
+        observed_states: list[SessionState] = []
+        async for _ in session.submit("auth.py"):
+            observed_states.append(session.state)
+
+        assert SessionState.PROCESSING in observed_states
+        # Ends in AWAITING_INPUT again (natural completion, no follow-ups)
+        assert session.state == SessionState.AWAITING_INPUT
+
+    @pytest.mark.asyncio
+    async def test_session_end_event_contains_awaiting_input_state(self, env) -> None:
+        """SESSION_END event data should reflect the AWAITING_INPUT state."""
+        client = MockLLMClient([_text_response("ok")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        events: list[AgentEvent] = []
+        async for event in session.submit("test"):
+            events.append(event)
+
+        end_events = [e for e in events if e.type == AgentEventType.SESSION_END]
+        assert len(end_events) == 1
+        assert end_events[0].data["state"] == SessionState.AWAITING_INPUT.value
+
+
+class TestAbort:
+    @pytest.mark.asyncio
+    async def test_abort_when_idle_sets_closed(self, env) -> None:
+        """Calling abort() on an idle session transitions to CLOSED."""
+        client = MockLLMClient()
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        assert session.state == SessionState.IDLE
+        session.abort()
+        assert session.state == SessionState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_abort_when_awaiting_input_sets_closed(self, env) -> None:
+        """Calling abort() from AWAITING_INPUT transitions to CLOSED."""
+        client = MockLLMClient([_text_response("ok")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        async for _ in session.submit("test"):
+            pass
+        assert session.state == SessionState.AWAITING_INPUT
+
+        session.abort()
+        assert session.state == SessionState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_abort_prevents_submit_after(self, env) -> None:
+        """After abort(), subsequent submit() calls raise RuntimeError."""
+        client = MockLLMClient()
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        session.abort()
+        with pytest.raises(RuntimeError, match="closed"):
+            async for _ in session.submit("test"):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_abort_during_processing_sets_closed(self, env) -> None:
+        """Calling abort() while processing should result in CLOSED after the loop finishes."""
+        import asyncio
+
+        abort_triggered = False
+
+        class AbortableClient(MockLLMClient):
+            """Client that yields to the event loop before returning."""
+
+            async def complete(self, request: Request) -> Response:
+                nonlocal abort_triggered
+                # Yield control so abort() can be called
+                await asyncio.sleep(0)
+                if abort_triggered:
+                    # Simulate the loop noticing abort and wrapping up
+                    return _text_response("wrapping up")
+                abort_triggered = True
+                return _text_response("first response")
+
+        client = AbortableClient()
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        events: list[AgentEvent] = []
+
+        async def _consume() -> None:
+            async for event in session.submit("Run something"):
+                events.append(event)
+                if event.type == AgentEventType.ASSISTANT_TEXT_END:
+                    # Abort after first text response arrives
+                    session.abort()
+
+        task = asyncio.create_task(_consume())
+        await asyncio.wait_for(task, timeout=3.0)
+
+        assert session.state == SessionState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_abort_skips_follow_ups(self, env) -> None:
+        """Abort during processing should skip queued follow-ups."""
+        import asyncio
+
+        class SlowClient(MockLLMClient):
+            async def complete(self, request: Request) -> Response:
+                # Simulate a slow first response
+                await asyncio.sleep(0.05)
+                return _text_response("first done")
+
+        client = SlowClient()
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+        session.follow_up("follow-up task")
+
+        events: list[AgentEvent] = []
+
+        async def _consume() -> None:
+            async for event in session.submit("Start"):
+                events.append(event)
+
+        task = asyncio.create_task(_consume())
+
+        # Wait for first LLM call to start, then abort
+        await asyncio.sleep(0.02)
+        session.abort()
+        await asyncio.wait_for(task, timeout=3.0)
+
+        assert session.state == SessionState.CLOSED
+        # The follow-up's text should NOT have been processed
+        text_ends = [e for e in events if e.type == AgentEventType.ASSISTANT_TEXT_END]
+        assert len(text_ends) == 1

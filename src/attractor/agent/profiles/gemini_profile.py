@@ -98,6 +98,33 @@ class GeminiProfile:
         """Return the 1M context window size for Gemini models."""
         return 1_000_000
 
+    @property
+    def supports_reasoning(self) -> bool:
+        """Return True — Gemini supports thinking capabilities."""
+        return True
+
+    @property
+    def supports_streaming(self) -> bool:
+        """Return True — Gemini supports streaming responses."""
+        return True
+
+    @property
+    def supports_parallel_tool_calls(self) -> bool:
+        """Return True — Gemini supports parallel tool call execution."""
+        return True
+
+    def provider_options(self) -> dict | None:
+        """Return Gemini-specific options including safety settings.
+
+        Returns:
+            Dict with safety settings configuration for Gemini models.
+        """
+        return {
+            "gemini": {
+                "safety_settings": [],
+            },
+        }
+
     def get_tools(self) -> list[ToolDefinition]:
         """Return the tool definitions for this profile."""
         return list(self.tool_definitions)

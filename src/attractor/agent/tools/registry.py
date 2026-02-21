@@ -67,6 +67,17 @@ class ToolRegistry:
         self._handlers[name] = handler
         self._definitions[name] = definition
 
+    def unregister(self, name: str) -> None:
+        """Remove a tool by name.
+
+        No-op if the name is not found.
+
+        Args:
+            name: The tool name to remove.
+        """
+        self._handlers.pop(name, None)
+        self._definitions.pop(name, None)
+
     async def dispatch(
         self,
         name: str,

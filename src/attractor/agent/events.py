@@ -41,11 +41,13 @@ class AgentEvent:
         type: The kind of event.
         data: Event payload — contents vary by event type.
         timestamp: Unix timestamp when the event was created.
+        session_id: UUID of the session that emitted this event.
     """
 
     type: AgentEventType
     data: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
+    session_id: str = ""
 
 
 _SENTINEL = object()

@@ -108,6 +108,7 @@ class AgentLoop:
         emitter: EventEmitter,
         config: LoopConfig,
         loop_detector: LoopDetector,
+        abort_event: asyncio.Event | None = None,
     ) -> None:
         self._profile = profile
         self._env = environment
@@ -116,6 +117,7 @@ class AgentLoop:
         self._emitter = emitter
         self._config = config
         self._detector = loop_detector
+        self._abort_event = abort_event
         self._steering_queue: list[str] = []
         self._total_turns: int = 0
 
@@ -152,12 +154,17 @@ class AgentLoop:
         if validation_error:
             return validation_error, validation_error, True
 
-        # Enforce max_command_timeout_ms ceiling on shell tool
-        if tc.tool_name == "shell" and "timeout_ms" in tc.arguments:
-            tc.arguments["timeout_ms"] = min(
-                tc.arguments["timeout_ms"],
-                self._config.max_command_timeout_ms,
-            )
+        # Apply default/ceiling timeout for shell tool
+        if tc.tool_name == "shell":
+            if "timeout_ms" not in tc.arguments:
+                tc.arguments["timeout_ms"] = (
+                    self._config.default_command_timeout_ms
+                )
+            else:
+                tc.arguments["timeout_ms"] = min(
+                    tc.arguments["timeout_ms"],
+                    self._config.max_command_timeout_ms,
+                )
 
         result = await self._registry.dispatch(
             tc.tool_name, tc.arguments, self._env
@@ -179,6 +186,10 @@ class AgentLoop:
         self, tool_name: str, arguments: dict[str, Any]
     ) -> str | None:
         """Validate tool arguments against the tool's JSON schema.
+
+        Validates required fields, types, enums, patterns, string length
+        constraints, numeric range constraints, array item types, and
+        nested object schemas.
 
         Returns an error message string if validation fails, None if valid.
         """
@@ -202,15 +213,110 @@ class AgentLoop:
 
         for field_name, value in arguments.items():
             if field_name in properties:
-                expected_type = properties[field_name].get("type")
-                if expected_type and not self._check_json_type(
-                    value, expected_type
-                ):
+                prop_schema = properties[field_name]
+                error = self._validate_value(
+                    value, prop_schema, field_name, tool_name
+                )
+                if error:
+                    return error
+
+        return None
+
+    def _validate_value(
+        self,
+        value: Any,
+        schema: dict[str, Any],
+        field_name: str,
+        tool_name: str,
+    ) -> str | None:
+        """Validate a single value against its JSON schema property.
+
+        Checks type, enum, pattern, minLength/maxLength, minimum/maximum,
+        array items, and nested object properties.
+
+        Returns an error message string if validation fails, None if valid.
+        """
+        expected_type = schema.get("type")
+        if expected_type and not self._check_json_type(value, expected_type):
+            return (
+                f"Argument '{field_name}' for tool '{tool_name}' "
+                f"expected type '{expected_type}', got "
+                f"'{type(value).__name__}'"
+            )
+
+        # Enum validation
+        if "enum" in schema and value not in schema["enum"]:
+            return (
+                f"Argument '{field_name}' for tool '{tool_name}' "
+                f"must be one of {schema['enum']}, got '{value}'"
+            )
+
+        # String-specific constraints
+        if isinstance(value, str):
+            import re
+
+            if "pattern" in schema:
+                if not re.search(schema["pattern"], value):
                     return (
                         f"Argument '{field_name}' for tool '{tool_name}' "
-                        f"expected type '{expected_type}', got "
-                        f"'{type(value).__name__}'"
+                        f"does not match pattern '{schema['pattern']}'"
                     )
+            if "minLength" in schema and len(value) < schema["minLength"]:
+                return (
+                    f"Argument '{field_name}' for tool '{tool_name}' "
+                    f"length {len(value)} is below minimum "
+                    f"{schema['minLength']}"
+                )
+            if "maxLength" in schema and len(value) > schema["maxLength"]:
+                return (
+                    f"Argument '{field_name}' for tool '{tool_name}' "
+                    f"length {len(value)} exceeds maximum "
+                    f"{schema['maxLength']}"
+                )
+
+        # Numeric constraints
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if "minimum" in schema and value < schema["minimum"]:
+                return (
+                    f"Argument '{field_name}' for tool '{tool_name}' "
+                    f"value {value} is below minimum {schema['minimum']}"
+                )
+            if "maximum" in schema and value > schema["maximum"]:
+                return (
+                    f"Argument '{field_name}' for tool '{tool_name}' "
+                    f"value {value} exceeds maximum {schema['maximum']}"
+                )
+
+        # Array item type validation
+        if isinstance(value, list) and "items" in schema:
+            items_schema = schema["items"]
+            for i, item in enumerate(value):
+                item_error = self._validate_value(
+                    item, items_schema, f"{field_name}[{i}]", tool_name
+                )
+                if item_error:
+                    return item_error
+
+        # Nested object validation
+        if isinstance(value, dict) and "properties" in schema:
+            nested_required = schema.get("required", [])
+            nested_props = schema["properties"]
+            for req_field in nested_required:
+                if req_field not in value:
+                    return (
+                        f"Missing required field '{req_field}' in "
+                        f"'{field_name}' for tool '{tool_name}'"
+                    )
+            for nested_key, nested_val in value.items():
+                if nested_key in nested_props:
+                    nested_error = self._validate_value(
+                        nested_val,
+                        nested_props[nested_key],
+                        f"{field_name}.{nested_key}",
+                        tool_name,
+                    )
+                    if nested_error:
+                        return nested_error
 
         return None
 
@@ -277,6 +383,16 @@ class AgentLoop:
 
         tool_round = 0
         while True:
+            # Check abort signal
+            if self._abort_event and self._abort_event.is_set():
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.ERROR,
+                        data={"error": "Aborted", "phase": "abort"},
+                    )
+                )
+                return
+
             # Check total turn limit (across all inputs in the session)
             if (
                 self._config.max_turns is not None
@@ -412,8 +528,8 @@ class AgentLoop:
                         data={
                             "tool_name": tc.tool_name,
                             "tool_call_id": tc.tool_call_id,
-                            "output": truncated,
-                            "full_output": full,
+                            "output": full,
+                            "truncated_output": truncated,
                             "is_error": is_error,
                         },
                     )
@@ -451,5 +567,15 @@ class AgentLoop:
                     )
                     # Inject the warning as a user message so the model sees it
                     history.append(Message.user(f"[SYSTEM WARNING] {warning}"))
+
+            # Check abort signal after tool execution
+            if self._abort_event and self._abort_event.is_set():
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.ERROR,
+                        data={"error": "Aborted", "phase": "abort"},
+                    )
+                )
+                return
 
             tool_round += 1
