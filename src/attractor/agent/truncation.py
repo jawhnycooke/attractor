@@ -13,10 +13,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class TruncationConfig:
@@ -26,22 +26,26 @@ class TruncationConfig:
     """
 
     # Stage 1 — character limits
-    char_limits: dict[str, int] = field(default_factory=lambda: {
-        "read_file": 50_000,
-        "shell": 30_000,
-        "grep": 20_000,
-        "glob": 20_000,
-        "edit_file": 10_000,
-        "apply_patch": 10_000,
-        "write_file": 1_000,
-    })
+    char_limits: dict[str, int] = field(
+        default_factory=lambda: {
+            "read_file": 50_000,
+            "shell": 30_000,
+            "grep": 20_000,
+            "glob": 20_000,
+            "edit_file": 10_000,
+            "apply_patch": 10_000,
+            "write_file": 1_000,
+        }
+    )
 
     # Stage 2 — line limits (0 means skip this stage)
-    line_limits: dict[str, int] = field(default_factory=lambda: {
-        "shell": 256,
-        "grep": 200,
-        "glob": 500,
-    })
+    line_limits: dict[str, int] = field(
+        default_factory=lambda: {
+            "shell": 256,
+            "grep": 200,
+            "glob": 500,
+        }
+    )
 
 
 _DEFAULT_CONFIG = TruncationConfig()
@@ -50,6 +54,7 @@ _DEFAULT_CONFIG = TruncationConfig()
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _truncate_chars(text: str, max_chars: int) -> str:
     """Truncate *text* by characters, keeping head and tail."""
@@ -87,6 +92,7 @@ def _truncate_lines(text: str, max_lines: int) -> str:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def truncate_output(
     tool_name: str,

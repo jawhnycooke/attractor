@@ -12,10 +12,10 @@ from attractor.agent.environment import ExecutionEnvironment
 from attractor.agent.tools.registry import ToolResult
 from attractor.llm.models import ToolDefinition
 
-
 # ---------------------------------------------------------------------------
 # read_file
 # ---------------------------------------------------------------------------
+
 
 async def read_file(
     arguments: dict[str, Any],
@@ -73,6 +73,7 @@ READ_FILE_DEF = ToolDefinition(
 # write_file
 # ---------------------------------------------------------------------------
 
+
 async def write_file(
     arguments: dict[str, Any],
     environment: ExecutionEnvironment,
@@ -115,6 +116,7 @@ WRITE_FILE_DEF = ToolDefinition(
 # edit_file
 # ---------------------------------------------------------------------------
 
+
 async def edit_file(
     arguments: dict[str, Any],
     environment: ExecutionEnvironment,
@@ -140,7 +142,7 @@ async def edit_file(
             # Line format: "     1\tcontent"
             tab_idx = line.find("\t")
             if tab_idx != -1:
-                content_lines.append(line[tab_idx + 1:])
+                content_lines.append(line[tab_idx + 1 :])
             else:
                 content_lines.append(line)
         content = "".join(content_lines)
@@ -201,6 +203,7 @@ EDIT_FILE_DEF = ToolDefinition(
 # shell
 # ---------------------------------------------------------------------------
 
+
 async def shell(
     arguments: dict[str, Any],
     environment: ExecutionEnvironment,
@@ -227,9 +230,7 @@ async def shell(
 
 SHELL_DEF = ToolDefinition(
     name="shell",
-    description=(
-        "Execute a shell command. Returns stdout, stderr, and exit code."
-    ),
+    description=("Execute a shell command. Returns stdout, stderr, and exit code."),
     parameters={
         "type": "object",
         "properties": {
@@ -250,6 +251,7 @@ SHELL_DEF = ToolDefinition(
 # ---------------------------------------------------------------------------
 # grep
 # ---------------------------------------------------------------------------
+
 
 async def grep_tool(
     arguments: dict[str, Any],
@@ -308,6 +310,7 @@ GREP_DEF = ToolDefinition(
 # ---------------------------------------------------------------------------
 # glob
 # ---------------------------------------------------------------------------
+
 
 async def glob_tool(
     arguments: dict[str, Any],

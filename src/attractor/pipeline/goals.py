@@ -8,7 +8,6 @@ the engine is allowed to exit through a terminal node.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from attractor.pipeline.conditions import evaluate_condition
 from attractor.pipeline.models import PipelineContext

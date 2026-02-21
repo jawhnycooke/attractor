@@ -91,37 +91,37 @@ class ModelStylesheet:
         """
         rules: list[StyleRule] = []
         for entry in data.get("rules", []):
-            rules.append(StyleRule(
-                handler_type=entry.get("handler_type"),
-                name_pattern=entry.get("name_pattern"),
-                match_attributes=entry.get("match_attributes", {}),
-                model=entry.get("model"),
-                temperature=entry.get("temperature"),
-                max_tokens=entry.get("max_tokens"),
-                timeout=entry.get("timeout"),
-                retry_count=entry.get("retry_count"),
-                extra={
-                    k: v
-                    for k, v in entry.items()
-                    if k
-                    not in {
-                        "handler_type",
-                        "name_pattern",
-                        "match_attributes",
-                        "model",
-                        "temperature",
-                        "max_tokens",
-                        "timeout",
-                        "retry_count",
-                    }
-                },
-            ))
+            rules.append(
+                StyleRule(
+                    handler_type=entry.get("handler_type"),
+                    name_pattern=entry.get("name_pattern"),
+                    match_attributes=entry.get("match_attributes", {}),
+                    model=entry.get("model"),
+                    temperature=entry.get("temperature"),
+                    max_tokens=entry.get("max_tokens"),
+                    timeout=entry.get("timeout"),
+                    retry_count=entry.get("retry_count"),
+                    extra={
+                        k: v
+                        for k, v in entry.items()
+                        if k
+                        not in {
+                            "handler_type",
+                            "name_pattern",
+                            "match_attributes",
+                            "model",
+                            "temperature",
+                            "max_tokens",
+                            "timeout",
+                            "retry_count",
+                        }
+                    },
+                )
+            )
         return cls(rules=rules)
 
 
-def apply_stylesheet(
-    stylesheet: ModelStylesheet, node: PipelineNode
-) -> dict[str, Any]:
+def apply_stylesheet(stylesheet: ModelStylesheet, node: PipelineNode) -> dict[str, Any]:
     """Resolve final attributes for *node* by layering stylesheet defaults.
 
     Evaluation order:

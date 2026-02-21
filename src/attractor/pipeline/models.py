@@ -111,40 +111,104 @@ class PipelineContext:
     Acts as the "blackboard" that nodes read from and write to.
     Supports scoped sub-contexts for parallel branch isolation and
     JSON serialization for checkpointing.
+
+    Data is stored privately in ``_data``.  Use the accessor methods
+    (:meth:`get`, :meth:`set`, :meth:`has`, :meth:`delete`,
+    :meth:`to_dict`, :meth:`update`) to interact with the store.
     """
 
-    data: dict[str, Any] = field(default_factory=dict)
+    _data: dict[str, Any] = field(default_factory=dict)
 
     def get(self, key: str, default: Any = None) -> Any:
-        return self.data.get(key, default)
+        """Return the value for *key*, or *default* if absent.
+
+        Args:
+            key: The context key to look up.
+            default: Value returned when *key* is not present.
+
+        Returns:
+            The stored value or *default*.
+        """
+        return self._data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
-        self.data[key] = value
+        """Store *value* under *key*.
+
+        Args:
+            key: The context key.
+            value: The value to store.
+        """
+        self._data[key] = value
 
     def has(self, key: str) -> bool:
-        return key in self.data
+        """Return ``True`` if *key* exists in the context.
+
+        Args:
+            key: The context key to check.
+
+        Returns:
+            Whether the key is present.
+        """
+        return key in self._data
 
     def delete(self, key: str) -> None:
-        self.data.pop(key, None)
+        """Remove *key* from the context if present.
+
+        Args:
+            key: The context key to remove.
+        """
+        self._data.pop(key, None)
 
     def to_dict(self) -> dict[str, Any]:
-        return dict(self.data)
+        """Return a shallow copy of all context data.
+
+        Returns:
+            A new ``dict`` with all key-value pairs.
+        """
+        return dict(self._data)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PipelineContext:
-        return cls(data=dict(data))
+        """Create a context from an existing dictionary.
+
+        Args:
+            data: Initial key-value pairs.
+
+        Returns:
+            A new :class:`PipelineContext` populated with *data*.
+        """
+        ctx = cls()
+        ctx._data = dict(data)
+        return ctx
 
     def create_scope(self, prefix: str) -> PipelineContext:
-        """Create a child context whose keys are prefixed on merge-back."""
+        """Create a child context whose keys are prefixed on merge-back.
+
+        Args:
+            prefix: The prefix applied when merging back.
+
+        Returns:
+            A new empty :class:`PipelineContext`.
+        """
         return PipelineContext()
 
     def merge_scope(self, scope: PipelineContext, prefix: str) -> None:
-        """Merge a scoped context back, prefixing its keys."""
-        for key, value in scope.data.items():
-            self.data[f"{prefix}.{key}"] = value
+        """Merge a scoped context back, prefixing its keys.
+
+        Args:
+            scope: The child context to merge.
+            prefix: Prefix prepended to each key.
+        """
+        for key, value in scope._data.items():
+            self._data[f"{prefix}.{key}"] = value
 
     def update(self, updates: dict[str, Any]) -> None:
-        self.data.update(updates)
+        """Merge *updates* into the context.
+
+        Args:
+            updates: Key-value pairs to merge.
+        """
+        self._data.update(updates)
 
 
 @dataclass
@@ -166,6 +230,11 @@ class Checkpoint:
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the checkpoint to a plain dictionary.
+
+        Returns:
+            A JSON-compatible ``dict`` representing this checkpoint.
+        """
         return {
             "pipeline_name": self.pipeline_name,
             "current_node": self.current_node,
@@ -176,6 +245,15 @@ class Checkpoint:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Checkpoint:
+        """Reconstruct a checkpoint from a dictionary.
+
+        Args:
+            data: Dictionary with checkpoint fields (as produced by
+                :meth:`to_dict`).
+
+        Returns:
+            A new :class:`Checkpoint` instance.
+        """
         return cls(
             pipeline_name=data["pipeline_name"],
             current_node=data["current_node"],
@@ -185,10 +263,24 @@ class Checkpoint:
         )
 
     def save_to_file(self, path: str | Path) -> None:
+        """Write this checkpoint to a JSON file.
+
+        Args:
+            path: Destination file path.  Parent directories are
+                created automatically.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2))
 
     @classmethod
     def load_from_file(cls, path: str | Path) -> Checkpoint:
+        """Load a checkpoint from a JSON file.
+
+        Args:
+            path: Path to the checkpoint file.
+
+        Returns:
+            A new :class:`Checkpoint` instance.
+        """
         return cls.from_dict(json.loads(Path(path).read_text()))

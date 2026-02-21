@@ -7,11 +7,15 @@ so the agent loop can continue gracefully.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable
+from typing import Any
 
-from attractor.llm.models import ToolDefinition
 from attractor.agent.environment import ExecutionEnvironment
+from attractor.llm.models import ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,7 +57,13 @@ class ToolRegistry:
         handler: ToolHandler,
         definition: ToolDefinition,
     ) -> None:
-        """Register a tool handler and its definition."""
+        """Register a tool handler and its definition.
+
+        Args:
+            name: The tool name used for dispatch.
+            handler: Async callable implementing the tool.
+            definition: JSON-schema definition sent to the LLM.
+        """
         self._handlers[name] = handler
         self._definitions[name] = definition
 
@@ -77,6 +87,7 @@ class ToolRegistry:
         try:
             return await handler(arguments=arguments, environment=environment)
         except Exception as exc:
+            logger.exception("Unhandled exception in tool '%s'", name)
             error_msg = f"Error executing tool '{name}': {exc}"
             return ToolResult(
                 output=error_msg,
@@ -89,7 +100,9 @@ class ToolRegistry:
         return list(self._definitions.values())
 
     def has_tool(self, name: str) -> bool:
+        """Return True if a tool with *name* is registered."""
         return name in self._handlers
 
     def tool_names(self) -> list[str]:
+        """Return the names of all registered tools."""
         return list(self._handlers.keys())

@@ -7,7 +7,10 @@ Response, handling partial tool call assembly and token usage tracking.
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import Any
 
 from attractor.llm.models import (
     ContentPart,
@@ -21,6 +24,8 @@ from attractor.llm.models import (
     ToolCallContent,
     TokenUsage,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,7 +43,7 @@ class StreamCollector:
     finish_reason: FinishReason = FinishReason.STOP
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = ""
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def process_event(self, event: StreamEvent) -> None:
         """Process a single stream event."""
@@ -62,8 +67,8 @@ class StreamCollector:
                 if tc.arguments_json and not tc.arguments:
                     try:
                         tc.arguments = json.loads(tc.arguments_json)
-                    except json.JSONDecodeError:
-                        pass
+                    except json.JSONDecodeError as exc:
+                        logger.warning("Failed to parse tool call arguments: %s", exc)
                 self.tool_calls.append(tc)
                 self._pending_tool = None
             elif self._pending_tool:
@@ -72,8 +77,8 @@ class StreamCollector:
                         self._pending_tool.arguments = json.loads(
                             self._pending_tool.arguments_json
                         )
-                    except json.JSONDecodeError:
-                        pass
+                    except json.JSONDecodeError as exc:
+                        logger.warning("Failed to parse tool call arguments: %s", exc)
                 self.tool_calls.append(self._pending_tool)
                 self._pending_tool = None
 
@@ -120,7 +125,7 @@ class StreamCollector:
             metadata=self.metadata,
         )
 
-    async def collect(self, stream) -> Response:
+    async def collect(self, stream: AsyncIterator[StreamEvent]) -> Response:
         """Consume an entire async stream and return the assembled Response."""
         async for event in stream:
             self.process_event(event)

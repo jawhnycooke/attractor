@@ -51,9 +51,22 @@ class GeminiAdapter:
         self._client = genai.Client(api_key=self._api_key)
 
     def provider_name(self) -> str:
+        """Return the canonical provider name.
+
+        Returns:
+            The string ``"gemini"``.
+        """
         return "gemini"
 
     def detect_model(self, model: str) -> bool:
+        """Check whether *model* belongs to this provider.
+
+        Args:
+            model: Model identifier string (e.g. ``"gemini-2.0-flash"``).
+
+        Returns:
+            True if the model string starts with ``"gemini-"``.
+        """
         return model.startswith("gemini-")
 
     # -----------------------------------------------------------------
@@ -64,14 +77,20 @@ class GeminiAdapter:
         contents: list[dict[str, Any]] = []
 
         if request.system_prompt:
-            contents.append({
-                "role": "user",
-                "parts": [{"text": f"[System Instructions]\n{request.system_prompt}"}],
-            })
-            contents.append({
-                "role": "model",
-                "parts": [{"text": "Understood."}],
-            })
+            contents.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": f"[System Instructions]\n{request.system_prompt}"}
+                    ],
+                }
+            )
+            contents.append(
+                {
+                    "role": "model",
+                    "parts": [{"text": "Understood."}],
+                }
+            )
 
         for msg in request.messages:
             mapped = self._map_message(msg)
@@ -90,27 +109,33 @@ class GeminiAdapter:
                 parts.append({"text": part.text})
             elif isinstance(part, ImageContent):
                 if part.base64_data:
-                    parts.append({
-                        "inline_data": {
-                            "mime_type": part.media_type,
-                            "data": part.base64_data,
-                        },
-                    })
+                    parts.append(
+                        {
+                            "inline_data": {
+                                "mime_type": part.media_type,
+                                "data": part.base64_data,
+                            },
+                        }
+                    )
             elif isinstance(part, ToolCallContent):
                 args = part.arguments or {}
-                parts.append({
-                    "function_call": {
-                        "name": part.tool_name,
-                        "args": args,
-                    },
-                })
+                parts.append(
+                    {
+                        "function_call": {
+                            "name": part.tool_name,
+                            "args": args,
+                        },
+                    }
+                )
             elif isinstance(part, ToolResultContent):
-                parts.append({
-                    "function_response": {
-                        "name": part.tool_call_id,
-                        "response": {"result": part.content},
-                    },
-                })
+                parts.append(
+                    {
+                        "function_response": {
+                            "name": part.tool_call_id,
+                            "response": {"result": part.content},
+                        },
+                    }
+                )
 
         role = "model" if msg.role == Role.ASSISTANT else "user"
         return {"role": role, "parts": parts} if parts else None
@@ -175,12 +200,14 @@ class GeminiAdapter:
                 if hasattr(part, "function_call") and part.function_call:
                     fc = part.function_call
                     args = dict(fc.args) if fc.args else {}
-                    content_parts.append(ToolCallContent(
-                        tool_call_id=_synth_tool_call_id(),
-                        tool_name=fc.name,
-                        arguments=args,
-                        arguments_json=json.dumps(args),
-                    ))
+                    content_parts.append(
+                        ToolCallContent(
+                            tool_call_id=_synth_tool_call_id(),
+                            tool_name=fc.name,
+                            arguments=args,
+                            arguments_json=json.dumps(args),
+                        )
+                    )
                 elif hasattr(part, "text") and part.text:
                     content_parts.append(TextContent(text=part.text))
 
@@ -193,9 +220,7 @@ class GeminiAdapter:
             )
 
         finish = _FINISH_MAP.get(finish_str, FinishReason.STOP)
-        if content_parts and any(
-            isinstance(p, ToolCallContent) for p in content_parts
-        ):
+        if content_parts and any(isinstance(p, ToolCallContent) for p in content_parts):
             finish = FinishReason.TOOL_USE
 
         return Response(
@@ -211,6 +236,14 @@ class GeminiAdapter:
     # -----------------------------------------------------------------
 
     async def complete(self, request: Request) -> Response:
+        """Send a non-streaming request to the Google Gemini API.
+
+        Args:
+            request: Provider-agnostic request to send.
+
+        Returns:
+            Mapped Response with content, usage, and finish reason.
+        """
         kwargs = self._build_kwargs(request)
         t0 = time.monotonic()
         raw = await self._client.aio.models.generate_content(**kwargs)
@@ -218,6 +251,14 @@ class GeminiAdapter:
         return self._map_response(raw, latency)
 
     async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+        """Send a streaming request to the Google Gemini API.
+
+        Args:
+            request: Provider-agnostic request to send.
+
+        Yields:
+            StreamEvent instances as they arrive from the API.
+        """
         kwargs = self._build_kwargs(request)
 
         t0 = time.monotonic()
@@ -262,7 +303,8 @@ class GeminiAdapter:
                 if usage_meta:
                     usage = TokenUsage(
                         input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
-                        output_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
+                        output_tokens=getattr(usage_meta, "candidates_token_count", 0)
+                        or 0,
                     )
                 yield StreamEvent(
                     type=StreamEventType.FINISH,

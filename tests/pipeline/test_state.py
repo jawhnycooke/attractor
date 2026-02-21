@@ -1,11 +1,13 @@
 """Tests for PipelineContext and Checkpoint serialization."""
 
-import json
-import tempfile
 from pathlib import Path
 
 from attractor.pipeline.models import Checkpoint, PipelineContext
-from attractor.pipeline.state import latest_checkpoint, list_checkpoints, save_checkpoint
+from attractor.pipeline.state import (
+    latest_checkpoint,
+    list_checkpoints,
+    save_checkpoint,
+)
 
 
 class TestPipelineContext:
@@ -22,7 +24,7 @@ class TestPipelineContext:
         assert ctx.get("missing") is None
 
     def test_delete(self) -> None:
-        ctx = PipelineContext(data={"a": 1, "b": 2})
+        ctx = PipelineContext.from_dict({"a": 1, "b": 2})
         ctx.delete("a")
         assert ctx.has("a") is False
         assert ctx.has("b") is True
@@ -30,14 +32,14 @@ class TestPipelineContext:
         ctx.delete("nonexistent")
 
     def test_update(self) -> None:
-        ctx = PipelineContext(data={"a": 1})
+        ctx = PipelineContext.from_dict({"a": 1})
         ctx.update({"b": 2, "c": 3})
         assert ctx.get("a") == 1
         assert ctx.get("b") == 2
         assert ctx.get("c") == 3
 
     def test_to_dict_from_dict(self) -> None:
-        original = PipelineContext(data={"x": 42, "y": "hello"})
+        original = PipelineContext.from_dict({"x": 42, "y": "hello"})
         serialized = original.to_dict()
         restored = PipelineContext.from_dict(serialized)
         assert restored.get("x") == 42
@@ -50,7 +52,7 @@ class TestPipelineContext:
         assert data["a"] == 1  # original unchanged
 
     def test_scoped_context(self) -> None:
-        parent = PipelineContext(data={"shared": True})
+        parent = PipelineContext.from_dict({"shared": True})
         scope = parent.create_scope("branch1")
         scope.set("result", "ok")
         parent.merge_scope(scope, "branch1")
@@ -63,7 +65,7 @@ class TestCheckpoint:
         cp = Checkpoint(
             pipeline_name="test_pipeline",
             current_node="step2",
-            context=PipelineContext(data={"key": "value"}),
+            context=PipelineContext.from_dict({"key": "value"}),
             completed_nodes=["step1"],
             timestamp=1234567890.0,
         )
@@ -79,7 +81,7 @@ class TestCheckpoint:
         cp = Checkpoint(
             pipeline_name="file_test",
             current_node="node_a",
-            context=PipelineContext(data={"count": 5}),
+            context=PipelineContext.from_dict({"count": 5}),
             completed_nodes=["init"],
         )
         path = tmp_path / "cp.json"
@@ -125,7 +127,7 @@ class TestStateHelpers:
         cp = Checkpoint(
             pipeline_name="latest_test",
             current_node="z",
-            context=PipelineContext(data={"v": 1}),
+            context=PipelineContext.from_dict({"v": 1}),
             timestamp=9999.0,
         )
         save_checkpoint(cp, tmp_path)

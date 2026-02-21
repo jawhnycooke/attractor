@@ -14,16 +14,11 @@ from attractor.llm.models import (
     Request,
     Response,
     RetryPolicy,
-    Role,
     StreamEvent,
-    StreamEventType,
-    TextContent,
     ToolCallContent,
     ToolDefinition,
-    TokenUsage,
 )
 from attractor.llm.middleware import Middleware
-from attractor.llm.streaming import StreamCollector
 
 logger = logging.getLogger(__name__)
 
@@ -51,22 +46,44 @@ class LLMClient:
 
     @staticmethod
     def _default_adapters() -> list[Any]:
+        """Discover and instantiate available provider adapters.
+
+        Each provider SDK is imported lazily. An ``ImportError`` means the
+        package is not installed (expected, logged at DEBUG). Any other
+        exception during adapter construction is unexpected and logged at
+        WARNING with a full traceback so operators can diagnose the issue.
+
+        Returns:
+            List of successfully instantiated provider adapters.
+        """
         adapters: list[Any] = []
         try:
             from attractor.llm.adapters.openai_adapter import OpenAIAdapter
-            adapters.append(OpenAIAdapter())
-        except Exception:
-            logger.debug("OpenAI adapter unavailable (missing openai package or key)")
+        except ImportError:
+            logger.debug("openai package not installed; skipping")
+        else:
+            try:
+                adapters.append(OpenAIAdapter())
+            except Exception:
+                logger.warning("OpenAIAdapter failed to initialize", exc_info=True)
         try:
             from attractor.llm.adapters.anthropic_adapter import AnthropicAdapter
-            adapters.append(AnthropicAdapter())
-        except Exception:
-            logger.debug("Anthropic adapter unavailable (missing anthropic package or key)")
+        except ImportError:
+            logger.debug("anthropic package not installed; skipping")
+        else:
+            try:
+                adapters.append(AnthropicAdapter())
+            except Exception:
+                logger.warning("AnthropicAdapter failed to initialize", exc_info=True)
         try:
             from attractor.llm.adapters.gemini_adapter import GeminiAdapter
-            adapters.append(GeminiAdapter())
-        except Exception:
-            logger.debug("Gemini adapter unavailable (missing google-genai package or key)")
+        except ImportError:
+            logger.debug("google-genai package not installed; skipping")
+        else:
+            try:
+                adapters.append(GeminiAdapter())
+            except Exception:
+                logger.warning("GeminiAdapter failed to initialize", exc_info=True)
         return adapters
 
     # -----------------------------------------------------------------
@@ -125,26 +142,20 @@ class LLMClient:
     # -----------------------------------------------------------------
 
     @staticmethod
-    async def _execute_tool(
-        executor: ToolExecutor, tc: ToolCallContent
-    ) -> Message:
+    async def _execute_tool(executor: ToolExecutor, tc: ToolCallContent) -> Message:
         """Execute a single tool call and return the result message."""
         try:
             result = await executor(tc)
             return Message.tool_result(tc.tool_call_id, str(result))
         except Exception as exc:
-            return Message.tool_result(
-                tc.tool_call_id, str(exc), is_error=True
-            )
+            return Message.tool_result(tc.tool_call_id, str(exc), is_error=True)
 
     @staticmethod
     async def _execute_tools_concurrently(
         executor: ToolExecutor, tool_calls: list[ToolCallContent]
     ) -> list[Message]:
         """Execute multiple tool calls concurrently with asyncio.gather."""
-        tasks = [
-            LLMClient._execute_tool(executor, tc) for tc in tool_calls
-        ]
+        tasks = [LLMClient._execute_tool(executor, tc) for tc in tool_calls]
         return list(await asyncio.gather(*tasks))
 
     # -----------------------------------------------------------------
@@ -208,6 +219,9 @@ class LLMClient:
             **kwargs,
         )
 
+        if max_tool_rounds <= 0:
+            return await self.complete(request)
+
         for _ in range(max_tool_rounds):
             response = await self.complete(request)
 
@@ -225,7 +239,7 @@ class LLMClient:
             )
             request.messages.extend(result_messages)
 
-        return response  # type: ignore[possibly-undefined]
+        return response
 
     async def stream_generate(
         self,
@@ -305,6 +319,4 @@ class LLMClient:
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"Model output is not valid JSON: {text[:200]!r}"
-            ) from exc
+            raise ValueError(f"Model output is not valid JSON: {text[:200]!r}") from exc

@@ -6,7 +6,6 @@ codex-rs conventions.
 
 from __future__ import annotations
 
-from attractor.agent.profiles.base import ProviderProfile
 from attractor.agent.tools.apply_patch import APPLY_PATCH_DEF
 from attractor.agent.tools.core_tools import (
     GLOB_DEF,
@@ -44,15 +43,21 @@ commands, and searching code.
 """
 
 
-class OpenAIProfile(ProviderProfile):
-    """Profile aligned with codex-rs conventions."""
+class OpenAIProfile:
+    """Profile aligned with codex-rs conventions.
+
+    Provides OpenAI-specific tool definitions and system prompt
+    template for GPT models. Uses apply_patch instead of edit_file.
+    """
 
     @property
     def provider_name(self) -> str:
+        """Return the provider identifier."""
         return "openai"
 
     @property
     def tool_definitions(self) -> list[ToolDefinition]:
+        """Return OpenAI tool definitions including apply_patch."""
         return [
             APPLY_PATCH_DEF,
             READ_FILE_DEF,
@@ -65,8 +70,21 @@ class OpenAIProfile(ProviderProfile):
 
     @property
     def system_prompt_template(self) -> str:
+        """Return the codex-rs system prompt template."""
         return _SYSTEM_PROMPT
 
     @property
     def context_window_size(self) -> int:
+        """Return the 128K context window size for GPT models."""
         return 128_000
+
+    def get_tools(self) -> list[ToolDefinition]:
+        """Return the tool definitions for this profile."""
+        return list(self.tool_definitions)
+
+    def format_system_prompt(self, **kwargs: str) -> str:
+        """Render the system prompt template with the given variables."""
+        template = self.system_prompt_template
+        for key, value in kwargs.items():
+            template = template.replace(f"{{{key}}}", str(value))
+        return template

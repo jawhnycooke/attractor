@@ -36,22 +36,49 @@ class NodeHandler(Protocol):
 
 
 class HandlerRegistry:
-    """Maps handler-type strings to :class:`NodeHandler` instances."""
+    """Registry mapping handler-type strings to handler instances.
+
+    Used by :class:`PipelineEngine` to dispatch node execution to the
+    appropriate handler based on the node's ``handler_type`` attribute.
+    """
 
     def __init__(self) -> None:
         self._handlers: dict[str, NodeHandler] = {}
 
     def register(self, handler_type: str, handler: NodeHandler) -> None:
+        """Register a *handler* under *handler_type*.
+
+        Args:
+            handler_type: Dispatch key (e.g. ``"codergen"``).
+            handler: The handler instance to register.
+        """
         self._handlers[handler_type] = handler
 
     def get(self, handler_type: str) -> NodeHandler | None:
+        """Return the handler for *handler_type*, or ``None``.
+
+        Args:
+            handler_type: The handler key to look up.
+
+        Returns:
+            The registered handler, or ``None`` if not found.
+        """
         return self._handlers.get(handler_type)
 
     def has(self, handler_type: str) -> bool:
+        """Return ``True`` if *handler_type* is registered.
+
+        Args:
+            handler_type: The handler key to check.
+
+        Returns:
+            Whether the handler type is registered.
+        """
         return handler_type in self._handlers
 
     @property
     def registered_types(self) -> list[str]:
+        """Return a list of all registered handler type strings."""
         return list(self._handlers.keys())
 
 
@@ -63,25 +90,71 @@ class HandlerRegistry:
 class CodergenHandler:
     """Invoke the Attractor coding agent to execute a prompt.
 
-    Attempts to import ``attractor.agent``; falls back to a stub
-    that echoes the prompt when the agent module is unavailable.
+    Attempts to import ``attractor.agent``; falls back to an error result
+    when the agent module is unavailable.
     """
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        """Run the coding agent for *node*'s prompt.
+
+        Builds a :class:`Session` with the appropriate provider profile,
+        a local execution environment, and an LLM client, then iterates
+        over the event stream to collect the final text output.
+
+        Args:
+            node: The pipeline node being executed.
+            context: Shared pipeline context for variable interpolation.
+
+        Returns:
+            A :class:`NodeResult` with the agent's text output on
+            success, or an error description on failure.
+        """
         prompt = node.attributes.get("prompt", "")
         model = node.attributes.get("model", "")
 
         # Interpolate context variables in the prompt
-        for key, value in context.data.items():
+        for key, value in context.to_dict().items():
             prompt = prompt.replace(f"{{{key}}}", str(value))
 
         try:
-            from attractor.agent import Session  # type: ignore[import-untyped]
+            from attractor.agent.events import AgentEventType
+            from attractor.agent.environment import LocalExecutionEnvironment
+            from attractor.agent.profiles import (
+                AnthropicProfile,
+                GeminiProfile,
+                OpenAIProfile,
+            )
+            from attractor.agent.session import Session, SessionConfig
+            from attractor.llm.client import LLMClient
 
-            session = Session(model=model) if model else Session()
-            result = await session.submit(prompt)
+            # Select profile based on model name prefix
+            if model.startswith("claude"):
+                profile = AnthropicProfile()
+            elif model.startswith("gemini"):
+                profile = GeminiProfile()
+            else:
+                profile = OpenAIProfile()
+
+            environment = LocalExecutionEnvironment()
+            config = SessionConfig(model_id=model)
+            llm_client = LLMClient()
+
+            session = Session(
+                profile=profile,
+                environment=environment,
+                config=config,
+                llm_client=llm_client,
+            )
+
+            # Consume the async event iterator and collect text
+            output_parts: list[str] = []
+            async for event in session.submit(prompt):
+                if event.type == AgentEventType.ASSISTANT_TEXT_DELTA:
+                    text = event.data.get("text", "")
+                    if text:
+                        output_parts.append(text)
+
+            result = "".join(output_parts)
             return NodeResult(
                 success=True,
                 output=result,
@@ -89,14 +162,17 @@ class CodergenHandler:
             )
         except ImportError:
             logger.warning(
-                "attractor.agent not available — using codergen stub"
+                "attractor.agent not available — codergen handler cannot run"
             )
             return NodeResult(
-                success=True,
-                output=f"[stub] Would execute prompt: {prompt}",
-                context_updates={"last_codergen_output": f"[stub] {prompt}"},
+                success=False,
+                error=(
+                    "attractor.agent module is not available; "
+                    "cannot execute codergen handler"
+                ),
             )
         except Exception as exc:
+            logger.exception("Handler failed on node '%s'", node.name)
             return NodeResult(success=False, error=str(exc))
 
 
@@ -106,22 +182,27 @@ class HumanGateHandler:
     def __init__(self, interviewer: Any = None) -> None:
         self._interviewer = interviewer
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        """Gate execution on human approval.
+
+        Args:
+            node: The pipeline node being executed.
+            context: Shared pipeline context.
+
+        Returns:
+            A :class:`NodeResult` with ``approved`` in context_updates
+            on success, or a failure if no interviewer is configured.
+        """
         prompt = node.attributes.get("prompt", "Approve this step?")
         interviewer = self._interviewer or context.get("_interviewer")
 
         if interviewer is None:
-            logger.warning("No interviewer configured — auto-approving")
             return NodeResult(
-                success=True,
-                context_updates={"approved": True},
+                success=False,
+                error="No interviewer configured for human_gate node",
             )
 
-        await interviewer.inform(
-            f"Node '{node.name}': {prompt}"
-        )
+        await interviewer.inform(f"Node '{node.name}': {prompt}")
         approved = await interviewer.confirm(prompt)
         return NodeResult(
             success=True,
@@ -140,9 +221,17 @@ class ConditionalHandler:
     def __init__(self, pipeline: Pipeline | None = None) -> None:
         self._pipeline = pipeline
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        """Evaluate outgoing edge conditions and route to the first match.
+
+        Args:
+            node: The conditional node whose edges are evaluated.
+            context: Shared pipeline context for condition resolution.
+
+        Returns:
+            A :class:`NodeResult` with ``next_node`` set to the first
+            matching edge target, or the default (unconditional) edge.
+        """
         pipeline = self._pipeline
         if pipeline is None:
             return NodeResult(success=True)
@@ -171,13 +260,25 @@ class ParallelHandler:
     ``asyncio.gather``.  Results are merged back into the parent context.
     """
 
-    def __init__(self, registry: HandlerRegistry | None = None, pipeline: Pipeline | None = None) -> None:
+    def __init__(
+        self,
+        registry: HandlerRegistry | None = None,
+        pipeline: Pipeline | None = None,
+    ) -> None:
         self._registry = registry
         self._pipeline = pipeline
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        """Fan out execution across the branches listed in *node*.
+
+        Args:
+            node: The parallel node whose ``branches`` attribute lists
+                the sub-nodes to execute concurrently.
+            context: Shared pipeline context.
+
+        Returns:
+            A :class:`NodeResult` with merged outputs from all branches.
+        """
         branches = node.attributes.get("branches", [])
         if isinstance(branches, str):
             branches = [b.strip() for b in branches.split(",")]
@@ -240,15 +341,22 @@ class ParallelHandler:
 class ToolHandler:
     """Execute a shell command and capture exit code + output."""
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        """Run a shell command defined in *node*'s ``command`` attribute.
+
+        Args:
+            node: The pipeline node with a ``command`` attribute.
+            context: Shared pipeline context for variable interpolation.
+
+        Returns:
+            A :class:`NodeResult` with stdout/stderr and exit code.
+        """
         command = node.attributes.get("command", "")
         if not command:
             return NodeResult(success=False, error="No command specified")
 
         # Interpolate context variables
-        for key, value in context.data.items():
+        for key, value in context.to_dict().items():
             command = command.replace(f"{{{key}}}", str(value))
 
         try:
@@ -278,6 +386,7 @@ class ToolHandler:
                 context_updates={"exit_code": -1},
             )
         except Exception as exc:
+            logger.exception("Handler failed on node '%s'", node.name)
             return NodeResult(success=False, error=str(exc))
 
 
@@ -292,16 +401,25 @@ class SupervisorHandler:
     def __init__(self, engine: Any = None) -> None:
         self._engine = engine
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        """Run an iterative refinement loop on a sub-pipeline.
+
+        Args:
+            node: The supervisor node with ``sub_pipeline``,
+                ``done_condition``, and ``max_iterations`` attributes.
+            context: Shared pipeline context.
+
+        Returns:
+            A :class:`NodeResult` indicating how many iterations ran
+            and whether the done condition was met.
+        """
         max_iterations = int(node.attributes.get("max_iterations", 5))
         done_condition = node.attributes.get("done_condition", "")
 
         if self._engine is None:
             return NodeResult(
-                success=True,
-                output=f"[stub] Would run supervisor loop up to {max_iterations}x",
+                success=False,
+                error="No engine configured for supervisor handler",
             )
 
         for i in range(max_iterations):

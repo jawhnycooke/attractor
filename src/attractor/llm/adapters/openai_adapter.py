@@ -14,7 +14,6 @@ from attractor.llm.models import (
     FinishReason,
     ImageContent,
     Message,
-    ReasoningEffort,
     Request,
     Response,
     Role,
@@ -49,9 +48,22 @@ class OpenAIAdapter:
         )
 
     def provider_name(self) -> str:
+        """Return the canonical provider name.
+
+        Returns:
+            The string ``"openai"``.
+        """
         return "openai"
 
     def detect_model(self, model: str) -> bool:
+        """Check whether *model* belongs to this provider.
+
+        Args:
+            model: Model identifier string (e.g. ``"gpt-4o"``).
+
+        Returns:
+            True if the model string starts with a known OpenAI prefix.
+        """
         return any(model.startswith(p) for p in self._MODEL_PREFIXES)
 
     # -----------------------------------------------------------------
@@ -77,7 +89,9 @@ class OpenAIAdapter:
 
         return items
 
-    def _map_message(self, msg: Message) -> dict[str, Any] | list[dict[str, Any]] | None:
+    def _map_message(
+        self, msg: Message
+    ) -> dict[str, Any] | list[dict[str, Any]] | None:
         if msg.role == Role.SYSTEM:
             return None  # system is handled via instructions parameter
 
@@ -85,11 +99,13 @@ class OpenAIAdapter:
             results = []
             for part in msg.content:
                 if isinstance(part, ToolResultContent):
-                    results.append({
-                        "type": "function_call_output",
-                        "call_id": part.tool_call_id,
-                        "output": part.content,
-                    })
+                    results.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": part.tool_call_id,
+                            "output": part.content,
+                        }
+                    )
             return results if len(results) != 1 else results[0]
 
         if msg.role == Role.ASSISTANT:
@@ -101,12 +117,14 @@ class OpenAIAdapter:
                     text_parts.append(part.text)
                 elif isinstance(part, ToolCallContent):
                     args_str = part.arguments_json or json.dumps(part.arguments)
-                    items.append({
-                        "type": "function_call",
-                        "call_id": part.tool_call_id,
-                        "name": part.tool_name,
-                        "arguments": args_str,
-                    })
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": part.tool_call_id,
+                            "name": part.tool_name,
+                            "arguments": args_str,
+                        }
+                    )
 
             if text_parts and not items:
                 return {
@@ -114,10 +132,13 @@ class OpenAIAdapter:
                     "content": "".join(text_parts),
                 }
             if text_parts:
-                items.insert(0, {
-                    "role": "assistant",
-                    "content": "".join(text_parts),
-                })
+                items.insert(
+                    0,
+                    {
+                        "role": "assistant",
+                        "content": "".join(text_parts),
+                    },
+                )
             return items if len(items) != 1 else items[0]
 
         # User / developer messages
@@ -137,10 +158,12 @@ class OpenAIAdapter:
                 mapped.append({"type": "input_text", "text": part.text})
             elif isinstance(part, ImageContent):
                 url = part.url or f"data:{part.media_type};base64,{part.base64_data}"
-                mapped.append({
-                    "type": "input_image",
-                    "image_url": url,
-                })
+                mapped.append(
+                    {
+                        "type": "input_image",
+                        "image_url": url,
+                    }
+                )
         return mapped
 
     def _map_tools(self, tools: list[ToolDefinition]) -> list[dict[str, Any]] | None:
@@ -200,23 +223,26 @@ class OpenAIAdapter:
                     if content_block.type == "output_text":
                         content_parts.append(TextContent(text=content_block.text))
                     elif content_block.type == "refusal":
-                        content_parts.append(TextContent(
-                            text=f"[Refusal: {content_block.refusal}]"
-                        ))
+                        content_parts.append(
+                            TextContent(text=f"[Refusal: {content_block.refusal}]")
+                        )
 
             elif item_type == "function_call":
                 has_tool_calls = True
                 args_str = item.arguments
                 try:
                     args = json.loads(args_str)
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.warning("Failed to parse tool call arguments: %s", exc)
                     args = {}
-                content_parts.append(ToolCallContent(
-                    tool_call_id=item.call_id,
-                    tool_name=item.name,
-                    arguments=args,
-                    arguments_json=args_str,
-                ))
+                content_parts.append(
+                    ToolCallContent(
+                        tool_call_id=item.call_id,
+                        tool_name=item.name,
+                        arguments=args,
+                        arguments_json=args_str,
+                    )
+                )
 
             elif item_type == "reasoning":
                 for summary_item in getattr(item, "summary", []):
@@ -228,13 +254,13 @@ class OpenAIAdapter:
             reasoning_tokens = 0
             cache_read_tokens = 0
             if raw.usage.output_tokens_details:
-                reasoning_tokens = getattr(
-                    raw.usage.output_tokens_details, "reasoning_tokens", 0
-                ) or 0
+                reasoning_tokens = (
+                    getattr(raw.usage.output_tokens_details, "reasoning_tokens", 0) or 0
+                )
             if raw.usage.input_tokens_details:
-                cache_read_tokens = getattr(
-                    raw.usage.input_tokens_details, "cached_tokens", 0
-                ) or 0
+                cache_read_tokens = (
+                    getattr(raw.usage.input_tokens_details, "cached_tokens", 0) or 0
+                )
             usage = TokenUsage(
                 input_tokens=raw.usage.input_tokens or 0,
                 output_tokens=raw.usage.output_tokens or 0,
@@ -263,6 +289,14 @@ class OpenAIAdapter:
     # -----------------------------------------------------------------
 
     async def complete(self, request: Request) -> Response:
+        """Send a non-streaming completion request to the OpenAI Responses API.
+
+        Args:
+            request: Provider-agnostic request to send.
+
+        Returns:
+            Mapped Response with content, usage, and finish reason.
+        """
         kwargs = self._build_kwargs(request)
         t0 = time.monotonic()
         raw = await self._client.responses.create(**kwargs)
@@ -270,6 +304,14 @@ class OpenAIAdapter:
         return self._map_response(raw, latency)
 
     async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+        """Send a streaming request to the OpenAI Responses API.
+
+        Args:
+            request: Provider-agnostic request to send.
+
+        Yields:
+            StreamEvent instances as they arrive from the API.
+        """
         kwargs = self._build_kwargs(request)
         kwargs["stream"] = True
 
@@ -325,8 +367,8 @@ class OpenAIAdapter:
                     tc.arguments_json = event.arguments
                     try:
                         tc.arguments = json.loads(event.arguments)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        logger.warning("Failed to parse tool call arguments: %s", exc)
                     tc.tool_name = tc.tool_name or event.name
                     yield StreamEvent(
                         type=StreamEventType.TOOL_CALL_END,
@@ -339,10 +381,14 @@ class OpenAIAdapter:
                 if resp and resp.usage:
                     reasoning_tokens = 0
                     if resp.usage.output_tokens_details:
-                        reasoning_tokens = getattr(
-                            resp.usage.output_tokens_details,
-                            "reasoning_tokens", 0,
-                        ) or 0
+                        reasoning_tokens = (
+                            getattr(
+                                resp.usage.output_tokens_details,
+                                "reasoning_tokens",
+                                0,
+                            )
+                            or 0
+                        )
                     usage = TokenUsage(
                         input_tokens=resp.usage.input_tokens or 0,
                         output_tokens=resp.usage.output_tokens or 0,
@@ -353,9 +399,7 @@ class OpenAIAdapter:
                     getattr(item, "type", None) == "function_call"
                     for item in (resp.output if resp else [])
                 )
-                finish = (
-                    FinishReason.TOOL_USE if has_tool_calls else FinishReason.STOP
-                )
+                finish = FinishReason.TOOL_USE if has_tool_calls else FinishReason.STOP
 
                 yield StreamEvent(
                     type=StreamEventType.FINISH,

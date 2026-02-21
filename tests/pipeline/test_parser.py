@@ -2,9 +2,7 @@
 
 import pytest
 
-from attractor.pipeline.models import Pipeline
 from attractor.pipeline.parser import ParseError, parse_dot_string
-
 
 SIMPLE_DOT = """\
 digraph simple {
@@ -67,9 +65,7 @@ class TestParseDotString:
     def test_edge_labels(self) -> None:
         pipeline = parse_dot_string(FULL_DOT)
         retry_edge = next(
-            e
-            for e in pipeline.edges
-            if e.source == "review" and e.target == "start"
+            e for e in pipeline.edges if e.source == "review" and e.target == "start"
         )
         assert retry_edge.label == "retry"
 

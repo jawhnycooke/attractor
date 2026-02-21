@@ -59,9 +59,7 @@ class CLIInterviewer:
 
     async def confirm(self, prompt: str) -> bool:
         self._console.print(Panel(prompt, title="Confirm"))
-        return await asyncio.to_thread(
-            Confirm.ask, "Proceed?", console=self._console
-        )
+        return await asyncio.to_thread(Confirm.ask, "Proceed?", console=self._console)
 
     async def inform(self, message: str) -> None:
         self._console.print(Panel(message, title="Info", border_style="blue"))

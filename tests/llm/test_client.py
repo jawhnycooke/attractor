@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from typing import Any
 
 import pytest
 
 from attractor.llm.client import LLMClient
 from attractor.llm.middleware import (
     LoggingMiddleware,
-    Middleware,
     TokenTrackingMiddleware,
 )
 from attractor.llm.models import (
@@ -26,13 +22,11 @@ from attractor.llm.models import (
     Role,
     StreamEvent,
     StreamEventType,
-    TextContent,
     ToolCallContent,
     ToolDefinition,
     TokenUsage,
 )
 from attractor.llm.streaming import StreamCollector
-
 
 # ---------------------------------------------------------------------------
 # Helpers — mock adapter
@@ -219,11 +213,13 @@ class TestGenerate:
                     return Response(
                         message=Message(
                             role=Role.ASSISTANT,
-                            content=[ToolCallContent(
-                                tool_call_id="call_001",
-                                tool_name="search",
-                                arguments={"q": "test"},
-                            )],
+                            content=[
+                                ToolCallContent(
+                                    tool_call_id="call_001",
+                                    tool_name="search",
+                                    arguments={"q": "test"},
+                                )
+                            ],
                         ),
                         model="mock-v1",
                         finish_reason=FinishReason.TOOL_USE,
@@ -259,11 +255,13 @@ class TestGenerate:
                 return Response(
                     message=Message(
                         role=Role.ASSISTANT,
-                        content=[ToolCallContent(
-                            tool_call_id="call_002",
-                            tool_name="fn",
-                            arguments={},
-                        )],
+                        content=[
+                            ToolCallContent(
+                                tool_call_id="call_002",
+                                tool_name="fn",
+                                arguments={},
+                            )
+                        ],
                     ),
                     model="mock-v1",
                     finish_reason=FinishReason.TOOL_USE,
@@ -365,19 +363,19 @@ class TestGenerate:
                     return Response(
                         message=Message(
                             role=Role.ASSISTANT,
-                            content=[ToolCallContent(
-                                tool_call_id="call_err",
-                                tool_name="failing_tool",
-                                arguments={},
-                            )],
+                            content=[
+                                ToolCallContent(
+                                    tool_call_id="call_err",
+                                    tool_name="failing_tool",
+                                    arguments={},
+                                )
+                            ],
                         ),
                         model="mock-v1",
                         finish_reason=FinishReason.TOOL_USE,
                     )
                 # Check that the error was passed back
-                tool_msgs = [
-                    m for m in request.messages if m.role == Role.TOOL
-                ]
+                tool_msgs = [m for m in request.messages if m.role == Role.TOOL]
                 assert len(tool_msgs) == 1
                 part = tool_msgs[0].content[0]
                 assert part.is_error is True

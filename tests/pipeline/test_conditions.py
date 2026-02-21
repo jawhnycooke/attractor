@@ -8,13 +8,15 @@ from attractor.pipeline.models import PipelineContext
 
 @pytest.fixture
 def ctx() -> PipelineContext:
-    return PipelineContext(data={
-        "approved": True,
-        "exit_code": 0,
-        "retries": 3,
-        "name": "test",
-        "count": 42,
-    })
+    return PipelineContext.from_dict(
+        {
+            "approved": True,
+            "exit_code": 0,
+            "retries": 3,
+            "name": "test",
+            "count": 42,
+        }
+    )
 
 
 class TestEvaluateCondition:
@@ -39,17 +41,11 @@ class TestEvaluateCondition:
         assert evaluate_condition('name != "other"', ctx) is True
 
     def test_and_operator(self, ctx: PipelineContext) -> None:
-        assert evaluate_condition(
-            "approved == true and exit_code == 0", ctx
-        ) is True
-        assert evaluate_condition(
-            "approved == true and exit_code != 0", ctx
-        ) is False
+        assert evaluate_condition("approved == true and exit_code == 0", ctx) is True
+        assert evaluate_condition("approved == true and exit_code != 0", ctx) is False
 
     def test_or_operator(self, ctx: PipelineContext) -> None:
-        assert evaluate_condition(
-            "exit_code == 0 or retries > 10", ctx
-        ) is True
+        assert evaluate_condition("exit_code == 0 or retries > 10", ctx) is True
 
     def test_not_operator(self, ctx: PipelineContext) -> None:
         assert evaluate_condition("not approved == false", ctx) is True

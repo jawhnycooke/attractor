@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import enum
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 from attractor.pipeline.conditions import validate_condition_syntax
 from attractor.pipeline.models import Pipeline, PipelineEdge
@@ -85,38 +84,42 @@ def has_errors(findings: list[ValidationError]) -> bool:
 
 def _check_start_node(pipeline: Pipeline, errors: list[ValidationError]) -> None:
     if not pipeline.start_node:
-        errors.append(ValidationError(
-            level=ValidationLevel.ERROR,
-            message="No start node defined",
-        ))
+        errors.append(
+            ValidationError(
+                level=ValidationLevel.ERROR,
+                message="No start node defined",
+            )
+        )
     elif pipeline.start_node not in pipeline.nodes:
-        errors.append(ValidationError(
-            level=ValidationLevel.ERROR,
-            message=f"Start node '{pipeline.start_node}' does not exist",
-        ))
+        errors.append(
+            ValidationError(
+                level=ValidationLevel.ERROR,
+                message=f"Start node '{pipeline.start_node}' does not exist",
+            )
+        )
 
 
-def _check_terminal_nodes(
-    pipeline: Pipeline, errors: list[ValidationError]
-) -> None:
+def _check_terminal_nodes(pipeline: Pipeline, errors: list[ValidationError]) -> None:
     terminals = [n for n in pipeline.nodes.values() if n.is_terminal]
     if not terminals:
-        errors.append(ValidationError(
-            level=ValidationLevel.ERROR,
-            message="No terminal nodes found",
-        ))
+        errors.append(
+            ValidationError(
+                level=ValidationLevel.ERROR,
+                message="No terminal nodes found",
+            )
+        )
 
 
-def _check_handler_types(
-    pipeline: Pipeline, errors: list[ValidationError]
-) -> None:
+def _check_handler_types(pipeline: Pipeline, errors: list[ValidationError]) -> None:
     for node in pipeline.nodes.values():
         if node.handler_type not in _KNOWN_HANDLERS:
-            errors.append(ValidationError(
-                level=ValidationLevel.ERROR,
-                message=f"Unknown handler type '{node.handler_type}'",
-                node_name=node.name,
-            ))
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.ERROR,
+                    message=f"Unknown handler type '{node.handler_type}'",
+                    node_name=node.name,
+                )
+            )
 
 
 def _check_required_attributes(
@@ -126,48 +129,53 @@ def _check_required_attributes(
         required = _REQUIRED_ATTRS.get(node.handler_type, [])
         for attr in required:
             if attr not in node.attributes:
-                errors.append(ValidationError(
-                    level=ValidationLevel.ERROR,
-                    message=f"Missing required attribute '{attr}' for handler '{node.handler_type}'",
-                    node_name=node.name,
-                ))
+                errors.append(
+                    ValidationError(
+                        level=ValidationLevel.ERROR,
+                        message=(
+                            f"Missing required attribute '{attr}' "
+                            f"for handler '{node.handler_type}'"
+                        ),
+                        node_name=node.name,
+                    )
+                )
 
 
-def _check_edge_references(
-    pipeline: Pipeline, errors: list[ValidationError]
-) -> None:
+def _check_edge_references(pipeline: Pipeline, errors: list[ValidationError]) -> None:
     for edge in pipeline.edges:
         if edge.source not in pipeline.nodes:
-            errors.append(ValidationError(
-                level=ValidationLevel.ERROR,
-                message=f"Edge source '{edge.source}' does not exist",
-                edge=edge,
-            ))
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.ERROR,
+                    message=f"Edge source '{edge.source}' does not exist",
+                    edge=edge,
+                )
+            )
         if edge.target not in pipeline.nodes:
-            errors.append(ValidationError(
-                level=ValidationLevel.ERROR,
-                message=f"Edge target '{edge.target}' does not exist",
-                edge=edge,
-            ))
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.ERROR,
+                    message=f"Edge target '{edge.target}' does not exist",
+                    edge=edge,
+                )
+            )
 
 
-def _check_condition_syntax(
-    pipeline: Pipeline, errors: list[ValidationError]
-) -> None:
+def _check_condition_syntax(pipeline: Pipeline, errors: list[ValidationError]) -> None:
     for edge in pipeline.edges:
         if edge.condition:
             err = validate_condition_syntax(edge.condition)
             if err:
-                errors.append(ValidationError(
-                    level=ValidationLevel.ERROR,
-                    message=f"Invalid condition syntax: {err}",
-                    edge=edge,
-                ))
+                errors.append(
+                    ValidationError(
+                        level=ValidationLevel.ERROR,
+                        message=f"Invalid condition syntax: {err}",
+                        edge=edge,
+                    )
+                )
 
 
-def _check_reachability(
-    pipeline: Pipeline, errors: list[ValidationError]
-) -> None:
+def _check_reachability(pipeline: Pipeline, errors: list[ValidationError]) -> None:
     """Warn about nodes unreachable from the start node."""
     if not pipeline.start_node or pipeline.start_node not in pipeline.nodes:
         return  # already covered by _check_start_node
@@ -189,16 +197,16 @@ def _check_reachability(
 
     for name in pipeline.nodes:
         if name not in reachable:
-            errors.append(ValidationError(
-                level=ValidationLevel.WARNING,
-                message=f"Node is unreachable from start",
-                node_name=name,
-            ))
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.WARNING,
+                    message="Node is unreachable from start",
+                    node_name=name,
+                )
+            )
 
 
-def _check_cycles(
-    pipeline: Pipeline, errors: list[ValidationError]
-) -> None:
+def _check_cycles(pipeline: Pipeline, errors: list[ValidationError]) -> None:
     """Warn about cycles not involving a supervisor handler.
 
     Cycles through supervisor nodes are expected (iterative refinement).
@@ -245,8 +253,10 @@ def _check_cycles(
         for n in cycle_nodes:
             if n not in seen:
                 seen.add(n)
-                errors.append(ValidationError(
-                    level=ValidationLevel.WARNING,
-                    message="Node is part of a non-supervisor cycle",
-                    node_name=n,
-                ))
+                errors.append(
+                    ValidationError(
+                        level=ValidationLevel.WARNING,
+                        message="Node is part of a non-supervisor cycle",
+                        node_name=n,
+                    )
+                )

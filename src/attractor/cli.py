@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
-from pathlib import Path
 
 import click
 from rich.console import Console
@@ -23,13 +21,12 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from attractor.pipeline.engine import PipelineEngine
+from attractor.pipeline.handlers import create_default_registry
 from attractor.pipeline.interviewer import CLIInterviewer
 from attractor.pipeline.models import Checkpoint, PipelineContext
 from attractor.pipeline.parser import parse_dot_file
-from attractor.pipeline.state import latest_checkpoint
 from attractor.pipeline.stylesheet import ModelStylesheet
 from attractor.pipeline.validator import ValidationLevel, has_errors, validate_pipeline
-from attractor.pipeline.handlers import create_default_registry
 
 console = Console()
 
@@ -96,9 +93,7 @@ def run(
     stylesheet = ModelStylesheet.from_dict(stylesheet_data)
 
     interviewer = CLIInterviewer(console=console)
-    registry = create_default_registry(
-        pipeline=pipeline, interviewer=interviewer
-    )
+    registry = create_default_registry(pipeline=pipeline, interviewer=interviewer)
 
     engine = PipelineEngine(
         registry=registry,
@@ -140,7 +135,9 @@ def validate(pipeline_dot: str, strict: bool) -> None:
         location = f.node_name or ""
         if f.edge:
             location = f"{f.edge.source} -> {f.edge.target}"
-        table.add_row(f"[{level_style}]{f.level.value}[/{level_style}]", location, f.message)
+        table.add_row(
+            f"[{level_style}]{f.level.value}[/{level_style}]", location, f.message
+        )
 
     console.print(table)
 
@@ -178,9 +175,7 @@ def resume(checkpoint_path: str, verbose: bool, pipeline_dot: str | None) -> Non
         raise SystemExit(1) from exc
 
     interviewer = CLIInterviewer(console=console)
-    registry = create_default_registry(
-        pipeline=pipeline, interviewer=interviewer
-    )
+    registry = create_default_registry(pipeline=pipeline, interviewer=interviewer)
 
     engine = PipelineEngine(registry=registry)
 

@@ -8,6 +8,7 @@ filesystem via the ExecutionEnvironment.
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
@@ -16,10 +17,10 @@ from attractor.agent.environment import ExecutionEnvironment
 from attractor.agent.tools.registry import ToolResult
 from attractor.llm.models import ToolDefinition
 
-
 # ---------------------------------------------------------------------------
 # Patch operations
 # ---------------------------------------------------------------------------
+
 
 class OpKind(Enum):
     ADD_FILE = auto()
@@ -78,24 +79,24 @@ def parse_patch(text: str) -> list[PatchOp]:
                 path = re.sub(r"^b/", "", path).strip()
                 i += 1
                 # skip hunk header
-                if i < len(lines) and _HUNK_HEADER_RE.match(
-                    lines[i].rstrip("\n\r")
-                ):
+                if i < len(lines) and _HUNK_HEADER_RE.match(lines[i].rstrip("\n\r")):
                     i += 1
                 content_lines: list[str] = []
                 while i < len(lines):
-                    l = lines[i].rstrip("\n\r")
-                    if l.startswith("diff ") or l.startswith("--- "):
+                    raw_line = lines[i].rstrip("\n\r")
+                    if raw_line.startswith("diff ") or raw_line.startswith("--- "):
                         break
-                    if l.startswith("+"):
-                        content_lines.append(l[1:])
+                    if raw_line.startswith("+"):
+                        content_lines.append(raw_line[1:])
                     i += 1
-                ops.append(PatchOp(
-                    kind=OpKind.ADD_FILE,
-                    path=path,
-                    content="\n".join(content_lines)
-                    + ("\n" if content_lines else ""),
-                ))
+                ops.append(
+                    PatchOp(
+                        kind=OpKind.ADD_FILE,
+                        path=path,
+                        content="\n".join(content_lines)
+                        + ("\n" if content_lines else ""),
+                    )
+                )
             continue
 
         # --- delete file ---
@@ -108,16 +109,14 @@ def parse_patch(text: str) -> list[PatchOp]:
             i += 1
             # skip remaining hunk lines for the delete
             while i < len(lines):
-                l = lines[i].rstrip("\n\r")
-                if l.startswith("diff ") or l.startswith("--- "):
+                raw_line = lines[i].rstrip("\n\r")
+                if raw_line.startswith("diff ") or raw_line.startswith("--- "):
                     break
                 i += 1
             continue
 
         # --- diff header for update/move ---
-        diff_match = re.match(
-            r"^diff\s+--git\s+a/(.*?)\s+b/(.*?)\s*$", line
-        )
+        diff_match = re.match(r"^diff\s+--git\s+a/(.*?)\s+b/(.*?)\s*$", line)
         if diff_match:
             old_path = diff_match.group(1)
             new_path = diff_match.group(2)
@@ -125,8 +124,8 @@ def parse_patch(text: str) -> list[PatchOp]:
 
             # skip --- and +++ lines
             while i < len(lines):
-                l = lines[i].rstrip("\n\r")
-                if l.startswith("--- ") or l.startswith("+++ "):
+                raw_line = lines[i].rstrip("\n\r")
+                if raw_line.startswith("--- ") or raw_line.startswith("+++ "):
                     i += 1
                 else:
                     break
@@ -134,19 +133,16 @@ def parse_patch(text: str) -> list[PatchOp]:
             # parse hunks
             hunks: list[Hunk] = []
             while i < len(lines):
-                l = lines[i].rstrip("\n\r")
-                if l.startswith("diff "):
+                raw_line = lines[i].rstrip("\n\r")
+                if raw_line.startswith("diff "):
                     break
-                if _HUNK_HEADER_RE.match(l):
+                if _HUNK_HEADER_RE.match(raw_line):
                     i += 1
                     hunk = Hunk()
                     in_changes = False
                     while i < len(lines):
                         hl = lines[i].rstrip("\n\r")
-                        if (
-                            hl.startswith("diff ")
-                            or _HUNK_HEADER_RE.match(hl)
-                        ):
+                        if hl.startswith("diff ") or _HUNK_HEADER_RE.match(hl):
                             break
                         if hl.startswith("-"):
                             hunk.removals.append(hl[1:])
@@ -165,18 +161,22 @@ def parse_patch(text: str) -> list[PatchOp]:
                     i += 1
 
             if old_path != new_path:
-                ops.append(PatchOp(
-                    kind=OpKind.MOVE_FILE,
-                    path=old_path,
-                    new_path=new_path,
-                    hunks=hunks,
-                ))
+                ops.append(
+                    PatchOp(
+                        kind=OpKind.MOVE_FILE,
+                        path=old_path,
+                        new_path=new_path,
+                        hunks=hunks,
+                    )
+                )
             else:
-                ops.append(PatchOp(
-                    kind=OpKind.UPDATE_FILE,
-                    path=old_path,
-                    hunks=hunks,
-                ))
+                ops.append(
+                    PatchOp(
+                        kind=OpKind.UPDATE_FILE,
+                        path=old_path,
+                        hunks=hunks,
+                    )
+                )
             continue
 
         i += 1
@@ -188,9 +188,8 @@ def parse_patch(text: str) -> list[PatchOp]:
 # Applicator
 # ---------------------------------------------------------------------------
 
-def _find_hunk_location(
-    file_lines: list[str], hunk: Hunk
-) -> int | None:
+
+def _find_hunk_location(file_lines: list[str], hunk: Hunk) -> int | None:
     """Find where a hunk's context lines match in the file.
 
     Returns the index of the first line of the context_before match,
@@ -201,7 +200,7 @@ def _find_hunk_location(
         return 0
 
     for i in range(len(file_lines)):
-        if file_lines[i: i + len(search_lines)] == search_lines:
+        if file_lines[i : i + len(search_lines)] == search_lines:
             return i
     return None
 
@@ -217,18 +216,12 @@ def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
 
     # Build replacement: context_before + additions + context_after
     replacement = hunk.context_before + hunk.additions + hunk.context_after
-    span_len = (
-        len(hunk.context_before)
-        + len(hunk.removals)
-        + len(hunk.context_after)
-    )
+    span_len = len(hunk.context_before) + len(hunk.removals) + len(hunk.context_after)
 
-    return file_lines[:loc] + replacement + file_lines[loc + span_len:]
+    return file_lines[:loc] + replacement + file_lines[loc + span_len :]
 
 
-async def apply_ops(
-    ops: list[PatchOp], environment: ExecutionEnvironment
-) -> list[str]:
+async def apply_ops(ops: list[PatchOp], environment: ExecutionEnvironment) -> list[str]:
     """Apply a list of patch operations, return list of error messages."""
     errors: list[str] = []
 
@@ -240,7 +233,7 @@ async def apply_ops(
             elif op.kind == OpKind.DELETE_FILE:
                 # Write empty to effectively "delete" — real delete would need
                 # an env method; for now we clear it.
-                result = await environment.exec_command(f"rm -f '{op.path}'")
+                result = await environment.exec_command(f"rm -f {shlex.quote(op.path)}")
                 if result.exit_code != 0:
                     errors.append(f"Failed to delete {op.path}: {result.stderr}")
 
@@ -256,7 +249,7 @@ async def apply_ops(
                     "\n".join(file_lines) + "\n" if file_lines else "",
                 )
                 if op.new_path and op.new_path != op.path:
-                    await environment.exec_command(f"rm -f '{op.path}'")
+                    await environment.exec_command(f"rm -f {shlex.quote(op.path)}")
 
             elif op.kind == OpKind.UPDATE_FILE:
                 raw = await environment.read_file(op.path)
@@ -282,7 +275,7 @@ def _strip_line_numbers(text: str) -> str:
     for line in lines:
         tab_idx = line.find("\t")
         if tab_idx != -1:
-            stripped.append(line[tab_idx + 1:])
+            stripped.append(line[tab_idx + 1 :])
         else:
             stripped.append(line)
     return "\n".join(stripped)
@@ -291,6 +284,7 @@ def _strip_line_numbers(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool interface
 # ---------------------------------------------------------------------------
+
 
 async def apply_patch(
     arguments: dict[str, Any],
@@ -321,9 +315,7 @@ async def apply_patch(
 
 APPLY_PATCH_DEF = ToolDefinition(
     name="apply_patch",
-    description=(
-        "Apply a v4a-format patch to create, modify, delete, or move files."
-    ),
+    description=("Apply a v4a-format patch to create, modify, delete, or move files."),
     parameters={
         "type": "object",
         "properties": {

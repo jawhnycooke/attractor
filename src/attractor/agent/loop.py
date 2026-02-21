@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from attractor.agent.environment import ExecutionEnvironment
 from attractor.agent.events import AgentEvent, AgentEventType, EventEmitter
@@ -26,16 +27,12 @@ from attractor.llm.models import (
     ReasoningEffort,
     Request,
     Response,
-    Role,
-    TextContent,
-    ToolCallContent,
-    ToolResultContent,
 )
-
 
 # ---------------------------------------------------------------------------
 # LLM client protocol (decouples from concrete implementation)
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class LLMClientProtocol(Protocol):
@@ -48,33 +45,36 @@ class LLMClientProtocol(Protocol):
 # Loop configuration
 # ---------------------------------------------------------------------------
 
-class LoopConfig:
-    """Configuration passed into the loop from Session."""
 
-    def __init__(
-        self,
-        max_turns: int = 0,
-        max_tool_rounds: int = 0,
-        enable_loop_detection: bool = True,
-        reasoning_effort: ReasoningEffort | None = None,
-        default_command_timeout_ms: int = 10_000,
-        truncation_config: TruncationConfig | None = None,
-        model_id: str = "",
-        user_instructions: str = "",
-    ) -> None:
-        self.max_turns = max_turns
-        self.max_tool_rounds = max_tool_rounds
-        self.enable_loop_detection = enable_loop_detection
-        self.reasoning_effort = reasoning_effort
-        self.default_command_timeout_ms = default_command_timeout_ms
-        self.truncation_config = truncation_config
-        self.model_id = model_id
-        self.user_instructions = user_instructions
+@dataclass(frozen=True)
+class LoopConfig:
+    """Immutable configuration passed into the loop from Session.
+
+    Attributes:
+        max_turns: Maximum agentic turns, or None for unlimited.
+        max_tool_rounds: Maximum tool-call rounds, or None for unlimited.
+        enable_loop_detection: Whether to detect repeating tool patterns.
+        reasoning_effort: Optional reasoning effort level for the LLM.
+        default_command_timeout_ms: Default timeout for shell commands.
+        truncation_config: Optional truncation settings for tool output.
+        model_id: Model identifier string.
+        user_instructions: Extra user instructions for the system prompt.
+    """
+
+    max_turns: int | None = None
+    max_tool_rounds: int | None = None
+    enable_loop_detection: bool = True
+    reasoning_effort: ReasoningEffort | None = None
+    default_command_timeout_ms: int = 10_000
+    truncation_config: TruncationConfig | None = None
+    model_id: str = ""
+    user_instructions: str = ""
 
 
 # ---------------------------------------------------------------------------
 # AgentLoop
 # ---------------------------------------------------------------------------
+
 
 class AgentLoop:
     """Executes the agentic tool-use loop.
@@ -113,12 +113,14 @@ class AgentLoop:
         """
         # Append user message
         history.append(Message.user(user_input))
-        self._emitter.emit(AgentEvent(
-            type=AgentEventType.USER_INPUT,
-            data={"text": user_input},
-        ))
+        self._emitter.emit(
+            AgentEvent(
+                type=AgentEventType.USER_INPUT,
+                data={"text": user_input},
+            )
+        )
 
-        system_prompt = build_system_prompt(
+        system_prompt = await build_system_prompt(
             self._profile,
             self._env,
             model_id=self._config.model_id,
@@ -129,21 +131,25 @@ class AgentLoop:
         turn = 0
         while True:
             # Check turn limit
-            if self._config.max_turns > 0 and turn >= self._config.max_turns:
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.TURN_LIMIT,
-                    data={"turns": turn, "limit": self._config.max_turns},
-                ))
+            if self._config.max_turns is not None and turn >= self._config.max_turns:
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.TURN_LIMIT,
+                        data={"turns": turn, "limit": self._config.max_turns},
+                    )
+                )
                 return
 
             if (
-                self._config.max_tool_rounds > 0
+                self._config.max_tool_rounds is not None
                 and turn >= self._config.max_tool_rounds
             ):
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.TURN_LIMIT,
-                    data={"turns": turn, "limit": self._config.max_tool_rounds},
-                ))
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.TURN_LIMIT,
+                        data={"turns": turn, "limit": self._config.max_tool_rounds},
+                    )
+                )
                 return
 
             # Build request
@@ -159,10 +165,15 @@ class AgentLoop:
             try:
                 response = await self._llm.complete(request)
             except Exception as exc:
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.ERROR,
-                    data={"error": str(exc), "phase": "llm_call"},
-                ))
+                # Pop the user message to maintain user/assistant alternation
+                # invariant — no assistant response was generated.
+                history.pop()
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.ERROR,
+                        data={"error": str(exc), "phase": "llm_call"},
+                    )
+                )
                 return
 
             # Record assistant message
@@ -173,30 +184,38 @@ class AgentLoop:
             if not tool_calls:
                 # Text-only response — natural completion
                 text = response.message.text()
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.ASSISTANT_TEXT_START,
-                    data={},
-                ))
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.ASSISTANT_TEXT_DELTA,
-                    data={"text": text},
-                ))
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.ASSISTANT_TEXT_END,
-                    data={"text": text},
-                ))
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.ASSISTANT_TEXT_START,
+                        data={},
+                    )
+                )
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.ASSISTANT_TEXT_DELTA,
+                        data={"text": text},
+                    )
+                )
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.ASSISTANT_TEXT_END,
+                        data={"text": text},
+                    )
+                )
                 return
 
             # Execute tool calls
             for tc in tool_calls:
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.TOOL_CALL_START,
-                    data={
-                        "tool_name": tc.tool_name,
-                        "tool_call_id": tc.tool_call_id,
-                        "arguments": tc.arguments,
-                    },
-                ))
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.TOOL_CALL_START,
+                        data={
+                            "tool_name": tc.tool_name,
+                            "tool_call_id": tc.tool_call_id,
+                            "arguments": tc.arguments,
+                        },
+                    )
+                )
 
                 result = await self._registry.dispatch(
                     tc.tool_name, tc.arguments, self._env
@@ -213,32 +232,38 @@ class AgentLoop:
                     result.full_output = full
 
                 # Emit output delta
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.TOOL_CALL_OUTPUT_DELTA,
-                    data={
-                        "tool_call_id": tc.tool_call_id,
-                        "output": truncated,
-                    },
-                ))
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.TOOL_CALL_OUTPUT_DELTA,
+                        data={
+                            "tool_call_id": tc.tool_call_id,
+                            "output": truncated,
+                        },
+                    )
+                )
 
                 # TOOL_CALL_END carries the full untruncated output
-                self._emitter.emit(AgentEvent(
-                    type=AgentEventType.TOOL_CALL_END,
-                    data={
-                        "tool_name": tc.tool_name,
-                        "tool_call_id": tc.tool_call_id,
-                        "output": truncated,
-                        "full_output": full,
-                        "is_error": result.is_error,
-                    },
-                ))
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.TOOL_CALL_END,
+                        data={
+                            "tool_name": tc.tool_name,
+                            "tool_call_id": tc.tool_call_id,
+                            "output": truncated,
+                            "full_output": full,
+                            "is_error": result.is_error,
+                        },
+                    )
+                )
 
                 # Append tool result to history
-                history.append(Message.tool_result(
-                    tool_call_id=tc.tool_call_id,
-                    content=truncated,
-                    is_error=result.is_error,
-                ))
+                history.append(
+                    Message.tool_result(
+                        tool_call_id=tc.tool_call_id,
+                        content=truncated,
+                        is_error=result.is_error,
+                    )
+                )
 
                 # Record for loop detection
                 if self._config.enable_loop_detection:
@@ -251,23 +276,25 @@ class AgentLoop:
             if self._steering_queue:
                 for msg in self._steering_queue:
                     history.append(Message.user(msg))
-                    self._emitter.emit(AgentEvent(
-                        type=AgentEventType.STEERING_INJECTED,
-                        data={"text": msg},
-                    ))
+                    self._emitter.emit(
+                        AgentEvent(
+                            type=AgentEventType.STEERING_INJECTED,
+                            data={"text": msg},
+                        )
+                    )
                 self._steering_queue.clear()
 
             # Check for loops
             if self._config.enable_loop_detection:
                 warning = self._detector.check_for_loops()
                 if warning:
-                    self._emitter.emit(AgentEvent(
-                        type=AgentEventType.LOOP_DETECTION,
-                        data={"warning": warning},
-                    ))
+                    self._emitter.emit(
+                        AgentEvent(
+                            type=AgentEventType.LOOP_DETECTION,
+                            data={"warning": warning},
+                        )
+                    )
                     # Inject the warning as a user message so the model sees it
-                    history.append(Message.user(
-                        f"[SYSTEM WARNING] {warning}"
-                    ))
+                    history.append(Message.user(f"[SYSTEM WARNING] {warning}"))
 
             turn += 1

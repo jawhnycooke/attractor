@@ -55,16 +55,31 @@ class AnthropicAdapter:
         self._client = anthropic.AsyncAnthropic(api_key=self._api_key)
 
     def provider_name(self) -> str:
+        """Return the canonical provider name.
+
+        Returns:
+            The string ``"anthropic"``.
+        """
         return "anthropic"
 
     def detect_model(self, model: str) -> bool:
+        """Check whether *model* belongs to this provider.
+
+        Args:
+            model: Model identifier string (e.g. ``"claude-sonnet-4-20250514"``).
+
+        Returns:
+            True if the model string starts with ``"claude-"``.
+        """
         return model.startswith("claude-")
 
     # -----------------------------------------------------------------
     # Request mapping
     # -----------------------------------------------------------------
 
-    def _ensure_alternation(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _ensure_alternation(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         """Anthropic requires strict user/assistant alternation.
 
         Insert synthetic placeholder messages where consecutive same-role
@@ -103,12 +118,14 @@ class AnthropicAdapter:
             results = []
             for part in msg.content:
                 if isinstance(part, ToolResultContent):
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": part.tool_call_id,
-                        "content": part.content,
-                        **({"is_error": True} if part.is_error else {}),
-                    })
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": part.tool_call_id,
+                            "content": part.content,
+                            **({"is_error": True} if part.is_error else {}),
+                        }
+                    )
             return {"role": "user", "content": results}
 
         content = self._map_content_parts(msg)
@@ -122,31 +139,39 @@ class AnthropicAdapter:
                 parts.append({"type": "text", "text": part.text})
             elif isinstance(part, ImageContent):
                 if part.base64_data:
-                    parts.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": part.media_type,
-                            "data": part.base64_data,
-                        },
-                    })
+                    parts.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": part.media_type,
+                                "data": part.base64_data,
+                            },
+                        }
+                    )
                 elif part.url:
-                    parts.append({
-                        "type": "image",
-                        "source": {"type": "url", "url": part.url},
-                    })
+                    parts.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": part.url},
+                        }
+                    )
             elif isinstance(part, ToolCallContent):
                 args_str = part.arguments_json or json.dumps(part.arguments)
                 try:
-                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    args = (
+                        json.loads(args_str) if isinstance(args_str, str) else args_str
+                    )
                 except json.JSONDecodeError:
                     args = {}
-                parts.append({
-                    "type": "tool_use",
-                    "id": part.tool_call_id,
-                    "name": part.tool_name,
-                    "input": args,
-                })
+                parts.append(
+                    {
+                        "type": "tool_use",
+                        "id": part.tool_call_id,
+                        "name": part.tool_name,
+                        "input": args,
+                    }
+                )
             elif isinstance(part, ThinkingContent):
                 parts.append({"type": "thinking", "thinking": part.text})
             elif isinstance(part, RedactedThinkingContent):
@@ -204,24 +229,29 @@ class AnthropicAdapter:
                 content_parts.append(TextContent(text=block.text))
             elif block.type == "tool_use":
                 args = block.input if isinstance(block.input, dict) else {}
-                content_parts.append(ToolCallContent(
-                    tool_call_id=block.id,
-                    tool_name=block.name,
-                    arguments=args,
-                    arguments_json=json.dumps(args),
-                ))
+                content_parts.append(
+                    ToolCallContent(
+                        tool_call_id=block.id,
+                        tool_name=block.name,
+                        arguments=args,
+                        arguments_json=json.dumps(args),
+                    )
+                )
             elif block.type == "thinking":
                 content_parts.append(ThinkingContent(text=block.thinking))
             elif block.type == "redacted_thinking":
-                content_parts.append(RedactedThinkingContent(
-                    data=getattr(block, "data", ""),
-                ))
+                content_parts.append(
+                    RedactedThinkingContent(
+                        data=getattr(block, "data", ""),
+                    )
+                )
 
         usage = TokenUsage(
             input_tokens=raw.usage.input_tokens,
             output_tokens=raw.usage.output_tokens,
             cache_read_tokens=getattr(raw.usage, "cache_read_input_tokens", 0) or 0,
-            cache_write_tokens=getattr(raw.usage, "cache_creation_input_tokens", 0) or 0,
+            cache_write_tokens=getattr(raw.usage, "cache_creation_input_tokens", 0)
+            or 0,
         )
 
         finish = _FINISH_MAP.get(raw.stop_reason or "end_turn", FinishReason.STOP)
@@ -240,6 +270,14 @@ class AnthropicAdapter:
     # -----------------------------------------------------------------
 
     async def complete(self, request: Request) -> Response:
+        """Send a non-streaming completion request to the Anthropic Messages API.
+
+        Args:
+            request: Provider-agnostic request to send.
+
+        Returns:
+            Mapped Response with content, usage, and finish reason.
+        """
         kwargs = self._build_kwargs(request)
         t0 = time.monotonic()
         raw = await self._client.messages.create(**kwargs)
@@ -247,6 +285,14 @@ class AnthropicAdapter:
         return self._map_response(raw, latency)
 
     async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+        """Send a streaming request to the Anthropic Messages API.
+
+        Args:
+            request: Provider-agnostic request to send.
+
+        Yields:
+            StreamEvent instances as they arrive from the API.
+        """
         kwargs = self._build_kwargs(request)
         kwargs["stream"] = True
 
@@ -304,8 +350,11 @@ class AnthropicAdapter:
                             current_tool.arguments = json.loads(
                                 current_tool.arguments_json
                             )
-                        except json.JSONDecodeError:
-                            pass
+                        except json.JSONDecodeError as exc:
+                            logger.warning(
+                                "Failed to parse tool call arguments: %s",
+                                exc,
+                            )
                     yield StreamEvent(
                         type=StreamEventType.TOOL_CALL_END,
                         tool_call=current_tool,

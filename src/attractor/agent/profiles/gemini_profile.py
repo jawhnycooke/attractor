@@ -6,7 +6,6 @@ optional web tools.
 
 from __future__ import annotations
 
-from attractor.agent.profiles.base import ProviderProfile
 from attractor.agent.tools.core_tools import (
     EDIT_FILE_DEF,
     GLOB_DEF,
@@ -62,15 +61,22 @@ code by interacting with the filesystem and running commands.
 """
 
 
-class GeminiProfile(ProviderProfile):
-    """Profile aligned with gemini-cli conventions."""
+class GeminiProfile:
+    """Profile aligned with gemini-cli conventions.
+
+    Provides Google-specific tool definitions and system prompt
+    template for Gemini models. Includes list_dir for directory
+    exploration.
+    """
 
     @property
     def provider_name(self) -> str:
+        """Return the provider identifier."""
         return "google"
 
     @property
     def tool_definitions(self) -> list[ToolDefinition]:
+        """Return Gemini tool definitions including list_dir."""
         return [
             EDIT_FILE_DEF,
             READ_FILE_DEF,
@@ -84,8 +90,21 @@ class GeminiProfile(ProviderProfile):
 
     @property
     def system_prompt_template(self) -> str:
+        """Return the gemini-cli system prompt template."""
         return _SYSTEM_PROMPT
 
     @property
     def context_window_size(self) -> int:
+        """Return the 1M context window size for Gemini models."""
         return 1_000_000
+
+    def get_tools(self) -> list[ToolDefinition]:
+        """Return the tool definitions for this profile."""
+        return list(self.tool_definitions)
+
+    def format_system_prompt(self, **kwargs: str) -> str:
+        """Render the system prompt template with the given variables."""
+        template = self.system_prompt_template
+        for key, value in kwargs.items():
+            template = template.replace(f"{{{key}}}", str(value))
+        return template

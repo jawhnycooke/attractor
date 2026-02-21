@@ -10,7 +10,8 @@ import asyncio
 import enum
 import time
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 
 class AgentEventType(str, enum.Enum):

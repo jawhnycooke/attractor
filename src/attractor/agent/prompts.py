@@ -10,12 +10,16 @@ Builds a layered system prompt with precedence (later overrides earlier):
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import logging
 import subprocess
 from pathlib import Path
 
 from attractor.agent.environment import ExecutionEnvironment
 from attractor.agent.profiles.base import ProviderProfile
+
+logger = logging.getLogger(__name__)
 
 # Max bytes of project documentation to include in the system prompt.
 _PROJECT_DOC_BUDGET = 32 * 1024
@@ -28,8 +32,8 @@ _PROVIDER_DOC_MAP: dict[str, list[str]] = {
 }
 
 
-def _git_root(working_dir: str) -> str | None:
-    """Return the git repository root, or None."""
+def _git_root_sync(working_dir: str) -> str | None:
+    """Return the git repository root, or None (blocking)."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -40,12 +44,13 @@ def _git_root(working_dir: str) -> str | None:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("git rev-parse --show-toplevel failed: %s", exc)
     return None
 
 
-def _git_branch(working_dir: str) -> str:
+def _git_branch_sync(working_dir: str) -> str:
+    """Return the current git branch name (blocking)."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -56,12 +61,13 @@ def _git_branch(working_dir: str) -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("git rev-parse --abbrev-ref HEAD failed: %s", exc)
     return "(not a git repo)"
 
 
-def _git_status(working_dir: str) -> str:
+def _git_status_sync(working_dir: str) -> str:
+    """Return a short git status summary (blocking)."""
     try:
         result = subprocess.run(
             ["git", "status", "--short"],
@@ -73,9 +79,24 @@ def _git_status(working_dir: str) -> str:
         if result.returncode == 0:
             status = result.stdout.strip()
             return status if status else "clean"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("git status --short failed: %s", exc)
     return "(not a git repo)"
+
+
+async def _git_root(working_dir: str) -> str | None:
+    """Return the git repository root, or None."""
+    return await asyncio.to_thread(_git_root_sync, working_dir)
+
+
+async def _git_branch(working_dir: str) -> str:
+    """Return the current git branch name."""
+    return await asyncio.to_thread(_git_branch_sync, working_dir)
+
+
+async def _git_status(working_dir: str) -> str:
+    """Return a short git status summary."""
+    return await asyncio.to_thread(_git_status_sync, working_dir)
 
 
 def discover_project_docs(working_dir: str, provider_name: str) -> str:
@@ -84,7 +105,7 @@ def discover_project_docs(working_dir: str, provider_name: str) -> str:
     Always loads AGENTS.md if found, plus provider-specific files.
     Respects a 32 KB total budget.
     """
-    root = _git_root(working_dir) or working_dir
+    root = _git_root_sync(working_dir) or working_dir
     search_dirs = []
 
     # Walk from working_dir up to root
@@ -127,7 +148,8 @@ def discover_project_docs(working_dir: str, provider_name: str) -> str:
                         break
                     collected.append(f"# {fname} (from {directory})\n{content}")
                     total_bytes += len(content.encode())
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Failed to read project doc %s: %s", fpath, exc)
                     continue
         if total_bytes >= _PROJECT_DOC_BUDGET:
             break
@@ -135,7 +157,7 @@ def discover_project_docs(working_dir: str, provider_name: str) -> str:
     return "\n\n".join(collected)
 
 
-def build_system_prompt(
+async def build_system_prompt(
     profile: ProviderProfile,
     environment: ExecutionEnvironment,
     model_id: str = "",
@@ -150,8 +172,11 @@ def build_system_prompt(
     """
     working_dir = environment.working_directory()
     platform = environment.platform()
-    git_branch = _git_branch(working_dir)
-    git_status = _git_status(working_dir)
+
+    git_branch, git_status = await asyncio.gather(
+        _git_branch(working_dir),
+        _git_status(working_dir),
+    )
     date = datetime.date.today().isoformat()
 
     project_docs = discover_project_docs(working_dir, profile.provider_name)

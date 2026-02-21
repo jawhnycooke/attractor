@@ -71,6 +71,7 @@ def parse_dot_string(dot_content: str, name: str = "pipeline") -> Pipeline:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_nodes(graph: pydot.Dot) -> dict[str, PipelineNode]:
     nodes: dict[str, PipelineNode] = {}
     for dot_node in graph.get_nodes():
@@ -106,13 +107,15 @@ def _extract_edges(graph: pydot.Dot) -> list[PipelineEdge]:
         label = attrs.pop("label", "")
         priority = int(attrs.pop("priority", "0"))
 
-        edges.append(PipelineEdge(
-            source=source,
-            target=target,
-            condition=condition,
-            label=label,
-            priority=priority,
-        ))
+        edges.append(
+            PipelineEdge(
+                source=source,
+                target=target,
+                condition=condition,
+                label=label,
+                priority=priority,
+            )
+        )
 
     return edges
 
@@ -133,12 +136,12 @@ def _resolve_start(nodes: dict[str, PipelineNode]) -> str:
         nodes["start"].is_start = True
         return "start"
 
-    raise ParseError("No start node found — set start=true on a node or name one 'start'")
+    raise ParseError(
+        "No start node found — set start=true on a node or name one 'start'"
+    )
 
 
-def _mark_terminals(
-    nodes: dict[str, PipelineNode], edges: list[PipelineEdge]
-) -> None:
+def _mark_terminals(nodes: dict[str, PipelineNode], edges: list[PipelineEdge]) -> None:
     """Implicitly mark nodes with no outgoing edges as terminal."""
     sources = {e.source for e in edges}
     for node in nodes.values():

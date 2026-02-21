@@ -6,7 +6,6 @@ and adds file-system helpers for checkpoint persistence.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from attractor.pipeline.models import Checkpoint, PipelineContext

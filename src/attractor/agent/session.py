@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import enum
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from attractor.agent.environment import ExecutionEnvironment
 from attractor.agent.events import AgentEvent, AgentEventType, EventEmitter
@@ -45,10 +45,10 @@ from attractor.agent.tools.subagent import (
 from attractor.agent.truncation import TruncationConfig
 from attractor.llm.models import Message, ReasoningEffort
 
-
 # ---------------------------------------------------------------------------
 # Session configuration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SessionConfig:
@@ -68,6 +68,7 @@ class SessionConfig:
 # ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------
+
 
 class SessionState(str, enum.Enum):
     IDLE = "idle"
@@ -102,13 +103,16 @@ class Session:
         self._reasoning_effort = config.reasoning_effort
         self._registry = self._build_registry()
         self._loop_detector = LoopDetector()
+        self._current_loop: AgentLoop | None = None
 
     @property
     def state(self) -> SessionState:
+        """Current session lifecycle state."""
         return self._state
 
     @property
     def conversation_history(self) -> list[Message]:
+        """Snapshot of the conversation history (defensive copy)."""
         return list(self._history)
 
     def _build_registry(self) -> ToolRegistry:
@@ -150,14 +154,16 @@ class Session:
         self._state = SessionState.RUNNING
         emitter = EventEmitter()
 
-        emitter.emit(AgentEvent(
-            type=AgentEventType.SESSION_START,
-            data={"state": self._state.value},
-        ))
+        emitter.emit(
+            AgentEvent(
+                type=AgentEventType.SESSION_START,
+                data={"state": self._state.value},
+            )
+        )
 
         loop_config = LoopConfig(
-            max_turns=self._config.max_turns,
-            max_tool_rounds=self._config.max_tool_rounds_per_input,
+            max_turns=self._config.max_turns or None,
+            max_tool_rounds=self._config.max_tool_rounds_per_input or None,
             enable_loop_detection=self._config.enable_loop_detection,
             reasoning_effort=self._reasoning_effort,
             default_command_timeout_ms=self._config.default_command_timeout_ms,
@@ -175,6 +181,7 @@ class Session:
             config=loop_config,
             loop_detector=self._loop_detector,
         )
+        self._current_loop = loop
 
         # Run the loop in a background task so we can yield events as
         # they arrive.
@@ -188,16 +195,21 @@ class Session:
                     await loop.run(follow_up, self._history)
 
             except Exception as exc:
-                emitter.emit(AgentEvent(
-                    type=AgentEventType.ERROR,
-                    data={"error": str(exc), "phase": "session"},
-                ))
+                emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.ERROR,
+                        data={"error": str(exc), "phase": "session"},
+                    )
+                )
             finally:
                 self._state = SessionState.IDLE
-                emitter.emit(AgentEvent(
-                    type=AgentEventType.SESSION_END,
-                    data={"state": self._state.value},
-                ))
+                self._current_loop = None
+                emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.SESSION_END,
+                        data={"state": self._state.value},
+                    )
+                )
                 emitter.close()
 
         task = asyncio.create_task(_run_loop())
@@ -213,11 +225,12 @@ class Session:
 
         Steering messages are injected as user messages between tool rounds,
         allowing the caller to redirect the agent mid-execution.
+
+        Args:
+            message: The steering text to inject into the conversation.
         """
-        # This needs to reach into the current loop instance.
-        # We store it so the next loop picks it up.
-        # For a running loop, we'd need a reference — simplified here.
-        pass
+        if self._current_loop is not None:
+            self._current_loop.queue_steering(message)
 
     def follow_up(self, message: str) -> None:
         """Queue a message for processing after the current input completes."""

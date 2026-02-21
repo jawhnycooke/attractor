@@ -13,9 +13,7 @@ def _make_pipeline(**overrides) -> Pipeline:
     defaults = {
         "name": "test",
         "nodes": {
-            "start": PipelineNode(
-                name="start", handler_type="codergen", is_start=True
-            ),
+            "start": PipelineNode(name="start", handler_type="codergen", is_start=True),
             "end": PipelineNode(
                 name="end", handler_type="conditional", is_terminal=True
             ),
@@ -87,26 +85,18 @@ class TestValidatePipeline:
         assert any("ghost" in f.message for f in findings)
 
     def test_invalid_condition_syntax(self) -> None:
-        edges = [
-            PipelineEdge(
-                source="start", target="end", condition="== broken =="
-            )
-        ]
+        edges = [PipelineEdge(source="start", target="end", condition="== broken ==")]
         pipeline = _make_pipeline(edges=edges)
         findings = validate_pipeline(pipeline)
         assert any("condition" in f.message.lower() for f in findings)
 
     def test_unreachable_node_warning(self) -> None:
         nodes = {
-            "start": PipelineNode(
-                name="start", handler_type="codergen", is_start=True
-            ),
+            "start": PipelineNode(name="start", handler_type="codergen", is_start=True),
             "end": PipelineNode(
                 name="end", handler_type="conditional", is_terminal=True
             ),
-            "orphan": PipelineNode(
-                name="orphan", handler_type="codergen"
-            ),
+            "orphan": PipelineNode(name="orphan", handler_type="codergen"),
         }
         edges = [PipelineEdge(source="start", target="end")]
         pipeline = _make_pipeline(nodes=nodes, edges=edges)
@@ -134,10 +124,8 @@ class TestValidatePipeline:
     def test_has_errors_helper(self) -> None:
         from attractor.pipeline.validator import ValidationError
 
-        assert has_errors([
-            ValidationError(level=ValidationLevel.ERROR, message="bad")
-        ])
-        assert not has_errors([
-            ValidationError(level=ValidationLevel.WARNING, message="meh")
-        ])
+        assert has_errors([ValidationError(level=ValidationLevel.ERROR, message="bad")])
+        assert not has_errors(
+            [ValidationError(level=ValidationLevel.WARNING, message="meh")]
+        )
         assert not has_errors([])

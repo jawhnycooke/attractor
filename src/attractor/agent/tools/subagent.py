@@ -2,13 +2,17 @@
 
 Allows the main agent to spawn child agents for delegating subtasks.
 Subagents run in their own Sessions and communicate results back.
+
+Subagent state is stored per-session on the environment object
+(``environment.subagents``) rather than in module-level globals, so
+concurrent sessions do not share or leak subagent handles.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from attractor.agent.tools.registry import ToolResult
@@ -17,7 +21,14 @@ from attractor.llm.models import ToolDefinition
 
 @dataclass
 class SubagentHandle:
-    """Tracks a running subagent."""
+    """Tracks a running subagent.
+
+    Attributes:
+        agent_id: Unique identifier for the subagent.
+        task: The asyncio task executing the subagent, if any.
+        result: Completed result text, or None if still running.
+        closed: Whether the subagent has been closed.
+    """
 
     agent_id: str
     task: asyncio.Task[str] | None = None
@@ -25,16 +36,15 @@ class SubagentHandle:
     closed: bool = False
 
 
-# Module-level registry of active subagents.
-_subagents: dict[str, SubagentHandle] = {}
+def _get_subagents(environment: Any) -> dict[str, SubagentHandle]:
+    """Return the session-scoped subagent registry from *environment*.
 
-
-def _register_subagent(handle: SubagentHandle) -> None:
-    _subagents[handle.agent_id] = handle
-
-
-def get_active_subagents() -> dict[str, SubagentHandle]:
-    return _subagents
+    Falls back to creating the attribute if not present, for
+    environments that don't pre-initialise the dict.
+    """
+    if not hasattr(environment, "subagents"):
+        environment.subagents = {}
+    return environment.subagents
 
 
 async def spawn_agent(
@@ -43,9 +53,12 @@ async def spawn_agent(
 ) -> ToolResult:
     """Spawn a new subagent to work on a task.
 
-    The actual session creation is handled by the parent session
-    which injects the spawn logic. This is a placeholder that will be
-    wired up by the Session class.
+    Args:
+        arguments: Must contain a ``task`` key describing the work.
+        environment: Execution environment (carries session-scoped state).
+
+    Returns:
+        ToolResult with the new agent ID.
     """
     task_desc = arguments.get("task", "")
     if not task_desc:
@@ -55,9 +68,10 @@ async def spawn_agent(
             full_output="Error: 'task' is required",
         )
 
+    subagents = _get_subagents(environment)
     agent_id = f"subagent_{uuid.uuid4().hex[:8]}"
     handle = SubagentHandle(agent_id=agent_id)
-    _register_subagent(handle)
+    subagents[agent_id] = handle
 
     msg = (
         f"Subagent '{agent_id}' created for task: {task_desc}\n"
@@ -70,11 +84,20 @@ async def send_input(
     arguments: dict[str, Any],
     environment: Any,
 ) -> ToolResult:
-    """Send a follow-up message to a running subagent."""
-    agent_id: str = arguments.get("agent_id", "")
-    message: str = arguments.get("message", "")
+    """Send a follow-up message to a running subagent.
 
-    handle = _subagents.get(agent_id)
+    Args:
+        arguments: Must contain ``agent_id`` and ``message`` keys.
+        environment: Execution environment.
+
+    Returns:
+        ToolResult confirming delivery or describing the error.
+    """
+    agent_id: str = arguments.get("agent_id", "")
+    _message: str = arguments.get("message", "")  # TODO: deliver to subagent
+
+    subagents = _get_subagents(environment)
+    handle = subagents.get(agent_id)
     if handle is None:
         return ToolResult(
             output=f"Error: no subagent with id '{agent_id}'",
@@ -96,10 +119,19 @@ async def wait_agent(
     arguments: dict[str, Any],
     environment: Any,
 ) -> ToolResult:
-    """Wait for a subagent to complete and return its result."""
+    """Wait for a subagent to complete and return its result.
+
+    Args:
+        arguments: Must contain an ``agent_id`` key.
+        environment: Execution environment.
+
+    Returns:
+        ToolResult with the subagent output or an error.
+    """
     agent_id: str = arguments.get("agent_id", "")
 
-    handle = _subagents.get(agent_id)
+    subagents = _get_subagents(environment)
+    handle = subagents.get(agent_id)
     if handle is None:
         return ToolResult(
             output=f"Error: no subagent with id '{agent_id}'",
@@ -127,10 +159,19 @@ async def close_agent(
     arguments: dict[str, Any],
     environment: Any,
 ) -> ToolResult:
-    """Close a subagent and free its resources."""
+    """Close a subagent and free its resources.
+
+    Args:
+        arguments: Must contain an ``agent_id`` key.
+        environment: Execution environment.
+
+    Returns:
+        ToolResult confirming closure or describing the error.
+    """
     agent_id: str = arguments.get("agent_id", "")
 
-    handle = _subagents.get(agent_id)
+    subagents = _get_subagents(environment)
+    handle = subagents.get(agent_id)
     if handle is None:
         return ToolResult(
             output=f"Error: no subagent with id '{agent_id}'",
@@ -142,7 +183,7 @@ async def close_agent(
     if handle.task and not handle.task.done():
         handle.task.cancel()
 
-    del _subagents[agent_id]
+    del subagents[agent_id]
     msg = f"Subagent '{agent_id}' closed"
     return ToolResult(output=msg, full_output=msg)
 

@@ -12,10 +12,7 @@ from attractor.llm.models import (
     Request,
     Response,
     Role,
-    TextContent,
-    TokenUsage,
     ToolCallContent,
-    ToolResultContent,
 )
 
 
@@ -92,10 +89,12 @@ class TestSessionLifecycle:
         """Session should execute tool calls and loop back to LLM."""
         (tmp_path / "test.txt").write_text("file content\n")
 
-        client = MockLLMClient([
-            _tool_call_response("read_file", {"path": "test.txt"}),
-            _text_response("The file contains: file content"),
-        ])
+        client = MockLLMClient(
+            [
+                _tool_call_response("read_file", {"path": "test.txt"}),
+                _text_response("The file contains: file content"),
+            ]
+        )
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
 
@@ -113,8 +112,7 @@ class TestSessionLifecycle:
         """Session should stop after reaching the turn limit."""
         # Return tool calls forever
         responses = [
-            _tool_call_response("shell", {"command": "echo hi"})
-            for _ in range(20)
+            _tool_call_response("shell", {"command": "echo hi"}) for _ in range(20)
         ]
         client = MockLLMClient(responses)
         config = SessionConfig(
@@ -172,10 +170,12 @@ class TestSessionLifecycle:
 
     @pytest.mark.asyncio
     async def test_follow_up_queue(self, env) -> None:
-        client = MockLLMClient([
-            _text_response("first done"),
-            _text_response("follow-up done"),
-        ])
+        client = MockLLMClient(
+            [
+                _text_response("first done"),
+                _text_response("follow-up done"),
+            ]
+        )
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
         session.follow_up("Do this next")
@@ -185,10 +185,7 @@ class TestSessionLifecycle:
             events.append(event)
 
         # Should have processed both the initial and follow-up
-        text_events = [
-            e for e in events
-            if e.type == AgentEventType.ASSISTANT_TEXT_END
-        ]
+        text_events = [e for e in events if e.type == AgentEventType.ASSISTANT_TEXT_END]
         assert len(text_events) >= 1
 
     @pytest.mark.asyncio

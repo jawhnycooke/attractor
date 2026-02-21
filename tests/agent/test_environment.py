@@ -128,6 +128,75 @@ class TestGlob:
         assert len(py_files) == 2
 
 
+# ---------------------------------------------------------------------------
+# D5: Credential filtering (_filter_env)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterEnv:
+    """Tests for _filter_env — environment variable credential filtering."""
+
+    def test_filter_env_removes_known_api_keys(self) -> None:
+        from attractor.agent.environment import _filter_env
+
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-xxx",
+            "OPENAI_API_KEY": "sk-xxx",
+            "GOOGLE_API_KEY": "AIzaxxx",
+            "PATH": "/usr/bin",
+        }
+        filtered = _filter_env(env)
+        assert "ANTHROPIC_API_KEY" not in filtered
+        assert "OPENAI_API_KEY" not in filtered
+        assert "GOOGLE_API_KEY" not in filtered
+        assert filtered["PATH"] == "/usr/bin"
+
+    def test_filter_env_removes_new_patterns(self) -> None:
+        """Regression for B5: additional sensitive env vars must be filtered."""
+        from attractor.agent.environment import _filter_env
+
+        env = {
+            "AWS_ACCESS_KEY_ID": "AKIA...",
+            "GITHUB_TOKEN": "ghp_xxx",
+            "NPM_TOKEN": "npm_xxx",
+            "GH_TOKEN": "gho_xxx",
+            "DATABASE_URL": "postgres://user:pass@host/db",
+            "PATH": "/usr/bin",
+        }
+        filtered = _filter_env(env)
+        assert "AWS_ACCESS_KEY_ID" not in filtered
+        assert "GITHUB_TOKEN" not in filtered
+        assert "NPM_TOKEN" not in filtered
+        assert "GH_TOKEN" not in filtered
+        assert "DATABASE_URL" not in filtered
+        assert filtered["PATH"] == "/usr/bin"
+
+    def test_filter_env_preserves_safe_variables(self) -> None:
+        from attractor.agent.environment import _filter_env
+
+        env = {
+            "PATH": "/usr/bin:/usr/local/bin",
+            "HOME": "/home/user",
+            "LANG": "en_US.UTF-8",
+            "TERM": "xterm-256color",
+        }
+        filtered = _filter_env(env)
+        assert filtered == env
+
+    def test_filter_env_preserves_user_variables(self) -> None:
+        from attractor.agent.environment import _filter_env
+
+        env = {
+            "MY_APP_DEBUG": "true",
+            "LOG_LEVEL": "debug",
+            "ANTHROPIC_API_KEY": "secret",
+        }
+        filtered = _filter_env(env)
+        assert filtered["MY_APP_DEBUG"] == "true"
+        assert filtered["LOG_LEVEL"] == "debug"
+        assert "ANTHROPIC_API_KEY" not in filtered
+
+
 class TestPlatform:
     def test_platform_returns_string(self) -> None:
         env = LocalExecutionEnvironment()

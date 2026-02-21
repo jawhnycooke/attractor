@@ -3,7 +3,7 @@
 import pytest
 
 from attractor.pipeline.engine import EngineError, PipelineEngine
-from attractor.pipeline.handlers import HandlerRegistry, NodeHandler
+from attractor.pipeline.handlers import HandlerRegistry
 from attractor.pipeline.models import (
     NodeResult,
     Pipeline,
@@ -19,9 +19,7 @@ class EchoHandler:
     def __init__(self) -> None:
         self.executed: list[str] = []
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
         self.executed.append(node.name)
         return NodeResult(
             success=True,
@@ -33,9 +31,7 @@ class EchoHandler:
 class FailHandler:
     """Test handler that always fails."""
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
         return NodeResult(success=False, error="intentional failure")
 
 
@@ -45,9 +41,7 @@ class RoutingHandler:
     def __init__(self, target: str) -> None:
         self._target = target
 
-    async def execute(
-        self, node: PipelineNode, context: PipelineContext
-    ) -> NodeResult:
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
         return NodeResult(success=True, next_node=self._target)
 
 
@@ -56,13 +50,9 @@ def _simple_pipeline() -> Pipeline:
     return Pipeline(
         name="test",
         nodes={
-            "start": PipelineNode(
-                name="start", handler_type="echo", is_start=True
-            ),
+            "start": PipelineNode(name="start", handler_type="echo", is_start=True),
             "middle": PipelineNode(name="middle", handler_type="echo"),
-            "end": PipelineNode(
-                name="end", handler_type="echo", is_terminal=True
-            ),
+            "end": PipelineNode(name="end", handler_type="echo", is_terminal=True),
         },
         edges=[
             PipelineEdge(source="start", target="middle"),
@@ -77,15 +67,9 @@ def _branching_pipeline() -> Pipeline:
     return Pipeline(
         name="branch",
         nodes={
-            "start": PipelineNode(
-                name="start", handler_type="echo", is_start=True
-            ),
-            "left": PipelineNode(
-                name="left", handler_type="echo", is_terminal=True
-            ),
-            "right": PipelineNode(
-                name="right", handler_type="echo", is_terminal=True
-            ),
+            "start": PipelineNode(name="start", handler_type="echo", is_start=True),
+            "left": PipelineNode(name="left", handler_type="echo", is_terminal=True),
+            "right": PipelineNode(name="right", handler_type="echo", is_terminal=True),
         },
         edges=[
             PipelineEdge(
@@ -121,25 +105,21 @@ class TestPipelineEngine:
 
     async def test_context_propagation(self, registry: HandlerRegistry) -> None:
         engine = PipelineEngine(registry=registry)
-        initial = PipelineContext(data={"initial_key": "hello"})
+        initial = PipelineContext.from_dict({"initial_key": "hello"})
         ctx = await engine.run(_simple_pipeline(), context=initial)
         assert ctx.get("initial_key") == "hello"
         assert ctx.get("start_done") is True
 
-    async def test_conditional_branching_left(
-        self, registry: HandlerRegistry
-    ) -> None:
+    async def test_conditional_branching_left(self, registry: HandlerRegistry) -> None:
         engine = PipelineEngine(registry=registry)
-        ctx = PipelineContext(data={"go_left": True})
+        ctx = PipelineContext.from_dict({"go_left": True})
         result = await engine.run(_branching_pipeline(), context=ctx)
         assert result.get("left_done") is True
         assert result.get("right_done") is None
 
-    async def test_conditional_branching_right(
-        self, registry: HandlerRegistry
-    ) -> None:
+    async def test_conditional_branching_right(self, registry: HandlerRegistry) -> None:
         engine = PipelineEngine(registry=registry)
-        ctx = PipelineContext(data={"go_left": False})
+        ctx = PipelineContext.from_dict({"go_left": False})
         result = await engine.run(_branching_pipeline(), context=ctx)
         assert result.get("right_done") is True
         assert result.get("left_done") is None
@@ -156,9 +136,7 @@ class TestPipelineEngine:
                     name="start", handler_type="router", is_start=True
                 ),
                 "middle": PipelineNode(name="middle", handler_type="echo"),
-                "end": PipelineNode(
-                    name="end", handler_type="echo", is_terminal=True
-                ),
+                "end": PipelineNode(name="end", handler_type="echo", is_terminal=True),
             },
             edges=[
                 PipelineEdge(source="start", target="middle"),
@@ -181,12 +159,8 @@ class TestPipelineEngine:
         pipeline = Pipeline(
             name="fail_test",
             nodes={
-                "start": PipelineNode(
-                    name="start", handler_type="fail", is_start=True
-                ),
-                "end": PipelineNode(
-                    name="end", handler_type="echo", is_terminal=True
-                ),
+                "start": PipelineNode(name="start", handler_type="fail", is_start=True),
+                "end": PipelineNode(name="end", handler_type="echo", is_terminal=True),
             },
             edges=[PipelineEdge(source="start", target="end")],
             start_node="start",
@@ -210,9 +184,7 @@ class TestPipelineEngine:
         pipeline = Pipeline(
             name="loop",
             nodes={
-                "a": PipelineNode(
-                    name="a", handler_type="echo", is_start=True
-                ),
+                "a": PipelineNode(name="a", handler_type="echo", is_start=True),
                 "b": PipelineNode(name="b", handler_type="echo"),
             },
             edges=[
@@ -227,15 +199,141 @@ class TestPipelineEngine:
         completed = ctx.get("_completed_nodes")
         assert len(completed) == 10
 
+    async def test_checkpoint_records_next_node_not_completed(
+        self, registry: HandlerRegistry, tmp_path
+    ) -> None:
+        """Regression for A3: checkpoint should record the *next* node,
+        not the one that just completed."""
+        engine = PipelineEngine(registry=registry, checkpoint_dir=str(tmp_path))
+        await engine.run(_simple_pipeline())
+
+        # Find checkpoint files
+        import json
+
+        cp_files = sorted(tmp_path.glob("checkpoint_*.json"))
+        assert len(cp_files) >= 1
+
+        # Verify the invariant: for every checkpoint, current_node
+        # should NOT be in completed_nodes (unless it's the terminal
+        # checkpoint where current_node IS the terminal that just ran).
+        # At minimum, after "start" completes, the checkpoint should
+        # record the next node to run.
+        for cpf in cp_files:
+            cp_data = json.loads(cpf.read_text())
+            completed = cp_data["completed_nodes"]
+            current = cp_data["current_node"]
+            # If more nodes were executed after this checkpoint was saved,
+            # current_node is the NEXT to execute, which hasn't yet been added
+            # to completed_nodes.
+            # The key property: current_node points forward, not backward.
+            if len(completed) < 3:  # not the final checkpoint
+                assert current not in completed[: len(completed)]
+
+    async def test_resume_from_checkpoint_skips_completed_nodes(
+        self, registry: HandlerRegistry, echo_handler: EchoHandler
+    ) -> None:
+        from attractor.pipeline.models import Checkpoint
+
+        pipeline = _simple_pipeline()
+        # Create a checkpoint that says we're at "middle" with "start" done
+        checkpoint = Checkpoint(
+            pipeline_name="test",
+            current_node="middle",
+            context=PipelineContext(),
+            completed_nodes=["start"],
+        )
+
+        engine = PipelineEngine(registry=registry)
+        await engine.run(pipeline, checkpoint=checkpoint)
+
+        # Handler should have been called for middle and end, NOT start
+        assert "start" not in echo_handler.executed
+        assert "middle" in echo_handler.executed
+        assert "end" in echo_handler.executed
+
+    async def test_resume_with_invalid_node_raises(
+        self, registry: HandlerRegistry
+    ) -> None:
+        from attractor.pipeline.models import Checkpoint
+
+        pipeline = _simple_pipeline()
+        checkpoint = Checkpoint(
+            pipeline_name="test",
+            current_node="nonexistent_node",
+            context=PipelineContext(),
+            completed_nodes=[],
+        )
+
+        engine = PipelineEngine(registry=registry)
+        with pytest.raises(EngineError, match="not found"):
+            await engine.run(pipeline, checkpoint=checkpoint)
+
+    async def test_condition_error_sets_context_key(
+        self, registry: HandlerRegistry
+    ) -> None:
+        """Regression for A2: broken condition → _condition_error in context."""
+        pipeline = Pipeline(
+            name="cond_error",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="echo", is_start=True),
+                "target": PipelineNode(
+                    name="target", handler_type="echo", is_terminal=True
+                ),
+                "fallback": PipelineNode(
+                    name="fallback", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[
+                PipelineEdge(
+                    source="start",
+                    target="target",
+                    condition="invalid!!! syntax @@@",
+                    priority=0,
+                ),
+                PipelineEdge(source="start", target="fallback", priority=1),
+            ],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        # The bad condition should have set _condition_error
+        assert ctx.has("_condition_error")
+        # But execution continued via fallback
+        assert ctx.get("fallback_done") is True
+
+    async def test_condition_error_on_only_edge_raises(
+        self, registry: HandlerRegistry
+    ) -> None:
+        pipeline = Pipeline(
+            name="only_bad_edge",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="echo", is_start=True),
+                "target": PipelineNode(
+                    name="target", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[
+                PipelineEdge(
+                    source="start",
+                    target="target",
+                    condition="invalid!!! syntax @@@",
+                ),
+            ],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        with pytest.raises(EngineError, match="condition evaluation error"):
+            await engine.run(pipeline)
+
     async def test_default_edge_when_no_condition_matches(
         self, registry: HandlerRegistry
     ) -> None:
         pipeline = Pipeline(
             name="default_edge",
             nodes={
-                "start": PipelineNode(
-                    name="start", handler_type="echo", is_start=True
-                ),
+                "start": PipelineNode(name="start", handler_type="echo", is_start=True),
                 "cond_target": PipelineNode(
                     name="cond_target", handler_type="echo", is_terminal=True
                 ),

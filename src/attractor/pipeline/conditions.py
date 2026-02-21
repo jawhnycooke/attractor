@@ -87,6 +87,7 @@ def validate_condition_syntax(expression: str) -> str | None:
 # Internal AST walker
 # ---------------------------------------------------------------------------
 
+
 def _eval_node(node: ast.expr, ctx: PipelineContext) -> Any:
     """Recursively evaluate an AST node."""
     if isinstance(node, ast.Compare):

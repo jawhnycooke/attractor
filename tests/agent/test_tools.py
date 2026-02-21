@@ -34,9 +34,7 @@ class TestReadFile:
     @pytest.mark.asyncio
     async def test_read_with_offset_and_limit(self, env, tmp_path) -> None:
         (tmp_path / "lines.txt").write_text("\n".join(f"L{i}" for i in range(20)))
-        result = await read_file(
-            {"path": "lines.txt", "offset": 5, "limit": 3}, env
-        )
+        result = await read_file({"path": "lines.txt", "offset": 5, "limit": 3}, env)
         assert not result.is_error
         assert "L4" in result.output  # line 5 (0-indexed L4)
         assert "L0" not in result.output
@@ -51,9 +49,7 @@ class TestReadFile:
 class TestWriteFile:
     @pytest.mark.asyncio
     async def test_write_new_file(self, env, tmp_path) -> None:
-        result = await write_file(
-            {"path": "new.txt", "content": "hello world"}, env
-        )
+        result = await write_file({"path": "new.txt", "content": "hello world"}, env)
         assert not result.is_error
         assert (tmp_path / "new.txt").read_text() == "hello world"
 
@@ -120,9 +116,7 @@ class TestShell:
 
     @pytest.mark.asyncio
     async def test_command_timeout(self, env) -> None:
-        result = await shell(
-            {"command": "sleep 10", "timeout_ms": 500}, env
-        )
+        result = await shell({"command": "sleep 10", "timeout_ms": 500}, env)
         assert result.is_error
         assert "timed out" in result.output.lower()
 

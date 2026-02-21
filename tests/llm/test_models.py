@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import pytest
 
 from attractor.llm.models import (
     ContentKind,
     FinishReason,
     ImageContent,
     Message,
-    ReasoningEffort,
     Request,
     Response,
     RetryPolicy,
@@ -23,7 +21,6 @@ from attractor.llm.models import (
     ToolResultContent,
     TokenUsage,
 )
-
 
 # ---------------------------------------------------------------------------
 # Message creation helpers

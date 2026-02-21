@@ -10,13 +10,11 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
 
 from attractor.pipeline.conditions import evaluate_condition
 from attractor.pipeline.goals import GoalGate
 from attractor.pipeline.handlers import (
     HandlerRegistry,
-    NodeHandler,
     create_default_registry,
 )
 from attractor.pipeline.models import (
@@ -114,7 +112,9 @@ class PipelineEngine:
             if self._stylesheet:
                 node.attributes = apply_stylesheet(self._stylesheet, node)
 
-            logger.info("Executing node '%s' (handler: %s)", node.name, node.handler_type)
+            logger.info(
+                "Executing node '%s' (handler: %s)", node.name, node.handler_type
+            )
 
             # Dispatch to handler
             handler = registry.get(node.handler_type)
@@ -131,19 +131,22 @@ class PipelineEngine:
                 ctx.update(result.context_updates)
 
             if not result.success:
-                logger.error(
-                    "Node '%s' failed: %s", node.name, result.error
-                )
+                logger.error("Node '%s' failed: %s", node.name, result.error)
                 ctx.set("_last_error", result.error)
                 ctx.set("_failed_node", node.name)
 
             completed.append(node.name)
 
-            # Checkpoint
-            self._save_checkpoint(pipeline.name, current_node, ctx, completed)
-
             # Determine next node
             next_node = self._resolve_next(result, node, pipeline, ctx)
+
+            # Checkpoint with the *next* node so resume starts there
+            self._save_checkpoint(
+                pipeline.name,
+                next_node if next_node else current_node,
+                ctx,
+                completed,
+            )
 
             if next_node is None:
                 # Potential terminal — check goal gate
@@ -160,9 +163,7 @@ class PipelineEngine:
                 break
 
             if next_node not in pipeline.nodes:
-                raise EngineError(
-                    f"Next node '{next_node}' does not exist in pipeline"
-                )
+                raise EngineError(f"Next node '{next_node}' does not exist in pipeline")
 
             current_node = next_node
         else:
@@ -210,6 +211,7 @@ class PipelineEngine:
         # Evaluate outgoing edges in priority order
         edges = pipeline.outgoing_edges(node.name)
         default_target: str | None = None
+        had_condition_error = False
 
         for edge in edges:
             if edge.condition is None:
@@ -219,12 +221,22 @@ class PipelineEngine:
                 if evaluate_condition(edge.condition, ctx):
                     return edge.target
             except Exception as exc:
-                logger.warning(
-                    "Error evaluating condition '%s': %s", edge.condition, exc
+                had_condition_error = True
+                logger.error(
+                    "Error evaluating condition '%s': %s",
+                    edge.condition,
+                    exc,
                 )
+                ctx.set("_condition_error", str(exc))
 
         if default_target:
             return default_target
+
+        if had_condition_error:
+            raise EngineError(
+                f"No edge matched for non-terminal node '{node.name}' "
+                f"after condition evaluation error"
+            )
 
         # No outgoing edges — implicitly terminal
         return None

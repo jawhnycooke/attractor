@@ -7,9 +7,7 @@ logging, token tracking, and retry logic.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -23,11 +21,25 @@ class Middleware(Protocol):
     """Protocol for request/response middleware."""
 
     async def before_request(self, request: Request) -> Request:
-        """Transform or inspect a request before it is sent."""
+        """Transform or inspect a request before it is sent to a provider.
+
+        Args:
+            request: The outgoing LLM request.
+
+        Returns:
+            The (potentially modified) request to forward downstream.
+        """
         ...
 
     async def after_response(self, response: Response) -> Response:
-        """Transform or inspect a response after it is received."""
+        """Transform or inspect a response after it is received from a provider.
+
+        Args:
+            response: The incoming LLM response.
+
+        Returns:
+            The (potentially modified) response to return upstream.
+        """
         ...
 
 
