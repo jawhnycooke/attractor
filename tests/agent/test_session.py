@@ -262,5 +262,5 @@ class TestSessionLifecycle:
             pass
 
         # Verify reasoning_effort was passed through to the LLM request
-        assert len(captured_requests) >= 1
+        assert len(captured_requests) == 1
         assert captured_requests[0].reasoning_effort == ReasoningEffort.HIGH

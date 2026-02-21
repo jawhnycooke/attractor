@@ -156,10 +156,9 @@ class TestAnthropicReasoningTokens:
         raw = self._mock_response(thinking_text=thinking)
         response = adapter._map_response(raw, latency_ms=100.0)
 
-        word_count = len(thinking.split())
-        expected = int(word_count * 1.3)
-        assert response.usage.reasoning_tokens == expected
-        assert expected > 0
+        # "Let me think about this problem step by step and consider all angles"
+        # = 13 words × 1.3 = 16.9 → int(16.9) = 16
+        assert response.usage.reasoning_tokens == 16
 
     def test_no_thinking_yields_zero_reasoning_tokens(self) -> None:
         adapter = _make_anthropic_adapter()

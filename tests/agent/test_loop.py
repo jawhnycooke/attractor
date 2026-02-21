@@ -467,11 +467,12 @@ class TestAgentLoop:
 
         emitter.close()
 
-        # There should be a warning message injected about loop detection
+        # Warning is injected on each turn after the pattern is first detected
+        # (calls 3, 4, and 5 all trigger warnings)
         warning_msgs = [
             m for m in history if m.role == Role.USER and "SYSTEM WARNING" in m.text()
         ]
-        assert len(warning_msgs) >= 1
+        assert len(warning_msgs) == 3
 
     @pytest.mark.asyncio
     async def test_truncation_applied_to_long_output(self) -> None:
@@ -654,7 +655,8 @@ class TestAgentLoop:
         emitter.close()
 
         # With window_size=3 and repeating single calls, loop should be detected
+        # Warning fires on each turn after pattern first detected (calls 3, 4, 5)
         warning_msgs = [
             m for m in history if m.role == Role.USER and "SYSTEM WARNING" in m.text()
         ]
-        assert len(warning_msgs) >= 1
+        assert len(warning_msgs) == 3

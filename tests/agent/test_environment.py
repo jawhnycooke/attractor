@@ -198,18 +198,16 @@ class TestFilterEnv:
 
 
 class TestPlatform:
-    def test_platform_matches_sys_platform(self) -> None:
-        import sys
-
+    def test_platform_returns_known_value(self) -> None:
         env = LocalExecutionEnvironment()
-        assert env.platform() == sys.platform
+        # platform() must return one of the known Python platform strings
+        assert env.platform() in ("linux", "darwin", "win32")
 
     def test_working_directory_matches_configured_path(self, tmp_path) -> None:
         env = LocalExecutionEnvironment(working_dir=str(tmp_path))
         assert env.working_directory() == str(tmp_path)
 
-    def test_working_directory_defaults_to_cwd(self) -> None:
-        import os
-
+    def test_working_directory_defaults_to_cwd(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
         env = LocalExecutionEnvironment()
-        assert env.working_directory() == os.getcwd()
+        assert env.working_directory() == str(tmp_path)
