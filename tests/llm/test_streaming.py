@@ -1,4 +1,4 @@
-"""Tests for StreamCollector — streaming event aggregation."""
+"""Tests for StreamCollector and StreamResult — streaming event aggregation."""
 
 import logging
 from collections.abc import AsyncIterator
@@ -12,7 +12,7 @@ from attractor.llm.models import (
     TokenUsage,
     ToolCallContent,
 )
-from attractor.llm.streaming import StreamCollector
+from attractor.llm.streaming import StreamCollector, StreamResult
 
 
 class TestTextAccumulation:
@@ -202,3 +202,118 @@ class TestCollectAsyncIterator:
         assert response.finish_reason == FinishReason.STOP
         assert response.usage.input_tokens == 10
         assert response.usage.output_tokens == 5
+
+
+# ---------------------------------------------------------------------------
+# StreamResult
+# ---------------------------------------------------------------------------
+
+
+class TestStreamResult:
+    @pytest.mark.asyncio
+    async def test_async_iteration(self) -> None:
+        """StreamResult should iterate over all events from the source."""
+
+        async def event_stream() -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(type=StreamEventType.STREAM_START)
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="Hi")
+            yield StreamEvent(
+                type=StreamEventType.FINISH,
+                finish_reason=FinishReason.STOP,
+                usage=TokenUsage(input_tokens=5, output_tokens=2),
+            )
+
+        sr = StreamResult(_events=event_stream())
+
+        events = []
+        async for event in sr:
+            events.append(event)
+
+        assert len(events) == 3
+        types = [e.type for e in events]
+        assert StreamEventType.STREAM_START in types
+        assert StreamEventType.TEXT_DELTA in types
+        assert StreamEventType.FINISH in types
+
+    @pytest.mark.asyncio
+    async def test_response_accumulates_text(self) -> None:
+        """response() should consume events and return the full response."""
+
+        async def event_stream() -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="Hello ")
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="World")
+            yield StreamEvent(
+                type=StreamEventType.FINISH,
+                finish_reason=FinishReason.STOP,
+                usage=TokenUsage(input_tokens=10, output_tokens=5),
+            )
+
+        sr = StreamResult(_events=event_stream())
+        response = await sr.response()
+
+        assert response.message.text() == "Hello World"
+        assert response.finish_reason == FinishReason.STOP
+        assert response.usage.input_tokens == 10
+
+    @pytest.mark.asyncio
+    async def test_response_cached_on_second_call(self) -> None:
+        """Calling response() twice should return the same object."""
+
+        async def event_stream() -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="data")
+            yield StreamEvent(type=StreamEventType.FINISH)
+
+        sr = StreamResult(_events=event_stream())
+        r1 = await sr.response()
+        r2 = await sr.response()
+        assert r1 is r2
+
+    @pytest.mark.asyncio
+    async def test_text_stream(self) -> None:
+        """text_stream should yield only text deltas."""
+
+        async def event_stream() -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(type=StreamEventType.STREAM_START)
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="chunk1")
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="")
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="chunk2")
+            yield StreamEvent(type=StreamEventType.FINISH)
+
+        sr = StreamResult(_events=event_stream())
+        texts = []
+        async for text in sr.text_stream:
+            texts.append(text)
+
+        # Empty string should be skipped (event.text is falsy)
+        assert texts == ["chunk1", "chunk2"]
+
+    @pytest.mark.asyncio
+    async def test_partial_response_none_before_events(self) -> None:
+        """partial_response should be None when no events processed yet."""
+
+        async def event_stream() -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(type=StreamEventType.STREAM_START)
+            yield StreamEvent(type=StreamEventType.FINISH)
+
+        sr = StreamResult(_events=event_stream())
+        assert sr.partial_response is None
+
+    @pytest.mark.asyncio
+    async def test_partial_response_available_mid_stream(self) -> None:
+        """partial_response should reflect accumulated state mid-stream."""
+
+        async def event_stream() -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="partial")
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=" data")
+            yield StreamEvent(type=StreamEventType.FINISH)
+
+        sr = StreamResult(_events=event_stream())
+
+        # Consume first event manually
+        event = await sr.__anext__()
+        assert event.type == StreamEventType.TEXT_DELTA
+
+        # partial_response should now have content
+        pr = sr.partial_response
+        assert pr is not None
+        assert pr.message.text() == "partial"

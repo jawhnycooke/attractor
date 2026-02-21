@@ -130,3 +130,57 @@ class StreamCollector:
         async for event in stream:
             self.process_event(event)
         return self.to_response()
+
+
+@dataclass
+class StreamResult:
+    """Wrapper for streaming responses with convenience accessors.
+
+    Provides async iteration over events, text-only streaming,
+    and accumulated response access.
+    """
+
+    _events: AsyncIterator[StreamEvent]
+    _collector: StreamCollector = field(default_factory=StreamCollector)
+    _done: bool = field(default=False, init=False)
+    _response_cache: Response | None = field(default=None, init=False)
+
+    def __aiter__(self) -> StreamResult:
+        return self
+
+    async def __anext__(self) -> StreamEvent:
+        try:
+            event = await self._events.__anext__()
+            self._collector.process_event(event)
+            if event.type == StreamEventType.FINISH:
+                self._done = True
+            return event
+        except StopAsyncIteration:
+            self._done = True
+            raise
+
+    async def response(self) -> Response:
+        """Consume remaining events and return the accumulated Response."""
+        if not self._done:
+            async for _ in self:
+                pass
+        if self._response_cache is None:
+            self._response_cache = self._collector.to_response()
+        return self._response_cache
+
+    @property
+    def text_stream(self) -> AsyncIterator[str]:
+        """Async iterator yielding only text deltas."""
+        return self._text_stream_impl()
+
+    async def _text_stream_impl(self) -> AsyncIterator[str]:
+        async for event in self:
+            if event.type == StreamEventType.TEXT_DELTA and event.text:
+                yield event.text
+
+    @property
+    def partial_response(self) -> Response | None:
+        """Current accumulated state, or None if no events processed."""
+        if not self._collector.text_parts and not self._collector.tool_calls:
+            return None
+        return self._collector.to_response()

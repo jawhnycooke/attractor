@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any
 
-from attractor.llm.errors import ProviderError, SDKError
+from attractor.llm.errors import AbortError, ProviderError, RequestTimeoutError, SDKError
 from attractor.llm.models import (
     FinishReason,
     Message,
@@ -16,6 +17,7 @@ from attractor.llm.models import (
     Response,
     RetryPolicy,
     StreamEvent,
+    StreamEventType,
     ToolCallContent,
     ToolDefinition,
 )
@@ -40,10 +42,35 @@ class LLMClient:
         adapters: list[Any] | None = None,
         middleware: list[Middleware] | None = None,
         retry_policy: RetryPolicy | None = None,
+        on_retry: Callable[[int, Exception, float], None] | None = None,
     ) -> None:
         self._adapters = adapters if adapters is not None else self._default_adapters()
         self._middleware: list[Middleware] = middleware or []
         self._retry_policy = retry_policy or RetryPolicy()
+        self._on_retry = on_retry
+
+    @classmethod
+    def from_env(
+        cls,
+        middleware: list[Middleware] | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ) -> LLMClient:
+        """Create a client from environment variables.
+
+        Reads API keys from standard environment variables and registers
+        only providers whose keys are present. This is the recommended
+        setup for most applications.
+
+        Environment variables:
+            OPENAI_API_KEY: OpenAI API key
+            ANTHROPIC_API_KEY: Anthropic API key
+            GEMINI_API_KEY or GOOGLE_API_KEY: Google Gemini API key
+        """
+        return cls(
+            adapters=cls._default_adapters(),
+            middleware=middleware,
+            retry_policy=retry_policy,
+        )
 
     @staticmethod
     def _default_adapters() -> list[Any]:
@@ -130,11 +157,16 @@ class LLMClient:
                 if isinstance(exc, SDKError) and not exc.is_retryable:
                     raise
                 if attempt < self._retry_policy.max_retries:
-                    # Use retry_after from the error if available
+                    # Use retry_after from the error if available;
+                    # server-specified delay is respected as-is (no jitter).
                     if isinstance(exc, ProviderError) and exc.retry_after:
                         delay = exc.retry_after
                     else:
                         delay = self._retry_policy.delay_for_attempt(attempt)
+                        # Apply jitter to computed delays only
+                        delay *= random.uniform(0.5, 1.5)
+                    if self._on_retry:
+                        self._on_retry(attempt, exc, delay)
                     logger.warning(
                         "LLM request failed (attempt %d/%d), retrying in %.1fs: %s",
                         attempt + 1,
@@ -167,6 +199,56 @@ class LLMClient:
         return list(await asyncio.gather(*tasks))
 
     # -----------------------------------------------------------------
+    # Tool argument validation
+    # -----------------------------------------------------------------
+
+    def _validate_tool_args(
+        self,
+        tc: ToolCallContent,
+        tools: list[ToolDefinition],
+    ) -> ToolCallContent | str:
+        """Validate tool call arguments against schema.
+
+        Returns the (possibly repaired) ToolCallContent if valid,
+        or an error string if validation fails.
+        """
+        tool_def = next((t for t in tools if t.name == tc.tool_name), None)
+        if tool_def is None:
+            return f"Unknown tool: {tc.tool_name}"
+
+        schema = tool_def.to_json_schema()
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        args = dict(tc.arguments)  # copy
+
+        # Check required fields
+        for req_field in required:
+            if req_field not in args:
+                return f"Missing required field: {req_field}"
+
+        # Basic type coercion
+        for key, value in list(args.items()):
+            if key in properties:
+                expected_type = properties[key].get("type")
+                if expected_type == "integer" and isinstance(value, str):
+                    try:
+                        args[key] = int(value)
+                    except ValueError:
+                        pass
+                elif expected_type == "number" and isinstance(value, str):
+                    try:
+                        args[key] = float(value)
+                    except ValueError:
+                        pass
+                elif expected_type == "boolean" and isinstance(value, str):
+                    args[key] = value.lower() in ("true", "1", "yes")
+
+        # Return updated tool call
+        tc.arguments = args
+        tc.arguments_json = json.dumps(args)
+        return tc
+
+    # -----------------------------------------------------------------
     # Core API
     # -----------------------------------------------------------------
 
@@ -196,6 +278,8 @@ class LLMClient:
         tools: list[ToolDefinition] | None = None,
         tool_executor: ToolExecutor | None = None,
         max_tool_rounds: int = 10,
+        timeout: float | None = None,
+        abort_signal: asyncio.Event | None = None,
         **kwargs: Any,
     ) -> Response:
         """High-level API that handles tool auto-execution loops.
@@ -213,6 +297,10 @@ class LLMClient:
                 executes tool calls and returns the result string. Multiple
                 simultaneous calls are dispatched concurrently.
             max_tool_rounds: Maximum number of tool-use round trips.
+            timeout: Per-round timeout in seconds. If a single complete()
+                call exceeds this, raises RequestTimeoutError.
+            abort_signal: An asyncio.Event that, when set, aborts the
+                generation loop with an AbortError.
             **kwargs: Additional Request fields (temperature, max_tokens, etc.).
         """
         if isinstance(prompt, str):
@@ -232,7 +320,24 @@ class LLMClient:
 
         response: Response | None = None
         for _ in range(max_tool_rounds):
-            response = await self.complete(request)
+            # Check abort signal before each round
+            if abort_signal and abort_signal.is_set():
+                raise AbortError("Generation aborted")
+
+            # Apply timeout to the complete() call
+            try:
+                if timeout:
+                    response = await asyncio.wait_for(
+                        self.complete(request), timeout=timeout
+                    )
+                else:
+                    response = await self.complete(request)
+            except asyncio.TimeoutError:
+                raise RequestTimeoutError(
+                    f"Generation timed out after {timeout}s",
+                    provider="",
+                    retryable=True,
+                )
 
             if response.finish_reason != FinishReason.TOOL_CALLS:
                 return response
@@ -243,10 +348,34 @@ class LLMClient:
 
             request.messages.append(response.message)
 
-            result_messages = await self._execute_tools_concurrently(
-                tool_executor, tool_calls
-            )
-            request.messages.extend(result_messages)
+            # Validate tool arguments before execution
+            if request.tools:
+                validated_calls: list[ToolCallContent] = []
+                validation_errors: list[tuple[ToolCallContent, str]] = []
+                for tc in tool_calls:
+                    result = self._validate_tool_args(tc, request.tools)
+                    if isinstance(result, str):
+                        validation_errors.append((tc, result))
+                    else:
+                        validated_calls.append(result)
+
+                # Send validation errors back as tool results
+                for tc, error in validation_errors:
+                    request.messages.append(
+                        Message.tool_result(tc.tool_call_id, error, is_error=True)
+                    )
+
+                # Execute validated calls
+                if validated_calls:
+                    result_messages = await self._execute_tools_concurrently(
+                        tool_executor, validated_calls
+                    )
+                    request.messages.extend(result_messages)
+            else:
+                result_messages = await self._execute_tools_concurrently(
+                    tool_executor, tool_calls
+                )
+                request.messages.extend(result_messages)
 
         assert response is not None
         return response
@@ -273,6 +402,68 @@ class LLMClient:
 
         async for event in self.stream(request):
             yield event
+
+    async def stream_generate_with_tools(
+        self,
+        prompt: str | list[Message],
+        model: str,
+        tools: list[ToolDefinition] | None = None,
+        tool_executor: ToolExecutor | None = None,
+        max_tool_rounds: int = 10,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamEvent]:
+        """Streaming generation with automatic tool execution loops.
+
+        Streams the model's response. When tool calls are detected,
+        executes them concurrently, emits a STEP_FINISH event,
+        and starts a new streaming round with tool results.
+        """
+        if isinstance(prompt, str):
+            messages = [Message.user(prompt)]
+        else:
+            messages = list(prompt)
+
+        request = Request(
+            messages=messages,
+            model=model,
+            tools=tools or [],
+            **kwargs,
+        )
+
+        from attractor.llm.streaming import StreamCollector
+
+        for round_num in range(max_tool_rounds + 1):
+            collector = StreamCollector()
+
+            async for event in self.stream(request):
+                collector.process_event(event)
+                yield event
+
+            step_response = collector.to_response()
+
+            # If no tool calls or no executor, we're done
+            if step_response.finish_reason != FinishReason.TOOL_CALLS:
+                return
+
+            tool_calls = step_response.message.tool_calls()
+            if not tool_calls or tool_executor is None:
+                return
+
+            # Execute tools concurrently
+            result_messages = await self._execute_tools_concurrently(
+                tool_executor, tool_calls
+            )
+
+            # Emit step_finish event
+            yield StreamEvent(
+                type=StreamEventType.STEP_FINISH,
+                usage=step_response.usage,
+                metadata={"round": round_num, "tool_calls": len(tool_calls)},
+            )
+
+            # Append to conversation for next round
+            request.messages.append(step_response.message)
+            request.messages.extend(result_messages)
 
     async def generate_object(
         self,

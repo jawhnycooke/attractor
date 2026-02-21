@@ -258,6 +258,21 @@ class AnthropicAdapter:
                 "budget_tokens": budget,
             }
 
+        # Read provider_options
+        if request.provider_options:
+            anthropic_opts = request.provider_options.get("anthropic", {})
+            if isinstance(anthropic_opts, dict):
+                # Beta headers
+                beta_headers = anthropic_opts.get("beta_headers", [])
+                if beta_headers:
+                    kwargs["extra_headers"] = {
+                        "anthropic-beta": ",".join(beta_headers),
+                    }
+                # Thinking override (provider-specific thinking config)
+                thinking_override = anthropic_opts.get("thinking")
+                if thinking_override and isinstance(thinking_override, dict):
+                    kwargs["thinking"] = thinking_override
+
         # Auto-inject cache_control for prompt caching
         self._inject_cache_control(kwargs, request)
 
@@ -296,9 +311,17 @@ class AnthropicAdapter:
                     )
                 )
 
+        # Estimate reasoning tokens from thinking blocks
+        reasoning_tokens = 0
+        for part in content_parts:
+            if isinstance(part, ThinkingContent) and part.text:
+                # Rough estimation: ~1.3 tokens per word
+                reasoning_tokens += int(len(part.text.split()) * 1.3)
+
         usage = TokenUsage(
             input_tokens=raw.usage.input_tokens,
             output_tokens=raw.usage.output_tokens,
+            reasoning_tokens=reasoning_tokens,
             cache_read_tokens=getattr(raw.usage, "cache_read_input_tokens", 0) or 0,
             cache_write_tokens=getattr(raw.usage, "cache_creation_input_tokens", 0)
             or 0,

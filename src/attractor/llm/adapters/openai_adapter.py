@@ -205,6 +205,19 @@ class OpenAIAdapter:
         if request.response_format:
             kwargs["text"] = {"format": request.response_format}
 
+        # Read provider_options
+        if request.provider_options:
+            openai_opts = request.provider_options.get("openai", {})
+            if isinstance(openai_opts, dict):
+                # Extra body params merged into kwargs
+                extra_body = openai_opts.get("extra_body", {})
+                if extra_body and isinstance(extra_body, dict):
+                    kwargs.update(extra_body)
+                # Extra headers stored for the create() call
+                extra_headers = openai_opts.get("extra_headers", {})
+                if extra_headers:
+                    kwargs["extra_headers"] = extra_headers
+
         return kwargs
 
     # -----------------------------------------------------------------

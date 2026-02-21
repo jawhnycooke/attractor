@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 
+import pytest
+
 from attractor.llm.models import (
     ContentKind,
     FinishReason,
+    GenerateResult,
     ImageContent,
     Message,
+    ModelInfo,
+    RateLimitInfo,
     Request,
     Response,
     RetryPolicy,
     Role,
+    StepResult,
     StreamEvent,
     StreamEventType,
     TextContent,
     ThinkingContent,
+    TimeoutConfig,
     ToolCallContent,
+    ToolChoice,
     ToolDefinition,
     ToolResultContent,
     TokenUsage,
@@ -326,20 +334,20 @@ class TestRequestResponse:
         assert resp.usage.total_tokens == 0
 
     def test_response_new_fields(self) -> None:
-        from attractor.llm.models import RateLimitInfo
-
         resp = Response(
             provider="anthropic",
             raw={"id": "msg_123"},
             warnings=["high token usage"],
-            rate_limit=RateLimitInfo(limit=100, remaining=50, reset_seconds=30.0),
+            rate_limit=RateLimitInfo(
+                requests_limit=100, requests_remaining=50, reset_at=1700000000.0
+            ),
         )
         assert resp.provider == "anthropic"
         assert resp.raw == {"id": "msg_123"}
         assert resp.warnings == ["high token usage"]
         assert resp.rate_limit is not None
-        assert resp.rate_limit.limit == 100
-        assert resp.rate_limit.remaining == 50
+        assert resp.rate_limit.requests_limit == 100
+        assert resp.rate_limit.requests_remaining == 50
 
     def test_response_defaults_empty_collections(self) -> None:
         resp = Response()
@@ -442,3 +450,337 @@ class TestStreamEvent:
     def test_text_end_event(self) -> None:
         evt = StreamEvent(type=StreamEventType.TEXT_END)
         assert evt.type == StreamEventType.TEXT_END
+
+
+# ---------------------------------------------------------------------------
+# TokenUsage.__add__
+# ---------------------------------------------------------------------------
+
+
+class TestTokenUsageAdd:
+    def test_sum_all_fields(self) -> None:
+        a = TokenUsage(
+            input_tokens=100,
+            output_tokens=50,
+            reasoning_tokens=20,
+            cache_read_tokens=10,
+            cache_write_tokens=5,
+        )
+        b = TokenUsage(
+            input_tokens=200,
+            output_tokens=80,
+            reasoning_tokens=30,
+            cache_read_tokens=15,
+            cache_write_tokens=10,
+        )
+        result = a + b
+        assert result.input_tokens == 300
+        assert result.output_tokens == 130
+        assert result.reasoning_tokens == 50
+        assert result.cache_read_tokens == 25
+        assert result.cache_write_tokens == 15
+
+    def test_zero_plus_nonzero(self) -> None:
+        zero = TokenUsage()
+        nonzero = TokenUsage(input_tokens=42, output_tokens=17)
+        result = zero + nonzero
+        assert result.input_tokens == 42
+        assert result.output_tokens == 17
+
+    def test_commutativity(self) -> None:
+        a = TokenUsage(input_tokens=10, output_tokens=20, reasoning_tokens=5)
+        b = TokenUsage(input_tokens=30, output_tokens=40, reasoning_tokens=15)
+        assert (a + b).input_tokens == (b + a).input_tokens
+        assert (a + b).output_tokens == (b + a).output_tokens
+        assert (a + b).reasoning_tokens == (b + a).reasoning_tokens
+
+    def test_result_is_new_instance(self) -> None:
+        a = TokenUsage(input_tokens=10)
+        b = TokenUsage(input_tokens=20)
+        result = a + b
+        assert result is not a
+        assert result is not b
+        assert result.input_tokens == 30
+
+    def test_total_tokens_after_add(self) -> None:
+        a = TokenUsage(input_tokens=100, output_tokens=50)
+        b = TokenUsage(input_tokens=200, output_tokens=80)
+        result = a + b
+        assert result.total_tokens == 430
+
+
+# ---------------------------------------------------------------------------
+# ToolChoice
+# ---------------------------------------------------------------------------
+
+
+class TestToolChoice:
+    def test_auto_mode(self) -> None:
+        tc = ToolChoice(mode="auto")
+        assert tc.mode == "auto"
+        assert tc.tool_name is None
+
+    def test_none_mode(self) -> None:
+        tc = ToolChoice(mode="none")
+        assert tc.mode == "none"
+
+    def test_required_mode(self) -> None:
+        tc = ToolChoice(mode="required")
+        assert tc.mode == "required"
+
+    def test_named_mode_with_tool(self) -> None:
+        tc = ToolChoice(mode="named", tool_name="search")
+        assert tc.mode == "named"
+        assert tc.tool_name == "search"
+
+    def test_named_mode_without_tool_raises(self) -> None:
+        with pytest.raises(ValueError, match="tool_name is required"):
+            ToolChoice(mode="named")
+
+    def test_invalid_mode_raises(self) -> None:
+        with pytest.raises(ValueError, match="Invalid tool choice mode"):
+            ToolChoice(mode="always")
+
+    def test_default_mode_is_auto(self) -> None:
+        tc = ToolChoice()
+        assert tc.mode == "auto"
+
+
+# ---------------------------------------------------------------------------
+# GenerateResult and StepResult
+# ---------------------------------------------------------------------------
+
+
+class TestStepResult:
+    def test_defaults(self) -> None:
+        step = StepResult()
+        assert step.text == ""
+        assert step.reasoning is None
+        assert step.tool_calls == []
+        assert step.tool_results == []
+        assert step.finish_reason == "stop"
+        assert step.usage.total_tokens == 0
+        assert step.response is None
+        assert step.warnings == []
+
+    def test_construction_with_fields(self) -> None:
+        tc = ToolCallContent(tool_name="read", arguments={"path": "/tmp"})
+        tr = ToolResultContent(tool_call_id="call_1", content="data")
+        step = StepResult(
+            text="result",
+            reasoning="I thought about it",
+            tool_calls=[tc],
+            tool_results=[tr],
+            usage=TokenUsage(input_tokens=10, output_tokens=5),
+            warnings=["token limit close"],
+        )
+        assert step.text == "result"
+        assert step.reasoning == "I thought about it"
+        assert len(step.tool_calls) == 1
+        assert len(step.tool_results) == 1
+        assert step.usage.total_tokens == 15
+        assert step.warnings == ["token limit close"]
+
+
+class TestGenerateResult:
+    def test_defaults(self) -> None:
+        gr = GenerateResult()
+        assert gr.text == ""
+        assert gr.reasoning is None
+        assert gr.tool_calls == []
+        assert gr.tool_results == []
+        assert gr.finish_reason == "stop"
+        assert gr.usage.total_tokens == 0
+        assert gr.total_usage.total_tokens == 0
+        assert gr.steps == []
+        assert gr.response is None
+        assert gr.output is None
+
+    def test_steps_list(self) -> None:
+        s1 = StepResult(text="step 1", usage=TokenUsage(input_tokens=10))
+        s2 = StepResult(text="step 2", usage=TokenUsage(input_tokens=20))
+        gr = GenerateResult(
+            text="final",
+            steps=[s1, s2],
+            total_usage=s1.usage + s2.usage,
+        )
+        assert len(gr.steps) == 2
+        assert gr.total_usage.input_tokens == 30
+
+    def test_output_field(self) -> None:
+        gr = GenerateResult(output={"key": "value"})
+        assert gr.output == {"key": "value"}
+
+    def test_output_arbitrary_types(self) -> None:
+        gr = GenerateResult(output=[1, 2, 3])
+        assert gr.output == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# StreamEvent new fields
+# ---------------------------------------------------------------------------
+
+
+class TestStreamEventFields:
+    def test_delta_field(self) -> None:
+        evt = StreamEvent(type=StreamEventType.TEXT_DELTA, delta="hello")
+        assert evt.delta == "hello"
+
+    def test_text_id_field(self) -> None:
+        evt = StreamEvent(type=StreamEventType.TEXT_START, text_id="txt_0")
+        assert evt.text_id == "txt_0"
+
+    def test_reasoning_delta_field(self) -> None:
+        evt = StreamEvent(
+            type=StreamEventType.REASONING_DELTA, reasoning_delta="thinking..."
+        )
+        assert evt.reasoning_delta == "thinking..."
+
+    def test_raw_field(self) -> None:
+        evt = StreamEvent(
+            type=StreamEventType.PROVIDER_EVENT,
+            raw={"provider": "anthropic", "event": "ping"},
+        )
+        assert evt.raw == {"provider": "anthropic", "event": "ping"}
+
+    def test_new_fields_default_none(self) -> None:
+        evt = StreamEvent(type=StreamEventType.TEXT_DELTA, text="hi")
+        assert evt.delta is None
+        assert evt.text_id is None
+        assert evt.reasoning_delta is None
+        assert evt.raw is None
+
+
+# ---------------------------------------------------------------------------
+# StreamEventType new values
+# ---------------------------------------------------------------------------
+
+
+class TestStreamEventTypeNewValues:
+    def test_reasoning_start_exists(self) -> None:
+        assert StreamEventType.REASONING_START == "thinking_start"
+
+    def test_reasoning_end_exists(self) -> None:
+        assert StreamEventType.REASONING_END == "thinking_end"
+
+    def test_provider_event_exists(self) -> None:
+        assert StreamEventType.PROVIDER_EVENT == "provider_event"
+
+    def test_step_finish_exists(self) -> None:
+        assert StreamEventType.STEP_FINISH == "step_finish"
+
+    def test_reasoning_start_is_thinking_start(self) -> None:
+        assert StreamEventType.REASONING_START is StreamEventType.THINKING_START
+
+    def test_reasoning_end_is_thinking_end(self) -> None:
+        assert StreamEventType.REASONING_END is StreamEventType.THINKING_END
+
+
+# ---------------------------------------------------------------------------
+# RateLimitInfo restructured fields
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimitInfo:
+    def test_defaults_all_none(self) -> None:
+        rl = RateLimitInfo()
+        assert rl.requests_remaining is None
+        assert rl.requests_limit is None
+        assert rl.tokens_remaining is None
+        assert rl.tokens_limit is None
+        assert rl.reset_at is None
+
+    def test_construction_with_values(self) -> None:
+        rl = RateLimitInfo(
+            requests_remaining=99,
+            requests_limit=100,
+            tokens_remaining=50000,
+            tokens_limit=100000,
+            reset_at=1700000000.0,
+        )
+        assert rl.requests_remaining == 99
+        assert rl.requests_limit == 100
+        assert rl.tokens_remaining == 50000
+        assert rl.tokens_limit == 100000
+        assert rl.reset_at == 1700000000.0
+
+    def test_partial_construction(self) -> None:
+        rl = RateLimitInfo(requests_remaining=50)
+        assert rl.requests_remaining == 50
+        assert rl.tokens_remaining is None
+
+
+# ---------------------------------------------------------------------------
+# ImageContent.detail
+# ---------------------------------------------------------------------------
+
+
+class TestImageContentDetail:
+    def test_detail_default_none(self) -> None:
+        img = ImageContent(url="https://example.com/img.png")
+        assert img.detail is None
+
+    def test_detail_set_to_auto(self) -> None:
+        img = ImageContent(url="https://example.com/img.png", detail="auto")
+        assert img.detail == "auto"
+
+    def test_detail_set_to_high(self) -> None:
+        img = ImageContent(url="https://example.com/img.png", detail="high")
+        assert img.detail == "high"
+
+    def test_detail_set_to_low(self) -> None:
+        img = ImageContent(url="https://example.com/img.png", detail="low")
+        assert img.detail == "low"
+
+
+# ---------------------------------------------------------------------------
+# TimeoutConfig
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutConfig:
+    def test_defaults_none(self) -> None:
+        tc = TimeoutConfig()
+        assert tc.total is None
+        assert tc.per_step is None
+
+    def test_total_only(self) -> None:
+        tc = TimeoutConfig(total=120.0)
+        assert tc.total == 120.0
+        assert tc.per_step is None
+
+    def test_per_step_only(self) -> None:
+        tc = TimeoutConfig(per_step=30.0)
+        assert tc.total is None
+        assert tc.per_step == 30.0
+
+    def test_both_set(self) -> None:
+        tc = TimeoutConfig(total=300.0, per_step=60.0)
+        assert tc.total == 300.0
+        assert tc.per_step == 60.0
+
+
+# ---------------------------------------------------------------------------
+# ModelInfo.aliases
+# ---------------------------------------------------------------------------
+
+
+class TestModelInfoAliases:
+    def test_aliases_default_empty(self) -> None:
+        mi = ModelInfo(model_id="claude-opus-4-6", provider="anthropic")
+        assert mi.aliases == []
+
+    def test_aliases_set(self) -> None:
+        mi = ModelInfo(
+            model_id="claude-sonnet-4-20250514",
+            provider="anthropic",
+            aliases=["sonnet", "claude-sonnet"],
+        )
+        assert mi.aliases == ["sonnet", "claude-sonnet"]
+        assert len(mi.aliases) == 2
+
+    def test_aliases_independent_instances(self) -> None:
+        m1 = ModelInfo(model_id="a", provider="p")
+        m2 = ModelInfo(model_id="b", provider="p")
+        m1.aliases.append("test")
+        assert m2.aliases == []

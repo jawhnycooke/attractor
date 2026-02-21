@@ -48,11 +48,15 @@ class StreamEventType(str, enum.Enum):
     TEXT_DELTA = "text_delta"
     TEXT_END = "text_end"
     THINKING_START = "thinking_start"
+    REASONING_START = "thinking_start"  # spec alias
     REASONING_DELTA = "reasoning_delta"
     THINKING_END = "thinking_end"
+    REASONING_END = "thinking_end"  # spec alias
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_DELTA = "tool_call_delta"
     TOOL_CALL_END = "tool_call_end"
+    PROVIDER_EVENT = "provider_event"
+    STEP_FINISH = "step_finish"
     FINISH = "finish"
     ERROR = "error"
 
@@ -138,6 +142,7 @@ class ImageContent:
     url: str | None = None
     base64_data: str | None = None
     media_type: str = "image/png"
+    detail: str | None = None
 
     def __post_init__(self) -> None:
         if self.url is None and self.base64_data is None:
@@ -394,6 +399,16 @@ class TokenUsage:
         """
         return self.input_tokens + self.output_tokens
 
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        """Sum two usage records for aggregation across steps."""
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+        )
+
 
 @dataclass
 class RetryPolicy:
@@ -441,6 +456,23 @@ class RetryPolicy:
 
 
 @dataclass
+class ToolChoice:
+    """Controls whether and how the model uses tools."""
+
+    mode: str = "auto"  # auto, none, required, named
+    tool_name: str | None = None
+
+    def __post_init__(self) -> None:
+        valid_modes = {"auto", "none", "required", "named"}
+        if self.mode not in valid_modes:
+            raise ValueError(
+                f"Invalid tool choice mode: {self.mode!r}, must be one of {valid_modes}"
+            )
+        if self.mode == "named" and not self.tool_name:
+            raise ValueError("tool_name is required when mode is 'named'")
+
+
+@dataclass
 class Request:
     """A request to an LLM provider."""
 
@@ -448,7 +480,7 @@ class Request:
     model: str = ""
     provider: str | None = None
     tools: list[ToolDefinition] = field(default_factory=list)
-    tool_choice: str | dict[str, Any] | None = None
+    tool_choice: ToolChoice | str | dict[str, Any] | None = None
     system_prompt: str = ""
     temperature: float | None = None
     max_tokens: int | None = None
@@ -464,9 +496,11 @@ class Request:
 class RateLimitInfo:
     """Rate limit metadata from provider response headers."""
 
-    limit: int | None = None
-    remaining: int | None = None
-    reset_seconds: float | None = None
+    requests_remaining: int | None = None
+    requests_limit: int | None = None
+    tokens_remaining: int | None = None
+    tokens_limit: int | None = None
+    reset_at: float | None = None
 
 
 @dataclass
@@ -506,6 +540,44 @@ class Response:
         return "".join(parts) if parts else None
 
 
+@dataclass
+class StepResult:
+    """Result of a single step in a multi-step generation."""
+
+    text: str = ""
+    reasoning: str | None = None
+    tool_calls: list[ToolCallContent] = field(default_factory=list)
+    tool_results: list[ToolResultContent] = field(default_factory=list)
+    finish_reason: FinishReason = field(default_factory=lambda: FinishReason.STOP)  # type: ignore[attr-defined]
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    response: Response | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class GenerateResult:
+    """Result of a multi-step generation with tool execution history."""
+
+    text: str = ""
+    reasoning: str | None = None
+    tool_calls: list[ToolCallContent] = field(default_factory=list)
+    tool_results: list[ToolResultContent] = field(default_factory=list)
+    finish_reason: FinishReason = field(default_factory=lambda: FinishReason.STOP)  # type: ignore[attr-defined]
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    total_usage: TokenUsage = field(default_factory=TokenUsage)
+    steps: list[StepResult] = field(default_factory=list)
+    response: Response | None = None
+    output: Any = None
+
+
+@dataclass
+class TimeoutConfig:
+    """Timeout configuration for multi-step operations."""
+
+    total: float | None = None
+    per_step: float | None = None
+
+
 # ---------------------------------------------------------------------------
 # Streaming Events
 # ---------------------------------------------------------------------------
@@ -517,10 +589,14 @@ class StreamEvent:
 
     type: StreamEventType
     text: str = ""
+    delta: str | None = None
+    text_id: str | None = None
+    reasoning_delta: str | None = None
     tool_call: ToolCallContent | None = None
     finish_reason: FinishReason | None = None
     usage: TokenUsage | None = None
     error: str | None = None
+    raw: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -544,3 +620,4 @@ class ModelInfo:
     supports_reasoning: bool = False
     input_cost_per_million: float = 0.0
     output_cost_per_million: float = 0.0
+    aliases: list[str] = field(default_factory=list)

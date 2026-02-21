@@ -178,6 +178,23 @@ class GeminiAdapter:
         if tools:
             config["tools"] = tools
 
+        # Read provider_options
+        if request.provider_options:
+            gemini_opts = request.provider_options.get("gemini", {})
+            if isinstance(gemini_opts, dict):
+                # Safety settings
+                safety_settings = gemini_opts.get("safety_settings")
+                if safety_settings:
+                    config["safety_settings"] = safety_settings
+                # Thinking config
+                thinking_config = gemini_opts.get("thinking_config")
+                if thinking_config:
+                    config["thinking_config"] = thinking_config
+                # Cached content
+                cached_content = gemini_opts.get("cached_content")
+                if cached_content:
+                    kwargs["cached_content"] = cached_content
+
         if config:
             kwargs["config"] = config
 
@@ -218,9 +235,16 @@ class GeminiAdapter:
         usage = TokenUsage()
         usage_meta = getattr(raw, "usage_metadata", None)
         if usage_meta:
+            # Try both camelCase and snake_case for the thoughts token field
+            thoughts_tokens = (
+                getattr(usage_meta, "thoughts_token_count", None)
+                or getattr(usage_meta, "thoughtsTokenCount", None)
+                or 0
+            )
             usage = TokenUsage(
                 input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
                 output_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
+                reasoning_tokens=thoughts_tokens,
             )
 
         finish = _FINISH_MAP.get(finish_str, FinishReason("stop", raw=finish_str))
