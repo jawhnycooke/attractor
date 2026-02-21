@@ -10,3 +10,5 @@ build/
 .ruff_cache/
 htmlcov/
 *.coverage
+.claude/scripts/*.log
+.claude/scripts/*.pid
