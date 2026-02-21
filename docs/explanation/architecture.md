@@ -10,23 +10,13 @@
 
 Attractor is a non-interactive coding agent designed for use in software factories — automated environments where code is generated, tested, reviewed, and deployed without human intervention on every step. The name "attractor" comes from dynamical systems theory: a basin of attraction is a region toward which a system naturally evolves. Attractor pipelines are designed to pull a codebase toward a desired state through repeated, directed LLM-driven transformations.
 
-```
-DOT File (workflow definition)
-         |
-         v
-  PipelineEngine        <-- orchestrates the workflow
-         |
-         v
-   NodeHandlers         <-- what each step does
-         |
-         v
-    agent.Session       <-- autonomous LLM-driven execution
-         |
-         v
-    LLMClient           <-- routes to the right provider
-         |
-         v
-  Provider Adapter      <-- Anthropic / OpenAI / Gemini
+```mermaid
+graph TD
+    DOT["DOT File\n(workflow definition)"] --> Engine["PipelineEngine\norchestrates the workflow"]
+    Engine --> Handlers["NodeHandlers\nwhat each step does"]
+    Handlers --> Session["agent.Session\nautonomous LLM-driven execution"]
+    Session --> Client["LLMClient\nroutes to the right provider"]
+    Client --> Adapter["Provider Adapter\nAnthropic / OpenAI / Gemini"]
 ```
 
 This is a composition of three concerns kept deliberately separate: the shape of the workflow (pipeline), the act of autonomous coding (agent), and the mechanics of talking to language models (LLM). Each layer knows about the layer below it and nothing about the layer above. This directionality keeps each layer independently testable and replaceable.
@@ -80,10 +70,14 @@ The tradeoff is that DOT is not a standard configuration format and is unfamilia
 
 Attractor separates its concerns into three layers with a strict dependency direction:
 
-```
-pipeline/   <-- knows about agent/, does NOT know about llm/
-  agent/    <-- knows about llm/, does NOT know about pipeline/
-    llm/    <-- knows about provider SDKs, nothing else
+```mermaid
+graph LR
+    Pipeline["pipeline/"] -->|"knows about"| Agent["agent/"]
+    Agent -->|"knows about"| LLM["llm/"]
+    LLM -->|"knows about"| SDKs["Provider SDKs"]
+
+    Pipeline -.-x|"does NOT know about"| LLM
+    Agent -.-x|"does NOT know about"| Pipeline
 ```
 
 **Mental Model**: Think of the layers like a restaurant. The `llm/` layer is the kitchen — it produces responses when given requests. The `agent/` layer is the waiter — it takes a customer's goal, places orders with the kitchen, collects results, and keeps the conversation going until the customer is satisfied. The `pipeline/` layer is the restaurant manager — it decides which tables (nodes) get served in which order, and ensures the customer journey (workflow) completes according to the reservation (DOT file).
@@ -98,17 +92,14 @@ Each layer has a clean interface:
 
 `PipelineContext` is the central data structure that makes multi-step workflows coherent. It is a simple key-value store that all nodes can read from and write to. This is an implementation of the Blackboard architectural pattern, common in AI planning systems.
 
-```
-Node A executes, writes {"bug_description": "null pointer in auth.py"}
-         |
-         v
-Node B reads {bug_description}, interpolates it into its prompt
-         |
-         v
-Node B executes, writes {"fix_applied": true, "exit_code": 0}
-         |
-         v
-Edge condition "fix_applied == true" routes to Node C
+```mermaid
+graph TD
+    A["Node A executes\nwrites bug_description = 'null pointer in auth.py'"]
+    B1["Node B reads bug_description\ninterpolates it into its prompt"]
+    B2["Node B executes\nwrites fix_applied = true, exit_code = 0"]
+    C["Edge condition\nfix_applied == true\nroutes to Node C"]
+
+    A --> B1 --> B2 --> C
 ```
 
 The blackboard is flat (no nesting) but uses naming conventions for organization. Internal engine keys are prefixed with `_` (`_last_error`, `_failed_node`, `_completed_nodes`). Handler-produced keys use plain names (`exit_code`, `approved`, `last_codergen_output`). Dotted keys like `branch_name.result` appear when `ParallelHandler` merges scoped sub-contexts back into the main context.
@@ -123,14 +114,15 @@ The blackboard is flat (no nesting) but uses naming conventions for organization
 
 The `PipelineEngine` walks the pipeline graph sequentially, one node at a time, in a `while` loop with a `max_steps` safety limit. This is single-threaded at the pipeline level — no two nodes execute simultaneously (unless a node explicitly fans out via `ParallelHandler`).
 
-```
-while steps < max_steps:
-    apply stylesheet to current node
-    dispatch to handler -> NodeResult
-    merge context_updates into PipelineContext
-    save checkpoint
-    evaluate outgoing edges -> pick next_node
-    advance to next_node (or stop if terminal)
+```mermaid
+graph TD
+    Start(["Start"]) --> Style["Apply stylesheet\nto current node"]
+    Style --> Dispatch["Dispatch to handler\n→ NodeResult"]
+    Dispatch --> Merge["Merge context_updates\ninto PipelineContext"]
+    Merge --> Checkpoint["Save checkpoint"]
+    Checkpoint --> Evaluate["Evaluate outgoing edges\n→ pick next_node"]
+    Evaluate -->|"next_node exists"| Style
+    Evaluate -->|"terminal node\nor no match"| Stop(["Stop"])
 ```
 
 **Why single-threaded?** Because the pipeline's value is its predictability. Parallel execution of pipeline nodes would create race conditions on the shared `PipelineContext`, complicate checkpointing (which snapshot do you save?), and make debugging much harder. The tool-level parallelism that matters — the concurrent execution of multiple tool calls within a single agent invocation — happens inside the agent layer, where the scope is well-defined.
@@ -141,10 +133,11 @@ The tradeoff is that independent pipeline branches (for example, "generate tests
 
 After each node completes, the engine evaluates outgoing edges to determine the next node. Edges are sorted by `priority` (ascending — lower number means higher priority), and the first edge whose condition evaluates to `True` wins. An unconditional edge (`condition=None`) serves as the fallback — the default route if no conditional edge matches.
 
-```
-review -> done    [condition="tests_passed == true"  priority=1]
-review -> fix     [condition="tests_passed == false" priority=2]
-review -> done    (unconditional, fallback)
+```mermaid
+graph LR
+    Review["review"] -->|"priority=1\ntests_passed == true"| Done["done"]
+    Review -->|"priority=2\ntests_passed == false"| Fix["fix"]
+    Review -.->|"unconditional\nfallback"| Done
 ```
 
 A handler can bypass this mechanism entirely by returning a `NodeResult` with `next_node` set. This allows handlers that understand the workflow shape (like `ConditionalHandler`) to perform their own routing logic before the engine's edge evaluation runs.
@@ -213,10 +206,14 @@ Without stylesheets, a DOT file that uses a specific model is tied to that model
 
 With stylesheets, the DOT file describes the workflow's intent, and the stylesheet applies model defaults by matching handler types or node name patterns:
 
-```
-DOT file: node "generate_fix" [handler_type="codergen" prompt="Fix the bug"]
-Stylesheet rule: handler_type=codergen -> model=claude-3-5-sonnet, temperature=0.2
-Result: node gets model and temperature without the DOT file mentioning them
+```mermaid
+graph LR
+    DOT["DOT file\ngenerate_fix\nhandler=codergen\nprompt='Fix the bug'"]
+    Sheet["Stylesheet rule\nhandler_type=codergen →\nmodel=claude-3-5-sonnet\ntemperature=0.2"]
+    Result["Resolved node\nmodel + temperature applied\nwithout DOT mentioning them"]
+
+    DOT --> Result
+    Sheet --> Result
 ```
 
 Node-specific attributes always override stylesheet defaults, so the DOT file retains the ability to pin a specific model for nodes where it matters. The stylesheet is the policy; the DOT file is the exception list.
@@ -229,17 +226,17 @@ Node-specific attributes always override stylesheet defaults, so the DOT file re
 
 The core mechanism of the agent layer is a loop that repeats until the LLM produces a response with no tool calls:
 
-```
-1. Append user message to conversation history
-2. Build Request (history + system prompt + tool definitions)
-3. Call LLM -> Response
-4. Append assistant message to history
-5. If response has tool calls:
-   a. Execute each tool call (possibly concurrently)
-   b. Append tool result messages to history
-   c. Check for loop patterns
-   d. Go to step 2
-6. If response is text-only: emit final text, return
+```mermaid
+graph TD
+    A["1. Append user message\nto conversation history"] --> B["2. Build Request\nhistory + system prompt + tool definitions"]
+    B --> C["3. Call LLM → Response"]
+    C --> D["4. Append assistant message\nto history"]
+    D --> E{"Has tool calls?"}
+    E -->|"Yes"| F["5a. Execute tool calls\n(possibly concurrently)"]
+    F --> G["5b. Append tool results\nto history"]
+    G --> H["5c. Check for\nloop patterns"]
+    H --> B
+    E -->|"No (text-only)"| I["6. Emit final text, return"]
 ```
 
 Each iteration of this loop is called a "turn." The conversation history grows with each turn — user input, assistant response, tool calls, tool results, the next assistant response, and so on. The model sees the entire conversation on every LLM call, which is how it accumulates knowledge about the work it has done.
@@ -273,11 +270,14 @@ LLMs can get stuck. A model might repeatedly call `grep` with the same pattern, 
 
 The `LoopDetector` watches the sequence of tool calls and looks for repeating patterns of length one, two, or three within a sliding window of ten calls. A pattern must repeat at least three consecutive times before triggering a warning. The pattern is fingerprinted by hashing the tool name plus a hash of the arguments, so `read_file(path="a.py")` and `read_file(path="b.py")` are different fingerprints even though they call the same tool.
 
-```
-Call sequence:  [A, B, C, A, B, C, A, B, C]
-Pattern length: 3
-Repetitions:    3
-Result:         LOOP DETECTED
+```mermaid
+graph LR
+    subgraph "Call sequence"
+        A1["A"] --> B1["B"] --> C1["C"] --> A2["A"] --> B2["B"] --> C2["C"] --> A3["A"] --> B3["B"] --> C3["C"]
+    end
+    C3 --> D["LOOP DETECTED\nPattern length: 3\nRepetitions: 3"]
+
+    style D fill:#f66,color:#fff
 ```
 
 When a loop is detected, the warning is injected as a user message into the conversation history, so the model can read it and adjust its strategy. This is more effective than silently breaking the loop because the model needs to understand why it stopped and choose a different path.
@@ -290,9 +290,19 @@ LLM context windows are finite. When the agent reads a large file or runs a shel
 
 Attractor applies a two-stage truncation pipeline to every tool result before it enters conversation history. Stage one trims by character count, keeping the head and tail of the output and replacing the middle with a warning marker. Stage two trims by line count, applying the same head-tail strategy.
 
-```
-Stage 1 (chars): keep first 15,000 chars + "... 8,432 chars removed ..." + last 15,000 chars
-Stage 2 (lines): keep first 128 lines + "... 64 lines removed ..." + last 128 lines
+```mermaid
+graph LR
+    Raw["Raw output"] --> S1["Stage 1: Char limit"]
+    S1 --> S2["Stage 2: Line limit"]
+    S2 --> Final["Truncated output"]
+
+    subgraph "Stage 1 (chars)"
+        Head1["First 15,000 chars"] ~~~ Mid1["… 8,432 chars removed …"] ~~~ Tail1["Last 15,000 chars"]
+    end
+
+    subgraph "Stage 2 (lines)"
+        Head2["First 128 lines"] ~~~ Mid2["… 64 lines removed …"] ~~~ Tail2["Last 128 lines"]
+    end
 ```
 
 Each tool has its own limits, calibrated to its typical output characteristics. `read_file` gets a generous character limit because reading files is fundamental. `write_file` gets a minimal limit because its output is just a confirmation. `shell` gets a strict line limit because command output often contains thousands of repetitive log lines.
@@ -338,10 +348,11 @@ Each provider adapter implements the `ProviderAdapter` protocol with three metho
 
 Model detection is string-based and prefix-driven:
 
-```
-"claude-3-5-sonnet-20241022" -> AnthropicAdapter.detect_model returns True
-"gpt-4o"                     -> OpenAIAdapter.detect_model returns True
-"gemini-1.5-pro"             -> GeminiAdapter.detect_model returns True
+```mermaid
+graph LR
+    Claude["claude-3-5-sonnet-20241022"] --> Anthropic["AnthropicAdapter\ndetect_model → True"]
+    GPT["gpt-4o"] --> OpenAI["OpenAIAdapter\ndetect_model → True"]
+    Gemini["gemini-1.5-pro"] --> Google["GeminiAdapter\ndetect_model → True"]
 ```
 
 The `LLMClient` iterates through registered adapters in order, returning the first one that claims the model. This means adapters are ordered (OpenAI, then Anthropic, then Gemini in the default list), and that order matters for ambiguous model strings — though in practice, current model naming conventions are unambiguous.
@@ -358,10 +369,15 @@ This design makes Attractor installable in environments where not all providers 
 
 Cross-cutting concerns like logging, token tracking, and caching should not be woven into the core request/response path. The middleware pipeline applies these concerns in a defined order around every LLM call:
 
-```
-before_request  [LoggingMiddleware] -> [TokenTrackingMiddleware] -> adapter.complete()
-                                                                          |
-after_response  [TokenTrackingMiddleware] <-- [LoggingMiddleware] <------+
+```mermaid
+graph LR
+    subgraph "before_request (forward order)"
+        R["Request"] --> L1["LoggingMiddleware"] --> T1["TokenTrackingMiddleware"]
+    end
+    T1 --> A["adapter.complete()"]
+    subgraph "after_response (reverse order)"
+        A --> T2["TokenTrackingMiddleware"] --> L2["LoggingMiddleware"] --> Resp["Response"]
+    end
 ```
 
 `before_request` hooks run in forward order; `after_response` hooks run in reverse. This mirrors the onion model of HTTP middleware in web frameworks — outer layers wrap inner layers.

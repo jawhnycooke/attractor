@@ -78,11 +78,11 @@ attractor resume .attractor/checkpoints/checkpoint_*.json --pipeline-dot pipelin
 
 ## Architecture
 
-```
-CLI (click + rich)
- └─ Pipeline Engine ── Parses DOT → validates → walks DAG → dispatches handlers
-      └─ Agent Session ── Agentic loop: prompt → tool calls → results → repeat
-           └─ LLM Client ── Routes to provider adapters (Anthropic, OpenAI, Gemini)
+```mermaid
+graph TD
+    CLI["CLI (click + rich)"] --> Engine["Pipeline Engine\nParses DOT → validates → walks DAG → dispatches handlers"]
+    Engine --> Agent["Agent Session\nAgentic loop: prompt → tool calls → results → repeat"]
+    Agent --> LLM["LLM Client\nRoutes to provider adapters (Anthropic, OpenAI, Gemini)"]
 ```
 
 | Subsystem | Purpose |

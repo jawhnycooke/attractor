@@ -8,11 +8,11 @@ Attractor is a non-interactive coding agent for software factories. It orchestra
 
 **Architecture layers**:
 
-```
-CLI (click)
- └─ pipeline/ ── Parses DOT → validates → executes node graph
-      └─ agent/ ── CodergenHandler invokes Session for LLM-driven coding
-           └─ llm/ ── Routes requests to provider adapters (Anthropic, OpenAI, Gemini)
+```mermaid
+graph TD
+    CLI["CLI (click)"] --> Pipeline["pipeline/\nParses DOT → validates → executes node graph"]
+    Pipeline --> Agent["agent/\nCodergenHandler invokes Session for LLM-driven coding"]
+    Agent --> LLM["llm/\nRoutes requests to provider adapters\n(Anthropic, OpenAI, Gemini)"]
 ```
 
 ---
