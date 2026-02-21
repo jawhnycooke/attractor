@@ -198,11 +198,18 @@ class TestFilterEnv:
 
 
 class TestPlatform:
-    def test_platform_returns_string(self) -> None:
-        env = LocalExecutionEnvironment()
-        assert isinstance(env.platform(), str)
-        assert len(env.platform()) > 0
+    def test_platform_matches_sys_platform(self) -> None:
+        import sys
 
-    def test_working_directory_returns_string(self) -> None:
         env = LocalExecutionEnvironment()
-        assert isinstance(env.working_directory(), str)
+        assert env.platform() == sys.platform
+
+    def test_working_directory_matches_configured_path(self, tmp_path) -> None:
+        env = LocalExecutionEnvironment(working_dir=str(tmp_path))
+        assert env.working_directory() == str(tmp_path)
+
+    def test_working_directory_defaults_to_cwd(self) -> None:
+        import os
+
+        env = LocalExecutionEnvironment()
+        assert env.working_directory() == os.getcwd()

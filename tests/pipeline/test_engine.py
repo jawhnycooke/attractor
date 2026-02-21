@@ -984,8 +984,12 @@ class TestGoalGates:
 
         engine = PipelineEngine(registry=registry, max_steps=5)
         ctx = await engine.run(pipeline)
-        # Gate should redirect to "gate" node before executing "end"
-        assert "gate" in terminal_handler.executed or ctx.has("_goal_gate_unmet")
+        completed = ctx.get("_completed_nodes", [])
+        # Engine must redirect to "gate" before allowing terminal "end"
+        assert "gate" in completed
+        # "end" should NOT have been dispatched — the pipeline ends at "gate"
+        # (implicitly terminal with no outgoing edges) after the redirect
+        assert not terminal_handler.executed
 
     async def test_e9_goal_gate_checks_outcome_status(self) -> None:
         """E9: Goal gate checks outcome is SUCCESS/PARTIAL_SUCCESS, not just completed."""
@@ -1140,11 +1144,11 @@ class TestMiscFeatures:
 
         engine = PipelineEngine(registry=registry, max_steps=10)
         ctx = await engine.run(pipeline)
-        # loop_restart resets completed nodes, so they should be short
         completed = ctx.get("_completed_nodes")
-        # Due to loop_restart, completed is reset each loop iteration
-        # After max_steps, the last completed set should be small
-        assert len(completed) <= 10
+        # Without loop_restart, all 10 steps would accumulate in completed.
+        # With loop_restart, completed resets each cycle (every 2 steps),
+        # so only the tail of the last partial iteration remains.
+        assert len(completed) <= 2
 
     async def test_e14_skipped_not_recorded(self) -> None:
         """E14: SKIPPED status skips outcome recording."""

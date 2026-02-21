@@ -141,7 +141,7 @@ class TestCodergenHandler:
         assert result.status == OutcomeStatus.FAIL
 
     @pytest.mark.asyncio
-    async def test_codergen_falls_back_to_node_label(self) -> None:
+    async def test_codergen_falls_back_to_node_label(self, tmp_path) -> None:
         """H3: Fall back to node.label as prompt text when node.prompt is empty."""
         handler = CodergenHandler()
         node = PipelineNode(
@@ -161,14 +161,16 @@ class TestCodergenHandler:
 
         with patch.dict("sys.modules", {"attractor.agent.events": None}):
             with patch("builtins.__import__", side_effect=selective_import):
-                result = await handler.execute(node, ctx)
+                await handler.execute(node, ctx, logs_root=tmp_path)
 
-        # Should have tried using the label as prompt (even though it failed
-        # on import, the prompt was correctly resolved)
-        assert result.status == OutcomeStatus.FAIL
+        # Prompt resolution happens BEFORE the import attempt, so we can
+        # verify via the written prompt.md that the label was used.
+        prompt_file = tmp_path / "test_node" / "prompt.md"
+        assert prompt_file.exists()
+        assert prompt_file.read_text() == "Fix the login bug"
 
     @pytest.mark.asyncio
-    async def test_codergen_expands_goal_variable(self) -> None:
+    async def test_codergen_expands_goal_variable(self, tmp_path) -> None:
         """H4: $goal in prompts should be expanded from pipeline metadata."""
         handler = CodergenHandler()
         node = _make_node(
@@ -190,10 +192,15 @@ class TestCodergenHandler:
 
         with patch.dict("sys.modules", {"attractor.agent.events": None}):
             with patch("builtins.__import__", side_effect=selective_import):
-                result = await handler.execute(node, ctx, graph=pipeline)
+                await handler.execute(
+                    node, ctx, graph=pipeline, logs_root=tmp_path
+                )
 
-        # Even though the handler fails on import, it still processed the prompt
-        assert result.status == OutcomeStatus.FAIL
+        # Prompt expansion happens BEFORE the import attempt, so we can
+        # verify via prompt.md that $goal was replaced.
+        prompt_file = tmp_path / node.name / "prompt.md"
+        assert prompt_file.exists()
+        assert prompt_file.read_text() == "Work on fix all bugs"
 
     @pytest.mark.asyncio
     async def test_codergen_writes_logs(self, tmp_path) -> None:
@@ -229,25 +236,32 @@ class TestCodergenHandler:
     @pytest.mark.asyncio
     async def test_codergen_sets_last_response_context_key(self) -> None:
         """H5: Should set 'last_response' not 'last_codergen_output'."""
+        from attractor.agent.events import AgentEvent, AgentEventType
+
         handler = CodergenHandler()
         node = _make_node(
             handler_type="codergen", prompt="do stuff", model="gpt-4o"
         )
         ctx = PipelineContext()
 
-        real_import = builtins.__import__
+        # Mock the agent session to yield a text delta event, exercising
+        # the handler's actual success path.
+        async def mock_submit(prompt):
+            yield AgentEvent(
+                type=AgentEventType.ASSISTANT_TEXT_DELTA,
+                data={"text": "agent output"},
+            )
 
-        def selective_import(name, *args, **kwargs):
-            if name.startswith("attractor.agent"):
-                raise ImportError("no agent")
-            return real_import(name, *args, **kwargs)
+        mock_session = AsyncMock()
+        mock_session.submit = mock_submit
 
-        with patch.dict("sys.modules", {"attractor.agent.events": None}):
-            with patch("builtins.__import__", side_effect=selective_import):
-                result = await handler.execute(node, ctx)
+        with patch("attractor.agent.session.Session", return_value=mock_session), \
+             patch("attractor.llm.client.LLMClient"):
+            result = await handler.execute(node, ctx)
 
-        # On failure, no context_updates for output, but verify key name
-        # when successful. Here we just verify the failure doesn't use old key.
+        assert result.status == OutcomeStatus.SUCCESS
+        assert "last_response" in result.context_updates
+        assert result.context_updates["last_response"] == "agent output"
         assert "last_codergen_output" not in result.context_updates
 
 
@@ -544,12 +558,39 @@ class TestParallelHandler:
 
     @pytest.mark.asyncio
     async def test_parallel_handler_stores_results_in_context(self) -> None:
-        handler = ParallelHandler()
-        node = _make_node(handler_type="parallel")
+        """ParallelHandler should store branch outputs in context_updates."""
+        registry = HandlerRegistry()
+        registry.register("start", StartHandler())
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={
+                "parallel_node": PipelineNode(
+                    name="parallel_node", handler_type="parallel"
+                ),
+                "branch_a": PipelineNode(
+                    name="branch_a", handler_type="start"
+                ),
+                "branch_b": PipelineNode(
+                    name="branch_b", handler_type="start"
+                ),
+            },
+            edges=[
+                PipelineEdge(source="parallel_node", target="branch_a"),
+                PipelineEdge(source="parallel_node", target="branch_b"),
+            ],
+        )
+
+        handler = ParallelHandler(registry=registry, pipeline=pipeline)
+        node = _make_node(name="parallel_node", handler_type="parallel")
         ctx = PipelineContext()
 
-        result = await handler.execute(node, ctx)
+        result = await handler.execute(node, ctx, graph=pipeline)
         assert result.success is True
+        assert "parallel.results" in result.context_updates
+        results = result.context_updates["parallel.results"]
+        assert "branch_a" in results
+        assert "branch_b" in results
 
 
 # ---------------------------------------------------------------------------

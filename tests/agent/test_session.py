@@ -166,8 +166,8 @@ class TestSessionLifecycle:
             pass
 
         history = session.conversation_history
-        # Should have: user message + assistant message
-        assert len(history) >= 2
+        # Should have exactly: user message + assistant message
+        assert len(history) == 2
 
     @pytest.mark.asyncio
     async def test_follow_up_queue(self, env) -> None:
@@ -194,10 +194,10 @@ class TestSessionLifecycle:
 
         # Should have processed both the initial and follow-up
         text_events = [e for e in events if e.type == AgentEventType.ASSISTANT_TEXT_END]
-        assert len(text_events) >= 2
+        assert len(text_events) == 2
 
-        # Verify the LLM was called twice (once for initial, once for follow-up)
-        assert len(captured_requests) >= 2
+        # Verify the LLM was called exactly twice (once for initial, once for follow-up)
+        assert len(captured_requests) == 2
         # The follow-up message should appear in the second call's history
         second_request_texts = [
             m.text() for m in captured_requests[1].messages if m.role == Role.USER
@@ -206,13 +206,10 @@ class TestSessionLifecycle:
 
     @pytest.mark.asyncio
     async def test_awaiting_input_state_transition(self, env) -> None:
-        """AWAITING_INPUT should be a valid state that transitions back to PROCESSING."""
+        """Submitting from AWAITING_INPUT should transition through PROCESSING back to IDLE."""
         client = MockLLMClient([_text_response("ok")])
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
-
-        # Verify AWAITING_INPUT is a valid state
-        assert SessionState.AWAITING_INPUT.value == "awaiting_input"
 
         # Manually set to AWAITING_INPUT to simulate model asking a question
         session._state = SessionState.AWAITING_INPUT
@@ -220,9 +217,11 @@ class TestSessionLifecycle:
 
         # Submitting input from AWAITING_INPUT should transition to PROCESSING
         # and eventually back to IDLE after completion
+        observed_states: list[SessionState] = []
         async for _ in session.submit("user answer"):
-            pass
+            observed_states.append(session.state)
 
+        assert SessionState.PROCESSING in observed_states
         assert session.state == SessionState.IDLE
 
     @pytest.mark.asyncio
