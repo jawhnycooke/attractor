@@ -8,9 +8,9 @@ Attractor lets you define multi-step coding workflows as directed acyclic graphs
 
 ```dot
 digraph refactor {
-    analyze [handler_type="codergen" prompt="Analyze the codebase for dead code" start=true]
-    remove  [handler_type="codergen" prompt="Remove the dead code identified in {analysis}"]
-    verify  [handler_type="codergen" prompt="Run tests and verify nothing is broken"]
+    analyze [handler="codergen" prompt="Analyze the codebase for dead code" start=true]
+    remove  [handler="codergen" prompt="Remove the dead code identified in {analysis}"]
+    verify  [handler="codergen" prompt="Run tests and verify nothing is broken"]
     done    [terminal=true]
 
     analyze -> remove
