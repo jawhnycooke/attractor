@@ -33,8 +33,8 @@ The pipeline subsystem implements a DAG-based execution engine. Workflows are de
 
 ```dot
 digraph my_pipeline {
-    start [handler_type="codergen" prompt="Fix the login bug" start=true]
-    review [handler_type="codergen" prompt="Review the changes"]
+    start [handler="codergen" prompt="Fix the login bug" start=true]
+    review [handler="codergen" prompt="Review the changes"]
     done [terminal=true]
 
     start -> review
@@ -43,7 +43,9 @@ digraph my_pipeline {
 }
 ```
 
-Node attributes: `handler_type`, `prompt`, `model`, `temperature`, `max_tokens`, `start`, `terminal`.
+Node attributes: `handler`, `prompt`, `model`, `temperature`, `max_tokens`, `start`, `terminal`.
+
+**Note**: The DOT attribute is `handler` (not `handler_type`). The parser maps it to the internal `PipelineNode.handler_type` field.
 Edge attributes: `condition`, `priority` (lower = higher priority).
 
 ## Adding a New Handler
