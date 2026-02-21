@@ -176,7 +176,7 @@ class AnthropicAdapter:
                 parts.append({"type": "thinking", "thinking": part.text})
             elif isinstance(part, RedactedThinkingContent):
                 parts.append({"type": "redacted_thinking", "data": part.data})
-        return parts or [{"type": "text", "text": ""}]
+        return parts or [{"type": "text", "text": "(empty)"}]
 
     def _map_tools(self, tools: list[ToolDefinition]) -> list[dict[str, Any]] | None:
         if not tools:
@@ -226,7 +226,8 @@ class AnthropicAdapter:
 
         for block in raw.content:
             if block.type == "text":
-                content_parts.append(TextContent(text=block.text))
+                if block.text:
+                    content_parts.append(TextContent(text=block.text))
             elif block.type == "tool_use":
                 args = block.input if isinstance(block.input, dict) else {}
                 content_parts.append(

@@ -6,11 +6,51 @@ and node results used throughout the pipeline engine.
 
 from __future__ import annotations
 
+import enum
 import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+class OutcomeStatus(str, enum.Enum):
+    """Handler outcome status per spec."""
+
+    SUCCESS = "success"
+    PARTIAL_SUCCESS = "partial_success"
+    RETRY = "retry"
+    FAIL = "fail"
+    SKIPPED = "skipped"
+
+
+_DURATION_UNITS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+
+
+def parse_duration(value: str) -> float:
+    """Parse a duration string like '900s', '15m', '250ms' into seconds."""
+    value = value.strip()
+    for suffix, multiplier in sorted(
+        _DURATION_UNITS.items(), key=lambda x: -len(x[0])
+    ):
+        if value.endswith(suffix):
+            return float(value[: -len(suffix)]) * multiplier
+    raise ValueError(f"Invalid duration: {value!r}")
+
+
+def coerce_value(raw: str) -> str | int | float | bool:
+    """Coerce a raw string attribute value to its typed form."""
+    if raw.lower() in ("true", "false"):
+        return raw.lower() == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
 
 
 @dataclass
@@ -25,6 +65,22 @@ class PipelineNode:
             attributes or stylesheet overrides.
         is_start: Whether this is the entry point of the pipeline.
         is_terminal: Whether this is a terminal (exit) node.
+        label: Human-readable label for visualization.
+        shape: GraphViz node shape.
+        classes: CSS-like class list for stylesheet matching.
+        prompt: Prompt template for LLM-backed handlers.
+        max_retries: Maximum retry count for this node.
+        goal_gate: Whether this node is a goal gate.
+        retry_target: Node to jump to on retry.
+        fallback_retry_target: Fallback retry target if retry_target is unset.
+        fidelity: Fidelity level override for this node.
+        thread_id: Thread grouping identifier.
+        timeout: Maximum execution time in seconds.
+        llm_model: LLM model override for this node.
+        llm_provider: LLM provider override for this node.
+        reasoning_effort: Reasoning effort level for LLM calls.
+        auto_status: Whether to auto-report status updates.
+        allow_partial: Whether partial success is acceptable.
     """
 
     name: str
@@ -32,6 +88,22 @@ class PipelineNode:
     attributes: dict[str, Any] = field(default_factory=dict)
     is_start: bool = False
     is_terminal: bool = False
+    label: str = ""
+    shape: str = "box"
+    classes: list[str] = field(default_factory=list)
+    prompt: str = ""
+    max_retries: int = 0
+    goal_gate: bool = False
+    retry_target: str | None = None
+    fallback_retry_target: str | None = None
+    fidelity: str | None = None
+    thread_id: str | None = None
+    timeout: float | None = None
+    llm_model: str | None = None
+    llm_provider: str | None = None
+    reasoning_effort: str = "high"
+    auto_status: bool = False
+    allow_partial: bool = False
 
 
 @dataclass
@@ -44,15 +116,21 @@ class PipelineEdge:
         condition: Optional expression evaluated against PipelineContext.
             ``None`` means unconditional (default edge).
         label: Human-readable label for visualization.
-        priority: Ordering hint when multiple edges share a source.
-            Lower values are evaluated first.
+        weight: Ordering hint when multiple edges share a source.
+            Higher values are evaluated first (descending sort).
+        fidelity: Fidelity level override for this edge transition.
+        thread_id: Thread grouping identifier for this edge.
+        loop_restart: Whether traversing this edge restarts a loop.
     """
 
     source: str
     target: str
     condition: str | None = None
     label: str = ""
-    priority: int = 0
+    weight: int = 0
+    fidelity: str | None = None
+    thread_id: str | None = None
+    loop_restart: bool = False
 
 
 @dataclass
@@ -65,6 +143,12 @@ class Pipeline:
         edges: All directed edges in the graph.
         start_node: Name of the designated start node.
         metadata: Arbitrary metadata from the graph-level attributes.
+        goal: Top-level goal description for the pipeline.
+        default_max_retry: Default max retries for nodes without explicit setting.
+        retry_target: Default retry target node.
+        fallback_retry_target: Fallback retry target if retry_target is unset.
+        default_fidelity: Default fidelity level for all nodes.
+        model_stylesheet: Path to model stylesheet file.
     """
 
     name: str
@@ -72,12 +156,19 @@ class Pipeline:
     edges: list[PipelineEdge] = field(default_factory=list)
     start_node: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    goal: str = ""
+    default_max_retry: int = 50
+    retry_target: str | None = None
+    fallback_retry_target: str | None = None
+    default_fidelity: str | None = None
+    model_stylesheet: str | None = None
 
     def outgoing_edges(self, node_name: str) -> list[PipelineEdge]:
-        """Return edges originating from *node_name*, sorted by priority."""
+        """Return edges originating from *node_name*, sorted by weight descending."""
         return sorted(
             [e for e in self.edges if e.source == node_name],
-            key=lambda e: e.priority,
+            key=lambda e: e.weight,
+            reverse=True,
         )
 
     def incoming_edges(self, node_name: str) -> list[PipelineEdge]:
@@ -90,18 +181,29 @@ class NodeResult:
     """Result returned by a node handler after execution.
 
     Attributes:
-        success: Whether the handler completed without error.
+        status: Outcome status of the handler execution.
         output: Arbitrary output payload.
-        error: Error description when ``success`` is False.
+        failure_reason: Error description when status indicates failure.
         next_node: Explicit routing override — bypasses edge evaluation.
         context_updates: Key-value pairs to merge into PipelineContext.
+        preferred_label: Preferred edge label for routing.
+        suggested_next_ids: Suggested next node IDs for routing hints.
+        notes: Free-form notes from the handler.
     """
 
-    success: bool
+    status: OutcomeStatus
     output: Any = None
-    error: str | None = None
+    failure_reason: str | None = None
     next_node: str | None = None
     context_updates: dict[str, Any] = field(default_factory=dict)
+    preferred_label: str | None = None
+    suggested_next_ids: list[str] = field(default_factory=list)
+    notes: str | None = None
+
+    @property
+    def success(self) -> bool:
+        """Backward-compatible success check."""
+        return self.status in (OutcomeStatus.SUCCESS, OutcomeStatus.PARTIAL_SUCCESS)
 
 
 @dataclass
@@ -221,6 +323,8 @@ class Checkpoint:
         context: Full pipeline context at checkpoint time.
         completed_nodes: Ordered list of nodes that finished successfully.
         timestamp: UNIX epoch when the checkpoint was created.
+        node_retries: Per-node retry counts at checkpoint time.
+        logs: Structured log entries captured during execution.
     """
 
     pipeline_name: str
@@ -228,6 +332,8 @@ class Checkpoint:
     context: PipelineContext
     completed_nodes: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
+    node_retries: dict[str, int] = field(default_factory=dict)
+    logs: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the checkpoint to a plain dictionary.
@@ -241,6 +347,8 @@ class Checkpoint:
             "context": self.context.to_dict(),
             "completed_nodes": list(self.completed_nodes),
             "timestamp": self.timestamp,
+            "node_retries": dict(self.node_retries),
+            "logs": list(self.logs),
         }
 
     @classmethod
@@ -260,6 +368,8 @@ class Checkpoint:
             context=PipelineContext.from_dict(data["context"]),
             completed_nodes=list(data["completed_nodes"]),
             timestamp=data["timestamp"],
+            node_retries=dict(data.get("node_retries", {})),
+            logs=list(data.get("logs", [])),
         )
 
     def save_to_file(self, path: str | Path) -> None:

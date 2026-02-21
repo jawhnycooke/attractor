@@ -48,6 +48,10 @@ class GeminiAdapter:
         from google import genai
 
         self._api_key = api_key or os.environ.get("GOOGLE_API_KEY")
+        if not self._api_key:
+            raise ValueError(
+                "GOOGLE_API_KEY environment variable is required for Gemini adapter"
+            )
         self._client = genai.Client(api_key=self._api_key)
 
     def provider_name(self) -> str:

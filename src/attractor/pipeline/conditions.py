@@ -6,15 +6,15 @@ and literal values without exposing ``eval`` or ``exec``.
 
 Supported syntax
 ~~~~~~~~~~~~~~~~
-- Comparisons: ``==``, ``!=``, ``<``, ``>``, ``<=``, ``>=``
+- Comparisons: ``==``, ``!=``
 - Boolean ops: ``and``, ``or``, ``not``
-- Identifiers: bare names resolve to ``context.get(name)``
+- Identifiers: bare names resolve to ``context.get(name, "")``
 - Literals: strings (``"quoted"``), ints, floats, booleans (``true``/``false``)
 
 Examples::
 
     evaluate_condition('approved == true', ctx)
-    evaluate_condition('exit_code != 0 and retries < 3', ctx)
+    evaluate_condition('exit_code != 0', ctx)
 """
 
 from __future__ import annotations
@@ -25,14 +25,10 @@ from typing import Any
 
 from attractor.pipeline.models import PipelineContext
 
-# Operator mapping for safe comparison dispatch
+# Operator mapping for safe comparison dispatch — restricted to = and != only
 _CMP_OPS: dict[type, Any] = {
     ast.Eq: operator.eq,
     ast.NotEq: operator.ne,
-    ast.Lt: operator.lt,
-    ast.Gt: operator.gt,
-    ast.LtE: operator.le,
-    ast.GtE: operator.ge,
 }
 
 _BOOL_LITERALS = {"true": True, "false": False, "null": None, "none": None}
@@ -102,7 +98,7 @@ def _eval_node(node: ast.expr, ctx: PipelineContext) -> Any:
         name = node.id
         if name in _BOOL_LITERALS:
             return _BOOL_LITERALS[name]
-        return ctx.get(name)
+        return ctx.get(name, "")
     if isinstance(node, ast.Attribute):
         # support dotted names like "result.status"
         return _eval_attribute(node, ctx)
@@ -149,6 +145,12 @@ def _eval_attribute(node: ast.Attribute, ctx: PipelineContext) -> Any:
 def _check_node(node: ast.expr) -> None:
     """Validate that only supported AST nodes are present."""
     if isinstance(node, ast.Compare):
+        for op in node.ops:
+            if type(op) not in _CMP_OPS:
+                raise ConditionError(
+                    f"Unsupported comparison operator: {type(op).__name__}; "
+                    "only == and != are allowed"
+                )
         _check_node(node.left)
         for comp in node.comparators:
             _check_node(comp)

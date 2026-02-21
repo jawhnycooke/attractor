@@ -119,7 +119,7 @@ class TestValidatePipeline:
         }
         pipeline = _make_pipeline(nodes=nodes)
         findings = validate_pipeline(pipeline)
-        assert any("command" in f.message for f in findings)
+        assert any("tool_command" in f.message for f in findings)
 
     def test_has_errors_helper(self) -> None:
         from attractor.pipeline.validator import ValidationError

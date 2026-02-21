@@ -45,6 +45,9 @@ def _setup_logging(verbose: bool) -> None:
 @click.version_option(package_name="attractor")
 def main() -> None:
     """Attractor — a non-interactive coding agent for software factories."""
+    from dotenv import load_dotenv
+
+    load_dotenv()
 
 
 @main.command()

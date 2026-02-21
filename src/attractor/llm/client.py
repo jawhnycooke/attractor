@@ -65,7 +65,7 @@ class LLMClient:
             try:
                 adapters.append(OpenAIAdapter())
             except Exception:
-                logger.warning("OpenAIAdapter failed to initialize", exc_info=True)
+                logger.debug("OpenAIAdapter failed to initialize", exc_info=True)
         try:
             from attractor.llm.adapters.anthropic_adapter import AnthropicAdapter
         except ImportError:
@@ -74,7 +74,7 @@ class LLMClient:
             try:
                 adapters.append(AnthropicAdapter())
             except Exception:
-                logger.warning("AnthropicAdapter failed to initialize", exc_info=True)
+                logger.debug("AnthropicAdapter failed to initialize", exc_info=True)
         try:
             from attractor.llm.adapters.gemini_adapter import GeminiAdapter
         except ImportError:
@@ -83,7 +83,7 @@ class LLMClient:
             try:
                 adapters.append(GeminiAdapter())
             except Exception:
-                logger.warning("GeminiAdapter failed to initialize", exc_info=True)
+                logger.debug("GeminiAdapter failed to initialize", exc_info=True)
         return adapters
 
     # -----------------------------------------------------------------

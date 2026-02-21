@@ -7,7 +7,9 @@ for routing, and checkpointing state after every completed node.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 import time
 from pathlib import Path
 
@@ -20,8 +22,10 @@ from attractor.pipeline.handlers import (
 from attractor.pipeline.models import (
     Checkpoint,
     NodeResult,
+    OutcomeStatus,
     Pipeline,
     PipelineContext,
+    PipelineEdge,
     PipelineNode,
 )
 from attractor.pipeline.state import save_checkpoint
@@ -103,6 +107,10 @@ class PipelineEngine:
                 f"Start node '{current_node}' not found in pipeline '{pipeline.name}'"
             )
 
+        # Set graph.goal at initialization
+        if not ctx.has("graph.goal"):
+            ctx.set("graph.goal", pipeline.goal)
+
         steps = 0
         while steps < self._max_steps:
             steps += 1
@@ -124,16 +132,89 @@ class PipelineEngine:
                     f"(node '{node.name}')"
                 )
 
-            result = await handler.execute(node, ctx)
+            # Retry loop
+            max_attempts = node.max_retries + 1
+            result: NodeResult | None = None
+
+            for attempt in range(max_attempts):
+                if attempt > 0:
+                    delay = self._retry_delay(attempt, node)
+                    logger.info(
+                        "Retrying node '%s' (attempt %d/%d) after %.1fs",
+                        node.name,
+                        attempt + 1,
+                        max_attempts,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+
+                result = await handler.execute(node, ctx)
+                ctx.set(f"internal.retry_count.{node.name}", attempt)
+
+                if result.status != OutcomeStatus.RETRY:
+                    break
+
+            assert result is not None  # At least one iteration always runs
 
             # Merge context updates
             if result.context_updates:
                 ctx.update(result.context_updates)
 
-            if not result.success:
-                logger.error("Node '%s' failed: %s", node.name, result.error)
-                ctx.set("_last_error", result.error)
+            # Set spec-required context keys
+            ctx.set("outcome", result.status.value)
+            if result.preferred_label:
+                ctx.set("preferred_label", result.preferred_label)
+            ctx.set("current_node", node.name)
+            ctx.set("last_stage", node.name)
+
+            if result.status == OutcomeStatus.FAIL:
+                logger.error(
+                    "Node '%s' failed: %s", node.name, result.failure_reason
+                )
+                ctx.set("_last_error", result.failure_reason)
                 ctx.set("_failed_node", node.name)
+
+                # Failure routing per spec
+                # 1. Check for edge with condition matching outcome==fail
+                fail_edges = [
+                    e
+                    for e in pipeline.outgoing_edges(node.name)
+                    if e.condition
+                    and "outcome" in e.condition
+                    and "fail" in e.condition
+                ]
+                routed = False
+                if fail_edges:
+                    ctx.set("outcome", "fail")
+                    for edge in fail_edges:
+                        try:
+                            if edge.condition and evaluate_condition(edge.condition, ctx):
+                                current_node = edge.target
+                                routed = True
+                                break
+                        except Exception:
+                            pass
+
+                # 2. Use node's retry_target
+                if not routed and node.retry_target and node.retry_target in pipeline.nodes:
+                    current_node = node.retry_target
+                    routed = True
+
+                # 3. Use pipeline's fallback_retry_target
+                if (
+                    not routed
+                    and node.fallback_retry_target
+                    and node.fallback_retry_target in pipeline.nodes
+                ):
+                    current_node = node.fallback_retry_target
+                    routed = True
+
+                if routed:
+                    completed.append(node.name)
+                    self._save_checkpoint(
+                        pipeline.name, current_node, ctx, completed
+                    )
+                    continue
 
             completed.append(node.name)
 
@@ -149,7 +230,38 @@ class PipelineEngine:
             )
 
             if next_node is None:
-                # Potential terminal — check goal gate
+                # Potential terminal — check goal gates
+                goal_gate_nodes = [
+                    n for n in pipeline.nodes.values() if n.goal_gate
+                ]
+                if goal_gate_nodes:
+                    completed_set = set(completed)
+                    all_satisfied = all(
+                        n.name in completed_set for n in goal_gate_nodes
+                    )
+                    if not all_satisfied:
+                        unmet = [
+                            n.name
+                            for n in goal_gate_nodes
+                            if n.name not in completed_set
+                        ]
+                        logger.warning("Goal gate not satisfied: %s", unmet)
+                        ctx.set("_goal_gate_unmet", unmet)
+                        # Route to pipeline retry_target
+                        if (
+                            pipeline.retry_target
+                            and pipeline.retry_target in pipeline.nodes
+                        ):
+                            current_node = pipeline.retry_target
+                            continue
+                        if (
+                            pipeline.fallback_retry_target
+                            and pipeline.fallback_retry_target in pipeline.nodes
+                        ):
+                            current_node = pipeline.fallback_retry_target
+                            continue
+
+                # Also check legacy GoalGate
                 if self._goal_gate and not self._goal_gate.check(completed, ctx):
                     unmet = self._goal_gate.unmet_requirements(completed, ctx)
                     logger.warning("Goal gate not satisfied: %s", unmet)
@@ -199,8 +311,8 @@ class PipelineEngine:
         pipeline: Pipeline,
         ctx: PipelineContext,
     ) -> str | None:
-        """Determine the next node to execute."""
-        # Explicit routing override from the handler
+        """5-step edge selection per spec."""
+        # Explicit routing override from handler
         if result.next_node:
             return result.next_node
 
@@ -208,38 +320,76 @@ class PipelineEngine:
         if node.is_terminal:
             return None
 
-        # Evaluate outgoing edges in priority order
-        edges = pipeline.outgoing_edges(node.name)
-        default_target: str | None = None
-        had_condition_error = False
+        edges = pipeline.outgoing_edges(node.name)  # Already sorted by weight desc
+        if not edges:
+            return None  # Implicitly terminal
 
+        # Step 1: Condition matching — collect eligible edges
+        eligible: list[PipelineEdge] = []
+        unconditional: list[PipelineEdge] = []
         for edge in edges:
             if edge.condition is None:
-                default_target = edge.target
-                continue
-            try:
-                if evaluate_condition(edge.condition, ctx):
-                    return edge.target
-            except Exception as exc:
-                had_condition_error = True
-                logger.error(
-                    "Error evaluating condition '%s': %s",
-                    edge.condition,
-                    exc,
+                unconditional.append(edge)
+                eligible.append(edge)
+            else:
+                try:
+                    if evaluate_condition(edge.condition, ctx):
+                        eligible.append(edge)
+                except Exception as exc:
+                    logger.error(
+                        "Error evaluating condition '%s': %s",
+                        edge.condition,
+                        exc,
+                    )
+                    ctx.set("_condition_error", str(exc))
+
+        if not eligible:
+            if unconditional:
+                eligible = unconditional
+            else:
+                raise EngineError(
+                    f"No edge matched for non-terminal node '{node.name}'"
                 )
-                ctx.set("_condition_error", str(exc))
 
-        if default_target:
-            return default_target
+        # Step 2: Preferred label match
+        if result.preferred_label:
+            normalized = result.preferred_label.strip().lower()
+            for edge in eligible:
+                if edge.label.strip().lower() == normalized:
+                    return edge.target
 
-        if had_condition_error:
-            raise EngineError(
-                f"No edge matched for non-terminal node '{node.name}' "
-                f"after condition evaluation error"
-            )
+        # Step 3: Suggested next IDs
+        if result.suggested_next_ids:
+            for suggested_id in result.suggested_next_ids:
+                for edge in eligible:
+                    if edge.target == suggested_id:
+                        return edge.target
 
-        # No outgoing edges — implicitly terminal
+        # Step 4: Highest weight (edges already sorted by weight desc)
+        # Return the first eligible edge (highest weight)
+        if eligible:
+            # Among edges with equal weight, fall through to step 5
+            max_weight = eligible[0].weight
+            top_edges = [e for e in eligible if e.weight == max_weight]
+            if len(top_edges) == 1:
+                return top_edges[0].target
+
+            # Step 5: Lexical tiebreak — target node ID first alphabetically
+            top_edges.sort(key=lambda e: e.target)
+            return top_edges[0].target
+
         return None
+
+    def _retry_delay(self, attempt: int, node: PipelineNode) -> float:
+        """Calculate retry delay with exponential backoff and jitter."""
+        base = 0.2  # 200ms initial
+        factor = 2.0
+        delay = base * (factor ** (attempt - 1))
+        max_delay = 30.0
+        delay = min(delay, max_delay)
+        # Add jitter (±25%)
+        jitter = delay * 0.25 * (2 * random.random() - 1)
+        return max(0, delay + jitter)
 
     def _save_checkpoint(
         self,

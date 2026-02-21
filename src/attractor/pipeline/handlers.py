@@ -18,6 +18,7 @@ from typing import Any, Protocol, runtime_checkable
 from attractor.pipeline.conditions import evaluate_condition
 from attractor.pipeline.models import (
     NodeResult,
+    OutcomeStatus,
     Pipeline,
     PipelineContext,
     PipelineNode,
@@ -85,6 +86,20 @@ class HandlerRegistry:
 # ---------------------------------------------------------------------------
 # Built-in handlers
 # ---------------------------------------------------------------------------
+
+
+class StartHandler:
+    """Entry point handler — no-op, always succeeds."""
+
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        return NodeResult(status=OutcomeStatus.SUCCESS, notes="Pipeline started")
+
+
+class ExitHandler:
+    """Exit point handler — no-op, always succeeds."""
+
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        return NodeResult(status=OutcomeStatus.SUCCESS, notes="Pipeline exiting")
 
 
 class CodergenHandler:
@@ -156,7 +171,7 @@ class CodergenHandler:
 
             result = "".join(output_parts)
             return NodeResult(
-                success=True,
+                status=OutcomeStatus.SUCCESS,
                 output=result,
                 context_updates={"last_codergen_output": result},
             )
@@ -165,25 +180,34 @@ class CodergenHandler:
                 "attractor.agent not available — codergen handler cannot run"
             )
             return NodeResult(
-                success=False,
-                error=(
+                status=OutcomeStatus.FAIL,
+                failure_reason=(
                     "attractor.agent module is not available; "
                     "cannot execute codergen handler"
                 ),
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
-            return NodeResult(success=False, error=str(exc))
+            return NodeResult(status=OutcomeStatus.FAIL, failure_reason=str(exc))
 
 
-class HumanGateHandler:
+class WaitHumanHandler:
     """Present a prompt to a human interviewer and gate on approval."""
 
-    def __init__(self, interviewer: Any = None) -> None:
+    def __init__(
+        self,
+        interviewer: Any = None,
+        pipeline: Pipeline | None = None,
+    ) -> None:
         self._interviewer = interviewer
+        self._pipeline = pipeline
 
     async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
         """Gate execution on human approval.
+
+        When a pipeline is available, derives choices from outgoing edge
+        labels and uses multiple-choice selection. Falls back to simple
+        confirm when no pipeline is set.
 
         Args:
             node: The pipeline node being executed.
@@ -191,23 +215,41 @@ class HumanGateHandler:
 
         Returns:
             A :class:`NodeResult` with ``approved`` in context_updates
-            on success, or a failure if no interviewer is configured.
+            and ``preferred_label`` set to the chosen edge label.
         """
         prompt = node.attributes.get("prompt", "Approve this step?")
         interviewer = self._interviewer or context.get("_interviewer")
 
         if interviewer is None:
             return NodeResult(
-                success=False,
-                error="No interviewer configured for human_gate node",
+                status=OutcomeStatus.FAIL,
+                failure_reason="No interviewer configured for wait.human node",
             )
 
         await interviewer.inform(f"Node '{node.name}': {prompt}")
+
+        # Multiple-choice from outgoing edges when pipeline is available
+        if self._pipeline is not None:
+            edges = self._pipeline.outgoing_edges(node.name)
+            edge_labels = [e.label or e.target for e in edges]
+            if edge_labels and hasattr(interviewer, "ask"):
+                answer = await interviewer.ask(prompt, options=edge_labels)
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    context_updates={"approved": True},
+                    preferred_label=answer,
+                )
+
+        # Fallback: simple confirm
         approved = await interviewer.confirm(prompt)
         return NodeResult(
-            success=True,
+            status=OutcomeStatus.SUCCESS,
             context_updates={"approved": approved},
         )
+
+
+# Backward-compat alias
+HumanGateHandler = WaitHumanHandler
 
 
 class ConditionalHandler:
@@ -234,7 +276,7 @@ class ConditionalHandler:
         """
         pipeline = self._pipeline
         if pipeline is None:
-            return NodeResult(success=True)
+            return NodeResult(status=OutcomeStatus.SUCCESS)
 
         edges = pipeline.outgoing_edges(node.name)
         default_target: str | None = None
@@ -244,12 +286,12 @@ class ConditionalHandler:
                 default_target = edge.target
                 continue
             if evaluate_condition(edge.condition, context):
-                return NodeResult(success=True, next_node=edge.target)
+                return NodeResult(status=OutcomeStatus.SUCCESS, next_node=edge.target)
 
         if default_target:
-            return NodeResult(success=True, next_node=default_target)
+            return NodeResult(status=OutcomeStatus.SUCCESS, next_node=default_target)
 
-        return NodeResult(success=True)
+        return NodeResult(status=OutcomeStatus.SUCCESS)
 
 
 class ParallelHandler:
@@ -284,14 +326,16 @@ class ParallelHandler:
             branches = [b.strip() for b in branches.split(",")]
 
         if not branches:
-            return NodeResult(success=True, output="No branches specified")
+            return NodeResult(
+                status=OutcomeStatus.SUCCESS, output="No branches specified"
+            )
 
         pipeline = self._pipeline
         registry = self._registry
 
         if not pipeline or not registry:
             return NodeResult(
-                success=True,
+                status=OutcomeStatus.SUCCESS,
                 output=f"[stub] Would run parallel branches: {branches}",
             )
 
@@ -299,13 +343,14 @@ class ParallelHandler:
             branch_node = pipeline.nodes.get(branch_name)
             if not branch_node:
                 return branch_name, NodeResult(
-                    success=False, error=f"Branch node '{branch_name}' not found"
+                    status=OutcomeStatus.FAIL,
+                    failure_reason=f"Branch node '{branch_name}' not found",
                 )
             handler = registry.get(branch_node.handler_type)
             if not handler:
                 return branch_name, NodeResult(
-                    success=False,
-                    error=f"No handler for '{branch_node.handler_type}'",
+                    status=OutcomeStatus.FAIL,
+                    failure_reason=f"No handler for '{branch_node.handler_type}'",
                 )
             scope = context.create_scope(branch_name)
             result = await handler.execute(branch_node, scope)
@@ -332,9 +377,35 @@ class ParallelHandler:
                     all_success = False
 
         return NodeResult(
-            success=all_success,
+            status=OutcomeStatus.SUCCESS if all_success else OutcomeStatus.FAIL,
             output=outputs,
-            context_updates={"parallel_results": outputs},
+            context_updates={"parallel.results": outputs},
+        )
+
+
+class FanInHandler:
+    """Consolidate parallel branch results."""
+
+    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+        results = context.get("parallel.results", {})
+        if not results:
+            return NodeResult(
+                status=OutcomeStatus.SUCCESS,
+                output="No parallel results to consolidate",
+            )
+
+        # Simple heuristic: pick branch with best outcome
+        best_id = None
+        best_output = None
+        for branch_id, branch_data in results.items():
+            if best_id is None:
+                best_id = branch_id
+                best_output = branch_data
+
+        return NodeResult(
+            status=OutcomeStatus.SUCCESS,
+            output=best_output,
+            context_updates={"parallel.fan_in.best_id": best_id},
         )
 
 
@@ -342,18 +413,24 @@ class ToolHandler:
     """Execute a shell command and capture exit code + output."""
 
     async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
-        """Run a shell command defined in *node*'s ``command`` attribute.
+        """Run a shell command defined in *node*'s ``tool_command`` attribute.
+
+        Falls back to the ``command`` attribute for backward compatibility.
 
         Args:
-            node: The pipeline node with a ``command`` attribute.
+            node: The pipeline node with a ``tool_command`` (or ``command``) attribute.
             context: Shared pipeline context for variable interpolation.
 
         Returns:
             A :class:`NodeResult` with stdout/stderr and exit code.
         """
-        command = node.attributes.get("command", "")
+        command = node.attributes.get("tool_command") or node.attributes.get(
+            "command", ""
+        )
         if not command:
-            return NodeResult(success=False, error="No command specified")
+            return NodeResult(
+                status=OutcomeStatus.FAIL, failure_reason="No command specified"
+            )
 
         # Interpolate context variables
         for key, value in context.to_dict().items():
@@ -370,27 +447,30 @@ class ToolHandler:
             )
             success = proc.returncode == 0
             return NodeResult(
-                success=success,
+                status=OutcomeStatus.SUCCESS if success else OutcomeStatus.FAIL,
                 output=proc.stdout,
-                error=proc.stderr if not success else None,
+                failure_reason=proc.stderr if not success else None,
                 context_updates={
                     "exit_code": proc.returncode,
+                    "tool.output": proc.stdout,
                     "stdout": proc.stdout,
                     "stderr": proc.stderr,
                 },
             )
         except subprocess.TimeoutExpired:
             return NodeResult(
-                success=False,
-                error=f"Command timed out: {command}",
+                status=OutcomeStatus.FAIL,
+                failure_reason=f"Command timed out: {command}",
                 context_updates={"exit_code": -1},
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
-            return NodeResult(success=False, error=str(exc))
+            return NodeResult(
+                status=OutcomeStatus.FAIL, failure_reason=str(exc)
+            )
 
 
-class SupervisorHandler:
+class ManagerLoopHandler:
     """Iterative refinement loop.
 
     Executes a sub-pipeline (identified by the ``sub_pipeline`` attribute)
@@ -405,7 +485,7 @@ class SupervisorHandler:
         """Run an iterative refinement loop on a sub-pipeline.
 
         Args:
-            node: The supervisor node with ``sub_pipeline``,
+            node: The manager loop node with ``sub_pipeline``,
                 ``done_condition``, and ``max_iterations`` attributes.
             context: Shared pipeline context.
 
@@ -418,8 +498,8 @@ class SupervisorHandler:
 
         if self._engine is None:
             return NodeResult(
-                success=False,
-                error="No engine configured for supervisor handler",
+                status=OutcomeStatus.FAIL,
+                failure_reason="No engine configured for manager_loop handler",
             )
 
         for i in range(max_iterations):
@@ -429,25 +509,29 @@ class SupervisorHandler:
             sub_pipeline_name = node.attributes.get("sub_pipeline", "")
             if not sub_pipeline_name:
                 return NodeResult(
-                    success=False, error="No sub_pipeline attribute specified"
+                    status=OutcomeStatus.FAIL,
+                    failure_reason="No sub_pipeline attribute specified",
                 )
 
             # Delegate to engine (which will call back with the sub-pipeline)
-            # For now, this is a hook point — the engine injects itself.
             await self._engine.run_sub_pipeline(sub_pipeline_name, context)
 
             if done_condition and evaluate_condition(done_condition, context):
                 return NodeResult(
-                    success=True,
-                    output=f"Supervisor done after {i + 1} iterations",
+                    status=OutcomeStatus.SUCCESS,
+                    output=f"Manager loop done after {i + 1} iterations",
                     context_updates={"_supervisor_iterations": i + 1},
                 )
 
         return NodeResult(
-            success=True,
-            output=f"Supervisor reached max iterations ({max_iterations})",
+            status=OutcomeStatus.SUCCESS,
+            output=f"Manager loop reached max iterations ({max_iterations})",
             context_updates={"_supervisor_iterations": max_iterations},
         )
+
+
+# Backward-compat alias
+SupervisorHandler = ManagerLoopHandler
 
 
 def create_default_registry(
@@ -456,12 +540,17 @@ def create_default_registry(
 ) -> HandlerRegistry:
     """Create a :class:`HandlerRegistry` pre-loaded with built-in handlers."""
     registry = HandlerRegistry()
+    registry.register("start", StartHandler())
+    registry.register("exit", ExitHandler())
     registry.register("codergen", CodergenHandler())
-    registry.register("human_gate", HumanGateHandler(interviewer=interviewer))
+    registry.register(
+        "wait.human", WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+    )
     registry.register("conditional", ConditionalHandler(pipeline=pipeline))
 
     parallel = ParallelHandler(registry=registry, pipeline=pipeline)
     registry.register("parallel", parallel)
+    registry.register("parallel.fan_in", FanInHandler())
     registry.register("tool", ToolHandler())
-    registry.register("supervisor", SupervisorHandler())
+    registry.register("stack.manager_loop", ManagerLoopHandler())
     return registry

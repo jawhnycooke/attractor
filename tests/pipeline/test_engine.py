@@ -6,6 +6,7 @@ from attractor.pipeline.engine import EngineError, PipelineEngine
 from attractor.pipeline.handlers import HandlerRegistry
 from attractor.pipeline.models import (
     NodeResult,
+    OutcomeStatus,
     Pipeline,
     PipelineContext,
     PipelineEdge,
@@ -22,7 +23,7 @@ class EchoHandler:
     async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
         self.executed.append(node.name)
         return NodeResult(
-            success=True,
+            status=OutcomeStatus.SUCCESS,
             output=f"echo:{node.name}",
             context_updates={f"{node.name}_done": True},
         )
@@ -32,7 +33,7 @@ class FailHandler:
     """Test handler that always fails."""
 
     async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
-        return NodeResult(success=False, error="intentional failure")
+        return NodeResult(status=OutcomeStatus.FAIL, failure_reason="intentional failure")
 
 
 class RoutingHandler:
@@ -42,7 +43,7 @@ class RoutingHandler:
         self._target = target
 
     async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
-        return NodeResult(success=True, next_node=self._target)
+        return NodeResult(status=OutcomeStatus.SUCCESS, next_node=self._target)
 
 
 def _simple_pipeline() -> Pipeline:
@@ -73,10 +74,10 @@ def _branching_pipeline() -> Pipeline:
         },
         edges=[
             PipelineEdge(
-                source="start", target="left", condition="go_left == true", priority=0
+                source="start", target="left", condition="go_left == true", weight=1
             ),
             PipelineEdge(
-                source="start", target="right", condition="go_left == false", priority=1
+                source="start", target="right", condition="go_left == false", weight=0
             ),
         ],
         start_node="start",
@@ -288,9 +289,9 @@ class TestPipelineEngine:
                     source="start",
                     target="target",
                     condition="invalid!!! syntax @@@",
-                    priority=0,
+                    weight=1,
                 ),
-                PipelineEdge(source="start", target="fallback", priority=1),
+                PipelineEdge(source="start", target="fallback", weight=0),
             ],
             start_node="start",
         )
@@ -324,7 +325,7 @@ class TestPipelineEngine:
         )
 
         engine = PipelineEngine(registry=registry)
-        with pytest.raises(EngineError, match="condition evaluation error"):
+        with pytest.raises(EngineError, match="No edge matched"):
             await engine.run(pipeline)
 
     async def test_default_edge_when_no_condition_matches(
@@ -346,10 +347,10 @@ class TestPipelineEngine:
                     source="start",
                     target="cond_target",
                     condition="never_true == true",
-                    priority=0,
+                    weight=1,
                 ),
                 PipelineEdge(
-                    source="start", target="default_target", priority=1
+                    source="start", target="default_target", weight=0
                 ),  # no condition = default
             ],
             start_node="start",

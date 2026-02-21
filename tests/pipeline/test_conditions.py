@@ -30,11 +30,15 @@ class TestEvaluateCondition:
         assert evaluate_condition("exit_code != 0", ctx) is False
         assert evaluate_condition("exit_code != 1", ctx) is True
 
-    def test_numeric_comparison(self, ctx: PipelineContext) -> None:
-        assert evaluate_condition("retries < 5", ctx) is True
-        assert evaluate_condition("retries > 5", ctx) is False
-        assert evaluate_condition("retries <= 3", ctx) is True
-        assert evaluate_condition("retries >= 4", ctx) is False
+    def test_ordering_operators_rejected(self, ctx: PipelineContext) -> None:
+        with pytest.raises(ConditionError):
+            evaluate_condition("retries < 5", ctx)
+        with pytest.raises(ConditionError):
+            evaluate_condition("retries > 5", ctx)
+        with pytest.raises(ConditionError):
+            evaluate_condition("retries <= 3", ctx)
+        with pytest.raises(ConditionError):
+            evaluate_condition("retries >= 4", ctx)
 
     def test_string_comparison(self, ctx: PipelineContext) -> None:
         assert evaluate_condition('name == "test"', ctx) is True
@@ -54,9 +58,9 @@ class TestEvaluateCondition:
         assert evaluate_condition("", ctx) is True
         assert evaluate_condition("   ", ctx) is True
 
-    def test_missing_variable_is_none(self) -> None:
+    def test_missing_variable_is_empty_string(self) -> None:
         ctx = PipelineContext()
-        assert evaluate_condition("missing == none", ctx) is True
+        assert evaluate_condition('missing == ""', ctx) is True
 
     def test_integer_literal(self, ctx: PipelineContext) -> None:
         assert evaluate_condition("count == 42", ctx) is True
@@ -65,6 +69,8 @@ class TestEvaluateCondition:
         with pytest.raises(ConditionError, match="Invalid condition syntax"):
             evaluate_condition("== broken ==", ctx)
 
-    def test_chained_comparison(self, ctx: PipelineContext) -> None:
-        assert evaluate_condition("1 < retries < 5", ctx) is True
-        assert evaluate_condition("5 < retries < 10", ctx) is False
+    def test_chained_comparison_rejected(self, ctx: PipelineContext) -> None:
+        with pytest.raises(ConditionError):
+            evaluate_condition("1 < retries < 5", ctx)
+        with pytest.raises(ConditionError):
+            evaluate_condition("5 < retries < 10", ctx)

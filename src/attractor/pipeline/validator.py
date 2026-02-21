@@ -9,29 +9,34 @@ from __future__ import annotations
 import enum
 from collections import deque
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from attractor.pipeline.conditions import validate_condition_syntax
 from attractor.pipeline.models import Pipeline, PipelineEdge
 
 # Handler types that are known to the built-in registry
 _KNOWN_HANDLERS = {
+    "start",
+    "exit",
     "codergen",
-    "human_gate",
+    "wait.human",
     "conditional",
     "parallel",
+    "parallel.fan_in",
     "tool",
-    "supervisor",
+    "stack.manager_loop",
 }
 
 # Required attributes per handler type
 _REQUIRED_ATTRS: dict[str, list[str]] = {
-    "tool": ["command"],
+    "tool": ["tool_command"],
 }
 
 
 class ValidationLevel(str, enum.Enum):
     ERROR = "error"
     WARNING = "warning"
+    INFO = "info"
 
 
 @dataclass
@@ -42,6 +47,8 @@ class ValidationError:
     message: str
     node_name: str | None = None
     edge: PipelineEdge | None = None
+    rule: str = ""
+    fix: str | None = None
 
     def __str__(self) -> str:
         location = ""
@@ -49,7 +56,23 @@ class ValidationError:
             location = f" (node '{self.node_name}')"
         elif self.edge:
             location = f" (edge {self.edge.source} -> {self.edge.target})"
-        return f"[{self.level.value.upper()}]{location} {self.message}"
+        rule_tag = f" [{self.rule}]" if self.rule else ""
+        return f"[{self.level.value.upper()}]{location}{rule_tag} {self.message}"
+
+
+@runtime_checkable
+class LintRule(Protocol):
+    """Protocol for custom validation rules."""
+
+    def check(self, pipeline: Pipeline) -> list[ValidationError]: ...
+
+
+_custom_rules: list[LintRule] = []
+
+
+def register_lint_rule(rule: LintRule) -> None:
+    """Register a custom lint rule to run during validation."""
+    _custom_rules.append(rule)
 
 
 def validate_pipeline(pipeline: Pipeline) -> list[ValidationError]:
@@ -61,13 +84,21 @@ def validate_pipeline(pipeline: Pipeline) -> list[ValidationError]:
     errors: list[ValidationError] = []
 
     _check_start_node(pipeline, errors)
+    _check_start_no_incoming(pipeline, errors)
     _check_terminal_nodes(pipeline, errors)
+    _check_exit_no_outgoing(pipeline, errors)
     _check_handler_types(pipeline, errors)
     _check_required_attributes(pipeline, errors)
     _check_edge_references(pipeline, errors)
     _check_condition_syntax(pipeline, errors)
     _check_reachability(pipeline, errors)
     _check_cycles(pipeline, errors)
+    _check_retry_target_exists(pipeline, errors)
+    _check_goal_gate_has_retry(pipeline, errors)
+    _check_prompt_on_llm_nodes(pipeline, errors)
+
+    for rule in _custom_rules:
+        errors.extend(rule.check(pipeline))
 
     return errors
 
@@ -88,6 +119,7 @@ def _check_start_node(pipeline: Pipeline, errors: list[ValidationError]) -> None
             ValidationError(
                 level=ValidationLevel.ERROR,
                 message="No start node defined",
+                rule="start_node",
             )
         )
     elif pipeline.start_node not in pipeline.nodes:
@@ -95,6 +127,24 @@ def _check_start_node(pipeline: Pipeline, errors: list[ValidationError]) -> None
             ValidationError(
                 level=ValidationLevel.ERROR,
                 message=f"Start node '{pipeline.start_node}' does not exist",
+                rule="start_node",
+            )
+        )
+
+
+def _check_start_no_incoming(
+    pipeline: Pipeline, errors: list[ValidationError]
+) -> None:
+    if not pipeline.start_node:
+        return
+    incoming = pipeline.incoming_edges(pipeline.start_node)
+    if incoming:
+        errors.append(
+            ValidationError(
+                level=ValidationLevel.ERROR,
+                message="Start node must not have incoming edges",
+                node_name=pipeline.start_node,
+                rule="start_no_incoming",
             )
         )
 
@@ -106,8 +156,26 @@ def _check_terminal_nodes(pipeline: Pipeline, errors: list[ValidationError]) -> 
             ValidationError(
                 level=ValidationLevel.ERROR,
                 message="No terminal nodes found",
+                rule="terminal_node",
             )
         )
+
+
+def _check_exit_no_outgoing(
+    pipeline: Pipeline, errors: list[ValidationError]
+) -> None:
+    for node in pipeline.nodes.values():
+        if node.handler_type == "exit":
+            outgoing = pipeline.outgoing_edges(node.name)
+            if outgoing:
+                errors.append(
+                    ValidationError(
+                        level=ValidationLevel.ERROR,
+                        message="Exit node must not have outgoing edges",
+                        node_name=node.name,
+                        rule="exit_no_outgoing",
+                    )
+                )
 
 
 def _check_handler_types(pipeline: Pipeline, errors: list[ValidationError]) -> None:
@@ -118,6 +186,7 @@ def _check_handler_types(pipeline: Pipeline, errors: list[ValidationError]) -> N
                     level=ValidationLevel.ERROR,
                     message=f"Unknown handler type '{node.handler_type}'",
                     node_name=node.name,
+                    rule="type_known",
                 )
             )
 
@@ -149,6 +218,7 @@ def _check_edge_references(pipeline: Pipeline, errors: list[ValidationError]) ->
                     level=ValidationLevel.ERROR,
                     message=f"Edge source '{edge.source}' does not exist",
                     edge=edge,
+                    rule="edge_target_exists",
                 )
             )
         if edge.target not in pipeline.nodes:
@@ -157,6 +227,7 @@ def _check_edge_references(pipeline: Pipeline, errors: list[ValidationError]) ->
                     level=ValidationLevel.ERROR,
                     message=f"Edge target '{edge.target}' does not exist",
                     edge=edge,
+                    rule="edge_target_exists",
                 )
             )
 
@@ -171,6 +242,7 @@ def _check_condition_syntax(pipeline: Pipeline, errors: list[ValidationError]) -
                         level=ValidationLevel.ERROR,
                         message=f"Invalid condition syntax: {err}",
                         edge=edge,
+                        rule="condition_syntax",
                     )
                 )
 
@@ -202,6 +274,7 @@ def _check_reachability(pipeline: Pipeline, errors: list[ValidationError]) -> No
                     level=ValidationLevel.WARNING,
                     message="Node is unreachable from start",
                     node_name=name,
+                    rule="reachability",
                 )
             )
 
@@ -260,3 +333,65 @@ def _check_cycles(pipeline: Pipeline, errors: list[ValidationError]) -> None:
                         node_name=n,
                     )
                 )
+
+
+def _check_retry_target_exists(
+    pipeline: Pipeline, errors: list[ValidationError]
+) -> None:
+    for node in pipeline.nodes.values():
+        if node.retry_target and node.retry_target not in pipeline.nodes:
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.WARNING,
+                    message=f"retry_target '{node.retry_target}' does not exist",
+                    node_name=node.name,
+                    rule="retry_target_exists",
+                )
+            )
+        if (
+            node.fallback_retry_target
+            and node.fallback_retry_target not in pipeline.nodes
+        ):
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.WARNING,
+                    message=(
+                        f"fallback_retry_target '{node.fallback_retry_target}' "
+                        "does not exist"
+                    ),
+                    node_name=node.name,
+                    rule="retry_target_exists",
+                )
+            )
+
+
+def _check_goal_gate_has_retry(
+    pipeline: Pipeline, errors: list[ValidationError]
+) -> None:
+    for node in pipeline.nodes.values():
+        if node.goal_gate and not node.retry_target and not pipeline.retry_target:
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.WARNING,
+                    message="goal_gate node has no retry_target",
+                    node_name=node.name,
+                    rule="goal_gate_has_retry",
+                    fix="Add retry_target attribute or set graph-level retry_target",
+                )
+            )
+
+
+def _check_prompt_on_llm_nodes(
+    pipeline: Pipeline, errors: list[ValidationError]
+) -> None:
+    for node in pipeline.nodes.values():
+        if node.handler_type == "codergen" and not node.prompt and not node.label:
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.WARNING,
+                    message="LLM node has no prompt or label",
+                    node_name=node.name,
+                    rule="prompt_on_llm_nodes",
+                    fix="Add a prompt or label attribute",
+                )
+            )
