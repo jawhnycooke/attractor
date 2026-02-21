@@ -8,6 +8,7 @@ import logging
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any
 
+from attractor.llm.errors import ProviderError, SDKError
 from attractor.llm.models import (
     FinishReason,
     Message,
@@ -125,8 +126,15 @@ class LLMClient:
                 return await adapter.complete(request)
             except Exception as exc:
                 last_error = exc
+                # Non-retryable errors should propagate immediately
+                if isinstance(exc, SDKError) and not exc.is_retryable:
+                    raise
                 if attempt < self._retry_policy.max_retries:
-                    delay = self._retry_policy.delay_for_attempt(attempt)
+                    # Use retry_after from the error if available
+                    if isinstance(exc, ProviderError) and exc.retry_after:
+                        delay = exc.retry_after
+                    else:
+                        delay = self._retry_policy.delay_for_attempt(attempt)
                     logger.warning(
                         "LLM request failed (attempt %d/%d), retrying in %.1fs: %s",
                         attempt + 1,
@@ -222,10 +230,11 @@ class LLMClient:
         if max_tool_rounds <= 0:
             return await self.complete(request)
 
+        response: Response | None = None
         for _ in range(max_tool_rounds):
             response = await self.complete(request)
 
-            if response.finish_reason != FinishReason.TOOL_USE:
+            if response.finish_reason != FinishReason.TOOL_CALLS:
                 return response
 
             tool_calls = response.message.tool_calls()
@@ -239,6 +248,7 @@ class LLMClient:
             )
             request.messages.extend(result_messages)
 
+        assert response is not None
         return response
 
     async def stream_generate(

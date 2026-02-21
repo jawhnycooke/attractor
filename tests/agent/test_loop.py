@@ -281,6 +281,79 @@ class TestAgentLoop:
         assert result_ids == {"id_1", "id_2"}
 
     @pytest.mark.asyncio
+    async def test_steering_drained_before_first_llm_call(self) -> None:
+        """Steering queued before submit() must appear before the first LLM call.
+
+        Per spec §2.5: drain_steering() is called BEFORE the first LLM call,
+        so steering messages queued while the session is IDLE appear in the
+        request messages on the very first LLM invocation.
+        """
+        profile = _make_profile()
+        env = _make_env()
+        registry = ToolRegistry()
+        emitter = EventEmitter()
+        detector = LoopDetector()
+        config = LoopConfig(model_id="test-model", max_turns=3)
+
+        text_resp = _make_text_response("Done")
+
+        captured_requests: list = []
+
+        async def capturing_complete(request):
+            captured_requests.append(request)
+            return text_resp
+
+        llm = AsyncMock()
+        llm.complete = capturing_complete
+
+        loop = AgentLoop(
+            profile=profile,
+            environment=env,
+            registry=registry,
+            llm_client=llm,
+            emitter=emitter,
+            config=config,
+            loop_detector=detector,
+        )
+
+        # Queue steering BEFORE running (simulates steer() called while IDLE)
+        loop.queue_steering("Focus on tests only")
+
+        history: list[Message] = []
+        import attractor.agent.loop as loop_mod
+
+        original = loop_mod.build_system_prompt
+        loop_mod.build_system_prompt = AsyncMock(return_value="system prompt")
+        try:
+            await loop.run("hello", history)
+        finally:
+            loop_mod.build_system_prompt = original
+
+        emitter.close()
+
+        # The steering message must appear in history BEFORE the first LLM call.
+        # Since we captured the request, the messages list sent to the LLM
+        # should contain the steering message (as a user message) in the
+        # first call's messages.
+        assert len(captured_requests) == 1
+        first_request = captured_requests[0]
+        first_request_messages = first_request.messages
+
+        # History order should be: user("hello"), user("Focus on tests only")
+        # Both should be in the first request's messages.
+        user_texts = [
+            m.text() for m in first_request_messages if m.role == Role.USER
+        ]
+        assert "Focus on tests only" in user_texts
+
+        # Also verify the steering message appears in history before the
+        # assistant response
+        assert history[0].role == Role.USER  # "hello"
+        assert history[1].role == Role.USER  # steering: "Focus on tests only"
+        assert "Focus on tests only" in history[1].text()
+        assert history[2].role == Role.ASSISTANT  # "Done"
+
+    @pytest.mark.asyncio
     async def test_steering_messages_injected_between_rounds(self) -> None:
         """Tests B2: steering messages are injected as user messages."""
         profile = _make_profile()
@@ -459,3 +532,129 @@ class TestAgentLoop:
         result_content = tool_result_msgs[0].content[0].content
         assert "truncated" in result_content.lower()
         assert len(result_content) < len(big_output)
+
+    @pytest.mark.asyncio
+    async def test_max_command_timeout_clamped(self) -> None:
+        """Shell tool timeout_ms should be clamped to max_command_timeout_ms."""
+        profile = _make_profile()
+        env = _make_env()
+        registry = ToolRegistry()
+        emitter = EventEmitter()
+        detector = LoopDetector()
+
+        # Set a low max_command_timeout_ms ceiling
+        config = LoopConfig(
+            model_id="test-model",
+            max_turns=2,
+            max_command_timeout_ms=5_000,
+        )
+
+        # LLM requests shell with a timeout exceeding the max
+        tool_resp = _make_tool_response(
+            "shell",
+            {"command": "sleep 60", "timeout_ms": 999_999},
+        )
+        text_resp = _make_text_response("Done")
+
+        llm = AsyncMock()
+        llm.complete = AsyncMock(side_effect=[tool_resp, text_resp])
+
+        captured_args: list[dict] = []
+
+        async def fake_dispatch(name, args, env_arg):
+            captured_args.append(dict(args))
+            return ToolResult(output="ok", full_output="ok")
+
+        registry.dispatch = fake_dispatch
+
+        loop = AgentLoop(
+            profile=profile,
+            environment=env,
+            registry=registry,
+            llm_client=llm,
+            emitter=emitter,
+            config=config,
+            loop_detector=detector,
+        )
+
+        history: list[Message] = []
+        import attractor.agent.loop as loop_mod
+
+        original = loop_mod.build_system_prompt
+        loop_mod.build_system_prompt = AsyncMock(return_value="system prompt")
+        try:
+            await loop.run("run it", history)
+        finally:
+            loop_mod.build_system_prompt = original
+
+        emitter.close()
+
+        # The timeout_ms in the dispatched args should be clamped to 5000
+        assert len(captured_args) == 1
+        assert captured_args[0]["timeout_ms"] == 5_000
+
+    @pytest.mark.asyncio
+    async def test_loop_detection_uses_configured_window(self) -> None:
+        """Loop detection should use the configured window_size from config."""
+        profile = _make_profile()
+        env = _make_env()
+        registry = ToolRegistry()
+        emitter = EventEmitter()
+        detector = LoopDetector()
+
+        # Use a small window so loop triggers faster
+        config = LoopConfig(
+            model_id="test-model",
+            enable_loop_detection=True,
+            loop_detection_window=3,
+            max_turns=10,
+        )
+
+        call_count = 0
+
+        async def fake_complete(request):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 5:
+                return _make_tool_response(
+                    "read_file",
+                    {"path": "same.py"},
+                    tool_call_id=f"call_{call_count}",
+                )
+            return _make_text_response("giving up")
+
+        llm = AsyncMock()
+        llm.complete = fake_complete
+
+        async def fake_dispatch(name, args, env_arg):
+            return ToolResult(output="content", full_output="content")
+
+        registry.dispatch = fake_dispatch
+
+        loop = AgentLoop(
+            profile=profile,
+            environment=env,
+            registry=registry,
+            llm_client=llm,
+            emitter=emitter,
+            config=config,
+            loop_detector=detector,
+        )
+
+        history: list[Message] = []
+        import attractor.agent.loop as loop_mod
+
+        original = loop_mod.build_system_prompt
+        loop_mod.build_system_prompt = AsyncMock(return_value="system prompt")
+        try:
+            await loop.run("hello", history)
+        finally:
+            loop_mod.build_system_prompt = original
+
+        emitter.close()
+
+        # With window_size=3 and repeating single calls, loop should be detected
+        warning_msgs = [
+            m for m in history if m.role == Role.USER and "SYSTEM WARNING" in m.text()
+        ]
+        assert len(warning_msgs) >= 1

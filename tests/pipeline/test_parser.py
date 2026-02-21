@@ -28,11 +28,11 @@ digraph pipeline {
     done [shape=Msquare]
 
     begin -> review
-    review -> implement [condition="approved == true"]
-    review -> begin [condition="approved == false" label="retry"]
+    review -> implement [condition="approved=true"]
+    review -> begin [condition="approved=false" label="retry"]
     implement -> test
-    test -> done [condition="exit_code == 0"]
-    test -> implement [condition="exit_code != 0" label="fix"]
+    test -> done [condition="exit_code=0"]
+    test -> implement [condition="exit_code!=0" label="fix"]
 }
 """
 
@@ -67,7 +67,7 @@ class TestParseDotString:
             for e in pipeline.edges
             if e.source == "review" and e.target == "implement"
         )
-        assert edge.condition == "approved == true"
+        assert edge.condition == "approved=true"
 
     def test_edge_labels(self) -> None:
         pipeline = parse_dot_string(FULL_DOT)
@@ -467,3 +467,277 @@ digraph g {
 """
         pipeline = parse_dot_string(dot)
         assert pipeline.nodes["b"].handler_type == "codergen"
+
+
+class TestRejectUndirectedAndStrict:
+    """P1: Reject undirected graphs and strict modifier."""
+
+    def test_undirected_graph_raises(self) -> None:
+        dot = """\
+graph g {
+    a -- b
+}
+"""
+        with pytest.raises(ParseError, match="[Dd]irected"):
+            parse_dot_string(dot)
+
+    def test_strict_digraph_raises(self) -> None:
+        dot = """\
+strict digraph g {
+    a [shape=Mdiamond]
+    b [shape=box]
+    a -> b
+}
+"""
+        with pytest.raises(ParseError, match="strict"):
+            parse_dot_string(dot)
+
+
+class TestRejectMultipleGraphs:
+    """P2: Reject DOT files containing multiple graphs."""
+
+    def test_multiple_graphs_raises(self) -> None:
+        dot = """\
+digraph g1 {
+    a [shape=Mdiamond]
+    b [shape=box]
+    a -> b
+}
+digraph g2 {
+    c [shape=Mdiamond]
+    d [shape=box]
+    c -> d
+}
+"""
+        with pytest.raises(ParseError, match="[Mm]ultiple"):
+            parse_dot_string(dot)
+
+
+class TestChainedEdges:
+    """P3: Test coverage for chained edges (a -> b -> c syntax)."""
+
+    def test_chained_edge_creates_multiple_edges(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    b [shape=box]
+    c [shape=Msquare]
+    a -> b -> c
+}
+"""
+        pipeline = parse_dot_string(dot)
+        ab = next(
+            (e for e in pipeline.edges if e.source == "a" and e.target == "b"),
+            None,
+        )
+        bc = next(
+            (e for e in pipeline.edges if e.source == "b" and e.target == "c"),
+            None,
+        )
+        assert ab is not None
+        assert bc is not None
+
+    def test_chained_edge_with_attributes(self) -> None:
+        """Attributes on chained edges apply to all edges in the chain."""
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    b [shape=box]
+    c [shape=Msquare]
+    a -> b -> c [label="next"]
+}
+"""
+        pipeline = parse_dot_string(dot)
+        ab = next(
+            (e for e in pipeline.edges if e.source == "a" and e.target == "b"),
+            None,
+        )
+        bc = next(
+            (e for e in pipeline.edges if e.source == "b" and e.target == "c"),
+            None,
+        )
+        assert ab is not None
+        assert bc is not None
+        assert ab.label == "next"
+        assert bc.label == "next"
+
+    def test_chained_edge_three_hops(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    b [shape=box]
+    c [shape=box]
+    d [shape=Msquare]
+    a -> b -> c -> d
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert any(e.source == "a" and e.target == "b" for e in pipeline.edges)
+        assert any(e.source == "b" and e.target == "c" for e in pipeline.edges)
+        assert any(e.source == "c" and e.target == "d" for e in pipeline.edges)
+
+
+class TestGraphLabel:
+    """P4: Extract graph-level label attribute."""
+
+    def test_graph_label_extracted(self) -> None:
+        dot = """\
+digraph g {
+    label="My Pipeline"
+    a [shape=Mdiamond]
+    b [shape=Msquare]
+    a -> b
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.label == "My Pipeline"
+
+    def test_graph_label_default_empty(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    b [shape=Msquare]
+    a -> b
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.label == ""
+
+
+class TestCaseInsensitiveStartNode:
+    """P5: Case-insensitive start node detection."""
+
+    def test_start_lowercase(self) -> None:
+        dot = """\
+digraph g {
+    start [prompt="begin"]
+    done [shape=Msquare]
+    start -> done
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.start_node == "start"
+
+    def test_start_uppercase(self) -> None:
+        dot = """\
+digraph g {
+    START [prompt="begin"]
+    done [shape=Msquare]
+    START -> done
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.start_node == "START"
+
+    def test_start_mixed_case(self) -> None:
+        dot = """\
+digraph g {
+    Start [prompt="begin"]
+    done [shape=Msquare]
+    Start -> done
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.start_node == "Start"
+
+
+class TestCaseInsensitiveTerminal:
+    """P6: Terminal detection for 'exit' and 'end' names (case-insensitive)."""
+
+    def test_exit_lowercase_is_terminal(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    exit [shape=box]
+    a -> exit
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.nodes["exit"].is_terminal is True
+
+    def test_exit_uppercase_is_terminal(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    EXIT [shape=box]
+    a -> EXIT
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.nodes["EXIT"].is_terminal is True
+
+    def test_end_lowercase_is_terminal(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    end [shape=box]
+    a -> end
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.nodes["end"].is_terminal is True
+
+    def test_end_uppercase_is_terminal(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    END [shape=box]
+    a -> END
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.nodes["END"].is_terminal is True
+
+
+class TestLexicalTiebreak:
+    """P7: outgoing_edges tiebreak lexically by target node name when weights equal."""
+
+    def test_same_weight_lexical_order(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    c_node [shape=box]
+    b_node [shape=box]
+    a -> c_node [weight=5]
+    a -> b_node [weight=5]
+}
+"""
+        pipeline = parse_dot_string(dot)
+        outgoing = pipeline.outgoing_edges("a")
+        assert len(outgoing) == 2
+        # Same weight, so lexical order: b_node < c_node
+        assert outgoing[0].target == "b_node"
+        assert outgoing[1].target == "c_node"
+
+    def test_different_weight_overrides_lexical(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    b_node [shape=box]
+    c_node [shape=box]
+    a -> b_node [weight=1]
+    a -> c_node [weight=10]
+}
+"""
+        pipeline = parse_dot_string(dot)
+        outgoing = pipeline.outgoing_edges("a")
+        # Higher weight first
+        assert outgoing[0].target == "c_node"
+        assert outgoing[1].target == "b_node"
+
+    def test_zero_weight_lexical_tiebreak(self) -> None:
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    z_node [shape=box]
+    a_node [shape=box]
+    m_node [shape=box]
+    a -> z_node
+    a -> a_node
+    a -> m_node
+}
+"""
+        pipeline = parse_dot_string(dot)
+        outgoing = pipeline.outgoing_edges("a")
+        targets = [e.target for e in outgoing]
+        assert targets == ["a_node", "m_node", "z_node"]

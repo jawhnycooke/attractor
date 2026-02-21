@@ -10,10 +10,12 @@ The AgentLoop executes the standard LLM → tool → LLM loop:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from attractor.agent.environment import ExecutionEnvironment
 from attractor.agent.events import AgentEvent, AgentEventType, EventEmitter
@@ -28,6 +30,8 @@ from attractor.llm.models import (
     Request,
     Response,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # LLM client protocol (decouples from concrete implementation)
@@ -51,24 +55,36 @@ class LoopConfig:
     """Immutable configuration passed into the loop from Session.
 
     Attributes:
-        max_turns: Maximum agentic turns, or None for unlimited.
-        max_tool_rounds: Maximum tool-call rounds, or None for unlimited.
+        max_turns: Maximum agentic turns (total LLM round-trips), or None
+            for unlimited.
+        max_tool_rounds: Maximum tool-call rounds per input, or None for
+            unlimited.
         enable_loop_detection: Whether to detect repeating tool patterns.
+        loop_detection_window: Number of recent tool calls to consider
+            when checking for repeating patterns.
         reasoning_effort: Optional reasoning effort level for the LLM.
         default_command_timeout_ms: Default timeout for shell commands.
+        max_command_timeout_ms: Upper bound for shell command timeouts.
         truncation_config: Optional truncation settings for tool output.
         model_id: Model identifier string.
         user_instructions: Extra user instructions for the system prompt.
+        context_window_size: Context window size in tokens for the model.
+        context_window_warning_threshold: Fraction (0.0-1.0) of context
+            window usage that triggers a warning event.
     """
 
     max_turns: int | None = None
     max_tool_rounds: int | None = None
     enable_loop_detection: bool = True
+    loop_detection_window: int = 10
     reasoning_effort: ReasoningEffort | None = None
     default_command_timeout_ms: int = 10_000
+    max_command_timeout_ms: int = 600_000
     truncation_config: TruncationConfig | None = None
     model_id: str = ""
     user_instructions: str = ""
+    context_window_size: int = 200_000
+    context_window_warning_threshold: float = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +117,138 @@ class AgentLoop:
         self._config = config
         self._detector = loop_detector
         self._steering_queue: list[str] = []
+        self._total_turns: int = 0
 
     def queue_steering(self, message: str) -> None:
         """Queue a steering message for injection after the current tool round."""
         self._steering_queue.append(message)
+
+    def _drain_steering(self, history: list[Message]) -> None:
+        """Drain all queued steering messages into history."""
+        if self._steering_queue:
+            for msg in self._steering_queue:
+                history.append(Message.user(msg))
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.STEERING_INJECTED,
+                        data={"text": msg},
+                    )
+                )
+            self._steering_queue.clear()
+
+    async def _execute_single_tool(
+        self,
+        tc: Any,
+    ) -> tuple[str, str, bool]:
+        """Execute a single tool call with truncation.
+
+        Returns:
+            Tuple of (truncated_output, full_output, is_error).
+        """
+        # Validate tool arguments against JSON schema if available
+        validation_error = self._validate_tool_arguments(
+            tc.tool_name, tc.arguments
+        )
+        if validation_error:
+            return validation_error, validation_error, True
+
+        # Enforce max_command_timeout_ms ceiling on shell tool
+        if tc.tool_name == "shell" and "timeout_ms" in tc.arguments:
+            tc.arguments["timeout_ms"] = min(
+                tc.arguments["timeout_ms"],
+                self._config.max_command_timeout_ms,
+            )
+
+        result = await self._registry.dispatch(
+            tc.tool_name, tc.arguments, self._env
+        )
+
+        # Apply truncation
+        truncated, full = truncate_output(
+            tc.tool_name,
+            result.output,
+            config=self._config.truncation_config,
+        )
+        result.output = truncated
+        if not result.full_output:
+            result.full_output = full
+
+        return truncated, full, result.is_error
+
+    def _validate_tool_arguments(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> str | None:
+        """Validate tool arguments against the tool's JSON schema.
+
+        Returns an error message string if validation fails, None if valid.
+        """
+        definition = self._registry._definitions.get(tool_name)
+        if definition is None:
+            return None  # Unknown tool — dispatch will handle it
+
+        schema = definition.parameters
+        if not schema:
+            return None
+
+        required = schema.get("required", [])
+        properties = schema.get("properties", {})
+
+        for field_name in required:
+            if field_name not in arguments:
+                return (
+                    f"Missing required argument '{field_name}' "
+                    f"for tool '{tool_name}'"
+                )
+
+        for field_name, value in arguments.items():
+            if field_name in properties:
+                expected_type = properties[field_name].get("type")
+                if expected_type and not self._check_json_type(
+                    value, expected_type
+                ):
+                    return (
+                        f"Argument '{field_name}' for tool '{tool_name}' "
+                        f"expected type '{expected_type}', got "
+                        f"'{type(value).__name__}'"
+                    )
+
+        return None
+
+    @staticmethod
+    def _check_json_type(value: Any, expected: str) -> bool:
+        """Check if a value matches a JSON schema type."""
+        type_map: dict[str, tuple[type, ...]] = {
+            "string": (str,),
+            "integer": (int,),
+            "number": (int, float),
+            "boolean": (bool,),
+            "array": (list,),
+            "object": (dict,),
+        }
+        allowed = type_map.get(expected)
+        if allowed is None:
+            return True  # Unknown type — allow
+        return isinstance(value, allowed)
+
+    def _check_context_window(self, response: Response) -> None:
+        """Emit a warning if context window usage exceeds the threshold."""
+        if not response.usage:
+            return
+        total_used = response.usage.input_tokens + response.usage.output_tokens
+        window = self._config.context_window_size
+        threshold = self._config.context_window_warning_threshold
+        if window > 0 and total_used > window * threshold:
+            pct = (total_used / window) * 100
+            self._emitter.emit(
+                AgentEvent(
+                    type=AgentEventType.CONTEXT_WINDOW_WARNING,
+                    data={
+                        "tokens_used": total_used,
+                        "context_window": window,
+                        "usage_percent": round(pct, 1),
+                    },
+                )
+            )
 
     async def run(self, user_input: str, history: list[Message]) -> None:
         """Execute the agentic loop for a single user input.
@@ -120,6 +264,9 @@ class AgentLoop:
             )
         )
 
+        # Drain any pending steering messages before the first LLM call
+        self._drain_steering(history)
+
         system_prompt = await build_system_prompt(
             self._profile,
             self._env,
@@ -128,26 +275,36 @@ class AgentLoop:
         )
         tools = self._profile.get_tools()
 
-        turn = 0
+        tool_round = 0
         while True:
-            # Check turn limit
-            if self._config.max_turns is not None and turn >= self._config.max_turns:
-                self._emitter.emit(
-                    AgentEvent(
-                        type=AgentEventType.TURN_LIMIT,
-                        data={"turns": turn, "limit": self._config.max_turns},
-                    )
-                )
-                return
-
+            # Check total turn limit (across all inputs in the session)
             if (
-                self._config.max_tool_rounds is not None
-                and turn >= self._config.max_tool_rounds
+                self._config.max_turns is not None
+                and self._total_turns >= self._config.max_turns
             ):
                 self._emitter.emit(
                     AgentEvent(
                         type=AgentEventType.TURN_LIMIT,
-                        data={"turns": turn, "limit": self._config.max_tool_rounds},
+                        data={
+                            "turns": self._total_turns,
+                            "limit": self._config.max_turns,
+                        },
+                    )
+                )
+                return
+
+            # Check per-input tool round limit
+            if (
+                self._config.max_tool_rounds is not None
+                and tool_round >= self._config.max_tool_rounds
+            ):
+                self._emitter.emit(
+                    AgentEvent(
+                        type=AgentEventType.TURN_LIMIT,
+                        data={
+                            "turns": tool_round,
+                            "limit": self._config.max_tool_rounds,
+                        },
                     )
                 )
                 return
@@ -175,6 +332,11 @@ class AgentLoop:
                     )
                 )
                 return
+
+            self._total_turns += 1
+
+            # Track context window usage
+            self._check_context_window(response)
 
             # Record assistant message
             history.append(response.message)
@@ -204,7 +366,7 @@ class AgentLoop:
                 )
                 return
 
-            # Execute tool calls
+            # Emit TOOL_CALL_START for all tool calls first
             for tc in tool_calls:
                 self._emitter.emit(
                     AgentEvent(
@@ -217,21 +379,23 @@ class AgentLoop:
                     )
                 )
 
-                result = await self._registry.dispatch(
-                    tc.tool_name, tc.arguments, self._env
+            # Execute tool calls concurrently via asyncio.gather
+            if len(tool_calls) > 1:
+                results = list(
+                    await asyncio.gather(
+                        *(
+                            self._execute_single_tool(tc)
+                            for tc in tool_calls
+                        )
+                    )
                 )
+            else:
+                results = [await self._execute_single_tool(tool_calls[0])]
 
-                # Apply truncation
-                truncated, full = truncate_output(
-                    tc.tool_name,
-                    result.output,
-                    config=self._config.truncation_config,
-                )
-                result.output = truncated
-                if not result.full_output:
-                    result.full_output = full
-
-                # Emit output delta
+            # Emit events and append results to history
+            for tc, (truncated, full, is_error) in zip(
+                tool_calls, results
+            ):
                 self._emitter.emit(
                     AgentEvent(
                         type=AgentEventType.TOOL_CALL_OUTPUT_DELTA,
@@ -242,7 +406,6 @@ class AgentLoop:
                     )
                 )
 
-                # TOOL_CALL_END carries the full untruncated output
                 self._emitter.emit(
                     AgentEvent(
                         type=AgentEventType.TOOL_CALL_END,
@@ -251,17 +414,16 @@ class AgentLoop:
                             "tool_call_id": tc.tool_call_id,
                             "output": truncated,
                             "full_output": full,
-                            "is_error": result.is_error,
+                            "is_error": is_error,
                         },
                     )
                 )
 
-                # Append tool result to history
                 history.append(
                     Message.tool_result(
                         tool_call_id=tc.tool_call_id,
                         content=truncated,
-                        is_error=result.is_error,
+                        is_error=is_error,
                     )
                 )
 
@@ -273,20 +435,13 @@ class AgentLoop:
                     self._detector.record_call(tc.tool_name, args_hash)
 
             # Inject queued steering messages
-            if self._steering_queue:
-                for msg in self._steering_queue:
-                    history.append(Message.user(msg))
-                    self._emitter.emit(
-                        AgentEvent(
-                            type=AgentEventType.STEERING_INJECTED,
-                            data={"text": msg},
-                        )
-                    )
-                self._steering_queue.clear()
+            self._drain_steering(history)
 
             # Check for loops
             if self._config.enable_loop_detection:
-                warning = self._detector.check_for_loops()
+                warning = self._detector.check_for_loops(
+                    window_size=self._config.loop_detection_window
+                )
                 if warning:
                     self._emitter.emit(
                         AgentEvent(
@@ -297,4 +452,4 @@ class AgentLoop:
                     # Inject the warning as a user message so the model sees it
                     history.append(Message.user(f"[SYSTEM WARNING] {warning}"))
 
-            turn += 1
+            tool_round += 1

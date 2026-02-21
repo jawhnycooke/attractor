@@ -78,6 +78,27 @@ class TestMessageFactories:
         )
         assert msg.text() == "result: "
 
+    def test_message_name_field(self) -> None:
+        msg = Message(
+            role=Role.TOOL,
+            content=[TextContent(text="data")],
+            name="my_tool",
+        )
+        assert msg.name == "my_tool"
+
+    def test_message_tool_call_id_field(self) -> None:
+        msg = Message(
+            role=Role.TOOL,
+            content=[TextContent(text="output")],
+            tool_call_id="call_abc",
+        )
+        assert msg.tool_call_id == "call_abc"
+
+    def test_message_name_defaults_to_none(self) -> None:
+        msg = Message.user("test")
+        assert msg.name is None
+        assert msg.tool_call_id is None
+
 
 # ---------------------------------------------------------------------------
 # Content parts
@@ -102,6 +123,14 @@ class TestContentParts:
     def test_thinking_content(self) -> None:
         t = ThinkingContent(text="Let me think...")
         assert t.kind == ContentKind.THINKING
+
+    def test_thinking_content_signature(self) -> None:
+        t = ThinkingContent(text="reasoning", signature="sig_abc123")
+        assert t.signature == "sig_abc123"
+
+    def test_thinking_content_signature_default_none(self) -> None:
+        t = ThinkingContent(text="reasoning")
+        assert t.signature is None
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +240,57 @@ class TestToolDefinition:
 
 
 # ---------------------------------------------------------------------------
+# FinishReason
+# ---------------------------------------------------------------------------
+
+
+class TestFinishReason:
+    def test_equality_by_reason(self) -> None:
+        a = FinishReason("stop", raw="end_turn")
+        b = FinishReason("stop", raw="stop_sequence")
+        assert a == b
+
+    def test_inequality(self) -> None:
+        assert FinishReason("stop") != FinishReason("length")
+
+    def test_equality_with_string(self) -> None:
+        assert FinishReason("stop") == "stop"
+        assert FinishReason("tool_calls") == "tool_calls"
+
+    def test_class_constants(self) -> None:
+        assert FinishReason.STOP == FinishReason("stop")
+        assert FinishReason.TOOL_CALLS == FinishReason("tool_calls")
+        assert FinishReason.LENGTH == FinishReason("length")
+        assert FinishReason.CONTENT_FILTER == FinishReason("content_filter")
+        assert FinishReason.ERROR == FinishReason("error")
+        assert FinishReason.OTHER == FinishReason("other")
+
+    def test_tool_use_alias(self) -> None:
+        assert FinishReason.TOOL_USE == FinishReason.TOOL_CALLS
+        assert FinishReason.TOOL_USE == FinishReason("tool_calls")
+
+    def test_raw_preserved(self) -> None:
+        fr = FinishReason("stop", raw="end_turn")
+        assert fr.raw == "end_turn"
+
+    def test_str(self) -> None:
+        assert str(FinishReason("stop")) == "stop"
+        assert str(FinishReason("tool_calls")) == "tool_calls"
+
+    def test_hashable(self) -> None:
+        s = {FinishReason("stop"), FinishReason("stop", raw="end_turn")}
+        assert len(s) == 1
+
+    def test_repr_without_raw(self) -> None:
+        fr = FinishReason("stop")
+        assert "stop" in repr(fr)
+
+    def test_repr_with_raw(self) -> None:
+        fr = FinishReason("stop", raw="end_turn")
+        assert "end_turn" in repr(fr)
+
+
+# ---------------------------------------------------------------------------
 # Request / Response
 # ---------------------------------------------------------------------------
 
@@ -222,11 +302,107 @@ class TestRequestResponse:
         assert req.tools == []
         assert req.temperature is None
 
+    def test_request_new_fields(self) -> None:
+        req = Request(
+            model="claude-opus-4-6",
+            provider="anthropic",
+            tool_choice="auto",
+            provider_options={"anthropic": {"thinking": True}},
+        )
+        assert req.provider == "anthropic"
+        assert req.tool_choice == "auto"
+        assert req.provider_options == {"anthropic": {"thinking": True}}
+
+    def test_request_provider_options_default_none(self) -> None:
+        req = Request(model="test")
+        assert req.provider_options is None
+        assert req.provider is None
+        assert req.tool_choice is None
+
     def test_response_defaults(self) -> None:
         resp = Response()
         assert resp.message.role == Role.ASSISTANT
         assert resp.finish_reason == FinishReason.STOP
         assert resp.usage.total_tokens == 0
+
+    def test_response_new_fields(self) -> None:
+        from attractor.llm.models import RateLimitInfo
+
+        resp = Response(
+            provider="anthropic",
+            raw={"id": "msg_123"},
+            warnings=["high token usage"],
+            rate_limit=RateLimitInfo(limit=100, remaining=50, reset_seconds=30.0),
+        )
+        assert resp.provider == "anthropic"
+        assert resp.raw == {"id": "msg_123"}
+        assert resp.warnings == ["high token usage"]
+        assert resp.rate_limit is not None
+        assert resp.rate_limit.limit == 100
+        assert resp.rate_limit.remaining == 50
+
+    def test_response_defaults_empty_collections(self) -> None:
+        resp = Response()
+        assert resp.provider == ""
+        assert resp.raw is None
+        assert resp.warnings == []
+        assert resp.rate_limit is None
+
+    def test_response_text_property(self) -> None:
+        resp = Response(
+            message=Message(
+                role=Role.ASSISTANT,
+                content=[TextContent(text="Hello "), TextContent(text="world")],
+            )
+        )
+        assert resp.text == "Hello world"
+
+    def test_response_text_property_empty(self) -> None:
+        resp = Response()
+        assert resp.text == ""
+
+    def test_response_tool_calls_property(self) -> None:
+        tc1 = ToolCallContent(tool_name="search", arguments={"q": "test"})
+        tc2 = ToolCallContent(tool_name="read", arguments={"path": "/tmp"})
+        resp = Response(
+            message=Message(
+                role=Role.ASSISTANT,
+                content=[TextContent(text="let me help"), tc1, tc2],
+            )
+        )
+        assert len(resp.tool_calls) == 2
+        assert resp.tool_calls[0].tool_name == "search"
+        assert resp.tool_calls[1].tool_name == "read"
+
+    def test_response_tool_calls_property_empty(self) -> None:
+        resp = Response(message=Message.assistant("no tools"))
+        assert resp.tool_calls == []
+
+    def test_response_reasoning_property(self) -> None:
+        resp = Response(
+            message=Message(
+                role=Role.ASSISTANT,
+                content=[
+                    ThinkingContent(text="Step 1. "),
+                    ThinkingContent(text="Step 2."),
+                    TextContent(text="The answer is 42."),
+                ],
+            )
+        )
+        assert resp.reasoning == "Step 1. Step 2."
+
+    def test_response_reasoning_property_none(self) -> None:
+        resp = Response(message=Message.assistant("no thinking"))
+        assert resp.reasoning is None
+
+    def test_response_reasoning_with_empty_thinking(self) -> None:
+        resp = Response(
+            message=Message(
+                role=Role.ASSISTANT,
+                content=[ThinkingContent(text=""), TextContent(text="answer")],
+            )
+        )
+        assert resp.reasoning is None
 
 
 # ---------------------------------------------------------------------------
@@ -250,3 +426,19 @@ class TestStreamEvent:
         assert evt.finish_reason == FinishReason.STOP
         assert evt.usage is not None
         assert evt.usage.total_tokens == 15
+
+    def test_new_stream_event_types_exist(self) -> None:
+        """Verify the new stream event types from the spec are available."""
+        assert StreamEventType.TEXT_START == "text_start"
+        assert StreamEventType.TEXT_END == "text_end"
+        assert StreamEventType.THINKING_START == "thinking_start"
+        assert StreamEventType.THINKING_END == "thinking_end"
+
+    def test_text_start_event(self) -> None:
+        evt = StreamEvent(type=StreamEventType.TEXT_START)
+        assert evt.type == StreamEventType.TEXT_START
+        assert evt.text == ""
+
+    def test_text_end_event(self) -> None:
+        evt = StreamEvent(type=StreamEventType.TEXT_END)
+        assert evt.type == StreamEventType.TEXT_END

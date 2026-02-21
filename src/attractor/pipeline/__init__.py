@@ -20,7 +20,11 @@ from attractor.pipeline.models import (
 )
 from attractor.pipeline.parser import parse_dot_file, parse_dot_string
 from attractor.pipeline.stylesheet import ModelStylesheet, apply_stylesheet
-from attractor.pipeline.validator import validate_pipeline
+from attractor.pipeline.validator import (
+    ValidationException,
+    validate_or_raise,
+    validate_pipeline,
+)
 
 __all__ = [
     "Checkpoint",
@@ -35,10 +39,12 @@ __all__ = [
     "PipelineEngine",
     "PipelineNode",
     "QueueInterviewer",
+    "ValidationException",
     "apply_stylesheet",
     "create_default_registry",
     "evaluate_condition",
     "parse_dot_file",
     "parse_dot_string",
+    "validate_or_raise",
     "validate_pipeline",
 ]

@@ -40,7 +40,7 @@ class StreamCollector:
     text_parts: list[str] = field(default_factory=list)
     tool_calls: list[ToolCallContent] = field(default_factory=list)
     _pending_tool: ToolCallContent | None = field(default=None, repr=False)
-    finish_reason: FinishReason = FinishReason.STOP
+    finish_reason: FinishReason = field(default_factory=lambda: FinishReason.STOP)  # type: ignore[attr-defined]
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)

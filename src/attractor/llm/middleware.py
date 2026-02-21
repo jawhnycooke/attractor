@@ -71,7 +71,7 @@ class LoggingMiddleware:
             self._level,
             "LLM response: model=%s finish=%s tokens=%d latency=%.0fms",
             response.model,
-            response.finish_reason.value,
+            response.finish_reason.reason,
             response.usage.total_tokens,
             response.latency_ms,
         )

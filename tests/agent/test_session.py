@@ -9,6 +9,7 @@ from attractor.agent.session import Session, SessionConfig, SessionState
 from attractor.llm.models import (
     FinishReason,
     Message,
+    ReasoningEffort,
     Request,
     Response,
     Role,
@@ -170,7 +171,14 @@ class TestSessionLifecycle:
 
     @pytest.mark.asyncio
     async def test_follow_up_queue(self, env) -> None:
-        client = MockLLMClient(
+        captured_requests: list[Request] = []
+
+        class CapturingClient(MockLLMClient):
+            async def complete(self, request: Request) -> Response:
+                captured_requests.append(request)
+                return await super().complete(request)
+
+        client = CapturingClient(
             [
                 _text_response("first done"),
                 _text_response("follow-up done"),
@@ -186,13 +194,67 @@ class TestSessionLifecycle:
 
         # Should have processed both the initial and follow-up
         text_events = [e for e in events if e.type == AgentEventType.ASSISTANT_TEXT_END]
-        assert len(text_events) >= 1
+        assert len(text_events) >= 2
+
+        # Verify the LLM was called twice (once for initial, once for follow-up)
+        assert len(captured_requests) >= 2
+        # The follow-up message should appear in the second call's history
+        second_request_texts = [
+            m.text() for m in captured_requests[1].messages if m.role == Role.USER
+        ]
+        assert any("Do this next" in t for t in second_request_texts)
+
+    @pytest.mark.asyncio
+    async def test_awaiting_input_state_transition(self, env) -> None:
+        """AWAITING_INPUT should be a valid state that transitions back to PROCESSING."""
+        client = MockLLMClient([_text_response("ok")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        # Verify AWAITING_INPUT is a valid state
+        assert SessionState.AWAITING_INPUT.value == "awaiting_input"
+
+        # Manually set to AWAITING_INPUT to simulate model asking a question
+        session._state = SessionState.AWAITING_INPUT
+        assert session.state == SessionState.AWAITING_INPUT
+
+        # Submitting input from AWAITING_INPUT should transition to PROCESSING
+        # and eventually back to IDLE after completion
+        async for _ in session.submit("user answer"):
+            pass
+
+        assert session.state == SessionState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_processing_state_during_execution(self, env) -> None:
+        """Session should be in PROCESSING state during execution."""
+        observed_states: list[SessionState] = []
+
+        client = MockLLMClient([_text_response("ok")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        async for event in session.submit("test"):
+            observed_states.append(session.state)
+
+        # During execution we should have seen PROCESSING at some point
+        # (the SESSION_START event fires right after state = PROCESSING)
+        assert SessionState.PROCESSING in observed_states
+        # After completion, state should be IDLE
+        assert session.state == SessionState.IDLE
 
     @pytest.mark.asyncio
     async def test_set_reasoning_effort(self, env) -> None:
         from attractor.llm.models import ReasoningEffort
 
-        client = MockLLMClient([_text_response("ok")])
+        captured_requests: list[Request] = []
+
+        class CapturingClient(MockLLMClient):
+            async def complete(self, request: Request) -> Response:
+                captured_requests.append(request)
+                return await super().complete(request)
+
+        client = CapturingClient([_text_response("ok")])
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
         session.set_reasoning_effort(ReasoningEffort.HIGH)
@@ -200,5 +262,6 @@ class TestSessionLifecycle:
         async for _ in session.submit("test"):
             pass
 
-        # No assertion on the effort value in the request since we'd
-        # need to inspect the mock; just verify no errors occurred.
+        # Verify reasoning_effort was passed through to the LLM request
+        assert len(captured_requests) >= 1
+        assert captured_requests[0].reasoning_effort == ReasoningEffort.HIGH

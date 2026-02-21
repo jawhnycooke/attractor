@@ -44,8 +44,12 @@ class StreamEventType(str, enum.Enum):
     """Event types emitted during streaming responses."""
 
     STREAM_START = "stream_start"
+    TEXT_START = "text_start"
     TEXT_DELTA = "text_delta"
+    TEXT_END = "text_end"
+    THINKING_START = "thinking_start"
     REASONING_DELTA = "reasoning_delta"
+    THINKING_END = "thinking_end"
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_DELTA = "tool_call_delta"
     TOOL_CALL_END = "tool_call_end"
@@ -53,14 +57,50 @@ class StreamEventType(str, enum.Enum):
     ERROR = "error"
 
 
-class FinishReason(str, enum.Enum):
-    """Why the model stopped generating."""
+@dataclass(frozen=True)
+class FinishReason:
+    """Why the model stopped generating.
 
-    STOP = "stop"
-    TOOL_USE = "tool_use"
-    LENGTH = "length"
-    CONTENT_FILTER = "content_filter"
-    ERROR = "error"
+    A dual representation preserving both portable semantics and
+    provider-specific detail per unified-llm-spec §3.8.
+
+    Args:
+        reason: Unified reason string — one of ``"stop"``, ``"length"``,
+            ``"tool_calls"``, ``"content_filter"``, ``"error"``, ``"other"``.
+        raw: The provider's native finish reason string (e.g. ``"end_turn"``
+            for Anthropic, ``"STOP"`` for Gemini).
+    """
+
+    reason: str = "stop"
+    raw: str | None = None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, FinishReason):
+            return self.reason == other.reason
+        if isinstance(other, str):
+            return self.reason == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.reason)
+
+    def __str__(self) -> str:
+        return self.reason
+
+    def __repr__(self) -> str:
+        if self.raw:
+            return f"FinishReason(reason={self.reason!r}, raw={self.raw!r})"
+        return f"FinishReason(reason={self.reason!r})"
+
+
+# Class-level constants for backward compatibility
+FinishReason.STOP = FinishReason("stop")  # type: ignore[attr-defined]
+FinishReason.TOOL_CALLS = FinishReason("tool_calls")  # type: ignore[attr-defined]
+FinishReason.TOOL_USE = FinishReason("tool_calls")  # type: ignore[attr-defined]  # compat alias
+FinishReason.LENGTH = FinishReason("length")  # type: ignore[attr-defined]
+FinishReason.CONTENT_FILTER = FinishReason("content_filter")  # type: ignore[attr-defined]
+FinishReason.ERROR = FinishReason("error")  # type: ignore[attr-defined]
+FinishReason.OTHER = FinishReason("other")  # type: ignore[attr-defined]
 
 
 class ReasoningEffort(str, enum.Enum):
@@ -162,10 +202,16 @@ class ToolResultContent:
 
 @dataclass
 class ThinkingContent:
-    """Model reasoning/thinking content (extended thinking)."""
+    """Model reasoning/thinking content (extended thinking).
+
+    The ``signature`` field stores a provider-specific opaque string
+    required for round-tripping thinking blocks back to the provider
+    (see unified-llm-spec §3.5).
+    """
 
     kind: ContentKind = field(default=ContentKind.THINKING, init=False)
     text: str = ""
+    signature: str | None = None
 
 
 @dataclass
@@ -200,6 +246,8 @@ class Message:
 
     role: Role
     content: list[ContentPart] = field(default_factory=list)
+    name: str | None = None
+    tool_call_id: str | None = None
 
     @staticmethod
     def system(text: str) -> Message:
@@ -398,7 +446,9 @@ class Request:
 
     messages: list[Message] = field(default_factory=list)
     model: str = ""
+    provider: str | None = None
     tools: list[ToolDefinition] = field(default_factory=list)
+    tool_choice: str | dict[str, Any] | None = None
     system_prompt: str = ""
     temperature: float | None = None
     max_tokens: int | None = None
@@ -407,6 +457,16 @@ class Request:
     reasoning_effort: ReasoningEffort | None = None
     response_format: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    provider_options: dict[str, Any] | None = None
+
+
+@dataclass
+class RateLimitInfo:
+    """Rate limit metadata from provider response headers."""
+
+    limit: int | None = None
+    remaining: int | None = None
+    reset_seconds: float | None = None
 
 
 @dataclass
@@ -415,11 +475,35 @@ class Response:
 
     message: Message = field(default_factory=lambda: Message(role=Role.ASSISTANT))
     model: str = ""
-    finish_reason: FinishReason = FinishReason.STOP
+    provider: str = ""
+    finish_reason: FinishReason = field(default_factory=lambda: FinishReason.STOP)  # type: ignore[attr-defined]
     usage: TokenUsage = field(default_factory=TokenUsage)
     provider_response_id: str = ""
     latency_ms: float = 0.0
+    raw: dict[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
+    rate_limit: RateLimitInfo | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def text(self) -> str:
+        """Concatenated text from all text parts in the response message."""
+        return self.message.text()
+
+    @property
+    def tool_calls(self) -> list[ToolCallContent]:
+        """Extracted tool calls from the response message."""
+        return self.message.tool_calls()
+
+    @property
+    def reasoning(self) -> str | None:
+        """Concatenated reasoning/thinking text, or None if absent."""
+        parts = [
+            p.text
+            for p in self.message.content
+            if isinstance(p, ThinkingContent) and p.text
+        ]
+        return "".join(parts) if parts else None
 
 
 # ---------------------------------------------------------------------------

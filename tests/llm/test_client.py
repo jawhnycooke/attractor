@@ -24,6 +24,7 @@ from attractor.llm.models import (
     StreamEventType,
     ToolCallContent,
     ToolDefinition,
+    ToolResultContent,
     TokenUsage,
 )
 from attractor.llm.streaming import StreamCollector
@@ -165,6 +166,95 @@ class TestComplete:
         with pytest.raises(ConnectionError, match="permanent failure"):
             await client.complete(request)
 
+    @pytest.mark.asyncio
+    async def test_non_retryable_error_raises_immediately(self) -> None:
+        """AuthenticationError should not be retried."""
+        from attractor.llm.errors import AuthenticationError
+
+        call_count = 0
+
+        class AuthFailAdapter(MockAdapter):
+            async def complete(self, request: Request) -> Response:
+                nonlocal call_count
+                call_count += 1
+                raise AuthenticationError(
+                    "Invalid API key",
+                    provider="mock",
+                    status_code=401,
+                )
+
+        adapter = AuthFailAdapter()
+        policy = RetryPolicy(max_retries=3, base_delay_seconds=0.01)
+        client = LLMClient(adapters=[adapter], retry_policy=policy)
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        with pytest.raises(AuthenticationError, match="Invalid API key"):
+            await client.complete(request)
+
+        # Should only have been called once — no retries
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retryable_error_is_retried(self) -> None:
+        """RateLimitError should be retried."""
+        from attractor.llm.errors import RateLimitError
+
+        call_count = 0
+
+        class RateLimitAdapter(MockAdapter):
+            async def complete(self, request: Request) -> Response:
+                nonlocal call_count
+                call_count += 1
+                if call_count < 3:
+                    raise RateLimitError(
+                        "Rate limited",
+                        provider="mock",
+                        status_code=429,
+                    )
+                return self._response
+
+        adapter = RateLimitAdapter()
+        policy = RetryPolicy(max_retries=3, base_delay_seconds=0.01)
+        client = LLMClient(adapters=[adapter], retry_policy=policy)
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        response = await client.complete(request)
+        assert response.message.text() == "mock reply"
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_retry_uses_retry_after_from_error(self) -> None:
+        """Retry delay should use error's retry_after when available."""
+        from attractor.llm.errors import RateLimitError
+
+        call_count = 0
+        delays: list[float] = []
+        start = time.monotonic()
+
+        class RateLimitAdapter(MockAdapter):
+            async def complete(self, request: Request) -> Response:
+                nonlocal call_count
+                call_count += 1
+                delays.append(time.monotonic() - start)
+                if call_count == 1:
+                    raise RateLimitError(
+                        "Rate limited",
+                        provider="mock",
+                        status_code=429,
+                        retry_after=0.01,
+                    )
+                return self._response
+
+        adapter = RateLimitAdapter()
+        policy = RetryPolicy(max_retries=2, base_delay_seconds=5.0)
+        client = LLMClient(adapters=[adapter], retry_policy=policy)
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        response = await client.complete(request)
+        assert response.message.text() == "mock reply"
+        # The retry should have used 0.01s, not 5.0s
+        assert call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # Streaming
@@ -204,10 +294,11 @@ class TestGenerate:
     @pytest.mark.asyncio
     async def test_generate_with_tool_loop(self) -> None:
         call_count = 0
+        second_request_messages: list[Message] = []
 
         class ToolAdapter(MockAdapter):
             async def complete(self, request: Request) -> Response:
-                nonlocal call_count
+                nonlocal call_count, second_request_messages
                 call_count += 1
                 if call_count == 1:
                     return Response(
@@ -225,6 +316,8 @@ class TestGenerate:
                         finish_reason=FinishReason.TOOL_USE,
                         usage=TokenUsage(input_tokens=10, output_tokens=5),
                     )
+                # Capture the second request's messages for verification
+                second_request_messages = list(request.messages)
                 return Response(
                     message=Message.assistant("final answer"),
                     model="mock-v1",
@@ -245,6 +338,17 @@ class TestGenerate:
         )
         assert response.message.text() == "final answer"
         assert call_count == 2
+
+        # Verify tool results were included in the second request
+        # Messages should be: user, assistant (tool call), tool result
+        assert len(second_request_messages) == 3
+        assert second_request_messages[0].role == Role.USER
+        assert second_request_messages[1].role == Role.ASSISTANT
+        assert second_request_messages[2].role == Role.TOOL
+        tool_result = second_request_messages[2].content[0]
+        assert isinstance(tool_result, ToolResultContent)
+        assert tool_result.tool_call_id == "call_001"
+        assert "result for search" in tool_result.content
 
     @pytest.mark.asyncio
     async def test_generate_no_executor_returns_tool_response(self) -> None:
@@ -346,9 +450,15 @@ class TestGenerate:
         assert call_count == 2
         assert len(execution_log) == 3
 
-        # All 3 tools should have completed — if they ran sequentially
-        # the total time would be ~0.15s, but concurrently ~0.05s.
-        # We verify all 3 ran by checking the log length.
+        # If run sequentially, total time would be ~0.15s (3 x 0.05s).
+        # If concurrent, all three finish in ~0.05s.
+        # Measure wall-clock: each tool took ~0.05s individually.
+        # If concurrent, the max across all three should be << 0.15s.
+        total_sequential_time = sum(t for _, t in execution_log)
+        max_individual_time = max(t for _, t in execution_log)
+        # All should have run in parallel: total ~0.15s but max ~0.05s
+        assert total_sequential_time >= 0.12  # each took ~0.05s
+        assert max_individual_time < 0.10  # but max is only ~0.05s (concurrent)
 
     @pytest.mark.asyncio
     async def test_generate_tool_executor_error_handling(self) -> None:

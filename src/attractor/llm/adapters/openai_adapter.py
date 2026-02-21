@@ -269,11 +269,11 @@ class OpenAIAdapter:
             )
 
         if has_tool_calls:
-            finish = FinishReason.TOOL_USE
+            finish = FinishReason("tool_calls", raw="tool_calls")
         elif raw.status == "incomplete":
-            finish = FinishReason.LENGTH
+            finish = FinishReason("length", raw="incomplete")
         else:
-            finish = FinishReason.STOP
+            finish = FinishReason("stop", raw=raw.status)
 
         return Response(
             message=Message(role=Role.ASSISTANT, content=content_parts),
@@ -399,7 +399,11 @@ class OpenAIAdapter:
                     getattr(item, "type", None) == "function_call"
                     for item in (resp.output if resp else [])
                 )
-                finish = FinishReason.TOOL_USE if has_tool_calls else FinishReason.STOP
+                finish = (
+                    FinishReason("tool_calls", raw="tool_calls")
+                    if has_tool_calls
+                    else FinishReason("stop", raw="completed")
+                )
 
                 yield StreamEvent(
                     type=StreamEventType.FINISH,
@@ -422,6 +426,6 @@ class OpenAIAdapter:
             elif event_type == "response.incomplete":
                 yield StreamEvent(
                     type=StreamEventType.FINISH,
-                    finish_reason=FinishReason.LENGTH,
+                    finish_reason=FinishReason("length", raw="incomplete"),
                     metadata={"latency_ms": (time.monotonic() - t0) * 1000},
                 )

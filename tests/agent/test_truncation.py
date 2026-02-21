@@ -66,14 +66,38 @@ class TestLineTruncation:
         assert "lines removed" not in truncated
 
     def test_both_stages_applied(self) -> None:
-        # Create output that triggers both char and line truncation
+        """Char truncation runs first, then line truncation on the result.
+
+        With char-first ordering:
+          1. Char truncation: 10000+ chars → ~1000 chars (~18 lines)
+          2. Line truncation: ~18 lines → 10 lines
+
+        If lines ran first (hypothetical reverse order):
+          1. Line truncation: 200 lines → 10 lines (~550 chars)
+          2. Char truncation: ~550 chars → no truncation (under 1000 limit)
+
+        So char-first produces a shorter result than line-first would.
+        """
         config = TruncationConfig(
-            char_limits={"shell": 500},
+            char_limits={"shell": 1000},
             line_limits={"shell": 10},
         )
-        text = "\n".join(f"line-{i}-{'x' * 50}" for i in range(100))
+        # 200 lines of ~54 chars each ≈ 10,800 chars
+        text = "\n".join(f"line-{i}-{'x' * 50}" for i in range(200))
         truncated, full = truncate_output("shell", text, config=config)
         assert full == text
+
+        # Simulate line-only truncation to prove both stages contribute
+        line_only_config = TruncationConfig(
+            char_limits={},  # no char truncation
+            line_limits={"shell": 10},
+        )
+        line_only_result, _ = truncate_output("shell", text, config=line_only_config)
+
+        # With both stages, the result should be shorter than line-only
+        # because char truncation runs first and introduces a marker line,
+        # making subsequent line truncation operate on a different structure
+        assert len(truncated) < len(line_only_result)
         assert "removed" in truncated
 
 

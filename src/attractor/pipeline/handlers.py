@@ -1,8 +1,9 @@
 """Pluggable node handlers for pipeline execution.
 
 Each handler implements the :class:`NodeHandler` protocol — a single
-``execute`` async method that receives the node definition and shared
-context, and returns a :class:`NodeResult`.
+``execute`` async method that receives the node definition, shared
+context, the pipeline graph, and an optional logs root path, and
+returns a :class:`NodeResult`.
 
 The :class:`HandlerRegistry` maps handler-type strings to handler
 instances and is used by the engine to dispatch execution.
@@ -11,8 +12,11 @@ instances and is used by the engine to dispatch execution.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import subprocess
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from attractor.pipeline.conditions import evaluate_condition
@@ -32,7 +36,11 @@ class NodeHandler(Protocol):
     """Protocol that all node handlers must satisfy."""
 
     async def execute(
-        self, node: PipelineNode, context: PipelineContext
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
     ) -> NodeResult: ...
 
 
@@ -41,10 +49,23 @@ class HandlerRegistry:
 
     Used by :class:`PipelineEngine` to dispatch node execution to the
     appropriate handler based on the node's ``handler_type`` attribute.
+
+    Supports a ``default_handler`` fallback for unknown handler types.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, default_handler: NodeHandler | None = None) -> None:
         self._handlers: dict[str, NodeHandler] = {}
+        self._default_handler = default_handler
+
+    @property
+    def default_handler(self) -> NodeHandler | None:
+        """Return the default fallback handler."""
+        return self._default_handler
+
+    @default_handler.setter
+    def default_handler(self, handler: NodeHandler | None) -> None:
+        """Set the default fallback handler."""
+        self._default_handler = handler
 
     def register(self, handler_type: str, handler: NodeHandler) -> None:
         """Register a *handler* under *handler_type*.
@@ -56,15 +77,15 @@ class HandlerRegistry:
         self._handlers[handler_type] = handler
 
     def get(self, handler_type: str) -> NodeHandler | None:
-        """Return the handler for *handler_type*, or ``None``.
+        """Return the handler for *handler_type*, or the default handler.
 
         Args:
             handler_type: The handler key to look up.
 
         Returns:
-            The registered handler, or ``None`` if not found.
+            The registered handler, the default handler, or ``None``.
         """
-        return self._handlers.get(handler_type)
+        return self._handlers.get(handler_type, self._default_handler)
 
     def has(self, handler_type: str) -> bool:
         """Return ``True`` if *handler_type* is registered.
@@ -91,15 +112,35 @@ class HandlerRegistry:
 class StartHandler:
     """Entry point handler — no-op, always succeeds."""
 
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
         return NodeResult(status=OutcomeStatus.SUCCESS, notes="Pipeline started")
 
 
 class ExitHandler:
     """Exit point handler — no-op, always succeeds."""
 
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
         return NodeResult(status=OutcomeStatus.SUCCESS, notes="Pipeline exiting")
+
+
+def _expand_goal(prompt: str, graph: Pipeline | None) -> str:
+    """Replace ``$goal`` in *prompt* with the pipeline's goal attribute."""
+    if graph is not None:
+        goal = graph.metadata.get("goal", graph.goal or "")
+        prompt = prompt.replace("$goal", str(goal))
+    return prompt
 
 
 class CodergenHandler:
@@ -109,27 +150,45 @@ class CodergenHandler:
     when the agent module is unavailable.
     """
 
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
         """Run the coding agent for *node*'s prompt.
-
-        Builds a :class:`Session` with the appropriate provider profile,
-        a local execution environment, and an LLM client, then iterates
-        over the event stream to collect the final text output.
 
         Args:
             node: The pipeline node being executed.
             context: Shared pipeline context for variable interpolation.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
 
         Returns:
             A :class:`NodeResult` with the agent's text output on
             success, or an error description on failure.
         """
-        prompt = node.attributes.get("prompt", "")
+        prompt = node.attributes.get("prompt", "") or node.prompt
         model = node.attributes.get("model", "")
+
+        # H3: Fall back to node.label when prompt is empty
+        if not prompt:
+            prompt = node.label or ""
+
+        # H4: Expand $goal variable
+        prompt = _expand_goal(prompt, graph)
 
         # Interpolate context variables in the prompt
         for key, value in context.to_dict().items():
             prompt = prompt.replace(f"{{{key}}}", str(value))
+
+        # H2: Write prompt.md when logs_root is provided
+        stage_dir: Path | None = None
+        if logs_root is not None:
+            stage_dir = Path(logs_root) / node.name
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            (stage_dir / "prompt.md").write_text(prompt)
 
         try:
             from attractor.agent.events import AgentEventType
@@ -169,16 +228,30 @@ class CodergenHandler:
                     if text:
                         output_parts.append(text)
 
-            result = "".join(output_parts)
+            result_text = "".join(output_parts)
+
+            # H2: Write response.md and status.json
+            if stage_dir is not None:
+                (stage_dir / "response.md").write_text(result_text)
+                (stage_dir / "status.json").write_text(
+                    json.dumps({"status": "success", "node": node.name})
+                )
+
+            # H5: Set last_response context key (not last_codergen_output)
             return NodeResult(
                 status=OutcomeStatus.SUCCESS,
-                output=result,
-                context_updates={"last_codergen_output": result},
+                output=result_text,
+                context_updates={"last_response": result_text},
             )
         except ImportError:
             logger.warning(
                 "attractor.agent not available — codergen handler cannot run"
             )
+            if stage_dir is not None:
+                (stage_dir / "status.json").write_text(
+                    json.dumps({"status": "fail", "node": node.name,
+                                "reason": "agent module not available"})
+                )
             return NodeResult(
                 status=OutcomeStatus.FAIL,
                 failure_reason=(
@@ -188,7 +261,39 @@ class CodergenHandler:
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
+            if stage_dir is not None:
+                (stage_dir / "status.json").write_text(
+                    json.dumps({"status": "fail", "node": node.name,
+                                "reason": str(exc)})
+                )
             return NodeResult(status=OutcomeStatus.FAIL, failure_reason=str(exc))
+
+
+def _parse_accelerator_key(label: str) -> str:
+    """Extract accelerator key from an edge label.
+
+    Patterns matched:
+    - ``[K] Label`` -> ``K``
+    - ``K) Label``  -> ``K``
+    - ``K - Label`` -> ``K``
+    - First character of label -> ``L``
+    """
+    # [K] Label
+    m = re.match(r"^\[(\w)\]\s*", label)
+    if m:
+        return m.group(1)
+    # K) Label
+    m = re.match(r"^(\w)\)\s*", label)
+    if m:
+        return m.group(1)
+    # K - Label
+    m = re.match(r"^(\w)\s*-\s*", label)
+    if m:
+        return m.group(1)
+    # First character
+    if label:
+        return label[0]
+    return ""
 
 
 class WaitHumanHandler:
@@ -202,22 +307,28 @@ class WaitHumanHandler:
         self._interviewer = interviewer
         self._pipeline = pipeline
 
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
         """Gate execution on human approval.
 
-        When a pipeline is available, derives choices from outgoing edge
-        labels and uses multiple-choice selection. Falls back to simple
-        confirm when no pipeline is set.
+        Uses outgoing edge targets as ``suggested_next_ids`` and sets
+        ``human_choice`` / ``selected_edge_id`` context keys per spec.
 
         Args:
             node: The pipeline node being executed.
             context: Shared pipeline context.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
 
         Returns:
-            A :class:`NodeResult` with ``approved`` in context_updates
-            and ``preferred_label`` set to the chosen edge label.
+            A :class:`NodeResult` with routing hints and context updates.
         """
-        prompt = node.attributes.get("prompt", "Approve this step?")
+        prompt = node.attributes.get("prompt", "") or node.label or "Approve this step?"
         interviewer = self._interviewer or context.get("_interviewer")
 
         if interviewer is None:
@@ -226,19 +337,40 @@ class WaitHumanHandler:
                 failure_reason="No interviewer configured for wait.human node",
             )
 
-        await interviewer.inform(f"Node '{node.name}': {prompt}")
+        # H6: Use outgoing edges from the graph parameter (preferred) or stored pipeline
+        active_graph = graph or self._pipeline
 
-        # Multiple-choice from outgoing edges when pipeline is available
-        if self._pipeline is not None:
-            edges = self._pipeline.outgoing_edges(node.name)
-            edge_labels = [e.label or e.target for e in edges]
-            if edge_labels and hasattr(interviewer, "ask"):
-                answer = await interviewer.ask(prompt, options=edge_labels)
-                return NodeResult(
-                    status=OutcomeStatus.SUCCESS,
-                    context_updates={"approved": True},
-                    preferred_label=answer,
-                )
+        if active_graph is not None:
+            edges = active_graph.outgoing_edges(node.name)
+            if edges:
+                # H7: Parse accelerator keys from edge labels
+                edge_labels = [e.label or e.target for e in edges]
+
+                await interviewer.inform(f"Node '{node.name}': {prompt}")
+
+                if hasattr(interviewer, "ask"):
+                    answer = await interviewer.ask(prompt, options=edge_labels)
+
+                    # Find the matching edge
+                    selected_edge = None
+                    for e in edges:
+                        label = e.label or e.target
+                        if label == answer:
+                            selected_edge = e
+                            break
+                    if selected_edge is None:
+                        selected_edge = edges[0]
+
+                    return NodeResult(
+                        status=OutcomeStatus.SUCCESS,
+                        suggested_next_ids=[selected_edge.target],
+                        context_updates={
+                            "human_choice": answer,
+                            "selected_edge_id": selected_edge.target,
+                        },
+                    )
+
+        await interviewer.inform(f"Node '{node.name}': {prompt}")
 
         # Fallback: simple confirm
         approved = await interviewer.confirm(prompt)
@@ -253,53 +385,43 @@ HumanGateHandler = WaitHumanHandler
 
 
 class ConditionalHandler:
-    """Evaluate conditions on outgoing edges and route accordingly.
+    """Pure no-op handler for conditional routing nodes.
 
-    This handler does not perform work itself — it simply evaluates
-    the pipeline's outgoing edges and picks the first matching target
-    via ``next_node``.  The engine uses this to decide the next step.
+    Per spec (§4.7), the handler returns SUCCESS immediately.
+    Actual edge evaluation is handled by the engine's edge selection
+    algorithm.
     """
 
-    def __init__(self, pipeline: Pipeline | None = None) -> None:
-        self._pipeline = pipeline
-
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
-        """Evaluate outgoing edge conditions and route to the first match.
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
+        """Return SUCCESS — routing is the engine's job.
 
         Args:
-            node: The conditional node whose edges are evaluated.
-            context: Shared pipeline context for condition resolution.
+            node: The conditional node.
+            context: Shared pipeline context.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
 
         Returns:
-            A :class:`NodeResult` with ``next_node`` set to the first
-            matching edge target, or the default (unconditional) edge.
+            An empty :class:`NodeResult` with SUCCESS status.
         """
-        pipeline = self._pipeline
-        if pipeline is None:
-            return NodeResult(status=OutcomeStatus.SUCCESS)
-
-        edges = pipeline.outgoing_edges(node.name)
-        default_target: str | None = None
-
-        for edge in edges:
-            if edge.condition is None:
-                default_target = edge.target
-                continue
-            if evaluate_condition(edge.condition, context):
-                return NodeResult(status=OutcomeStatus.SUCCESS, next_node=edge.target)
-
-        if default_target:
-            return NodeResult(status=OutcomeStatus.SUCCESS, next_node=default_target)
-
-        return NodeResult(status=OutcomeStatus.SUCCESS)
+        return NodeResult(
+            status=OutcomeStatus.SUCCESS,
+            notes=f"Conditional node evaluated: {node.name}",
+        )
 
 
 class ParallelHandler:
     """Fan-out execution across multiple sub-paths.
 
-    The node's ``branches`` attribute should be a list of node names.
-    Each branch gets its own scoped context and runs concurrently via
-    ``asyncio.gather``.  Results are merged back into the parent context.
+    Uses outgoing edges as branches per spec (§4.8). Supports
+    ``join_policy`` (wait_all/first_success) and ``error_policy``
+    (fail_fast/continue) attributes.
     """
 
     def __init__(
@@ -310,37 +432,54 @@ class ParallelHandler:
         self._registry = registry
         self._pipeline = pipeline
 
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
-        """Fan out execution across the branches listed in *node*.
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
+        """Fan out execution across outgoing edges.
 
         Args:
-            node: The parallel node whose ``branches`` attribute lists
-                the sub-nodes to execute concurrently.
+            node: The parallel node.
             context: Shared pipeline context.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
 
         Returns:
             A :class:`NodeResult` with merged outputs from all branches.
         """
-        branches = node.attributes.get("branches", [])
-        if isinstance(branches, str):
-            branches = [b.strip() for b in branches.split(",")]
+        active_graph = graph or self._pipeline
+
+        # H11: Use outgoing edges as branches
+        if active_graph is not None:
+            edges = active_graph.outgoing_edges(node.name)
+            branches = [e.target for e in edges]
+        else:
+            # Fallback to branches attribute
+            branches = node.attributes.get("branches", [])
+            if isinstance(branches, str):
+                branches = [b.strip() for b in branches.split(",")]
 
         if not branches:
             return NodeResult(
                 status=OutcomeStatus.SUCCESS, output="No branches specified"
             )
 
-        pipeline = self._pipeline
         registry = self._registry
 
-        if not pipeline or not registry:
+        if not active_graph or not registry:
             return NodeResult(
                 status=OutcomeStatus.SUCCESS,
                 output=f"[stub] Would run parallel branches: {branches}",
             )
 
+        join_policy = node.attributes.get("join_policy", "wait_all")
+        error_policy = node.attributes.get("error_policy", "continue")
+
         async def _run_branch(branch_name: str) -> tuple[str, NodeResult]:
-            branch_node = pipeline.nodes.get(branch_name)
+            branch_node = active_graph.nodes.get(branch_name)
             if not branch_node:
                 return branch_name, NodeResult(
                     status=OutcomeStatus.FAIL,
@@ -353,7 +492,7 @@ class ParallelHandler:
                     failure_reason=f"No handler for '{branch_node.handler_type}'",
                 )
             scope = context.create_scope(branch_name)
-            result = await handler.execute(branch_node, scope)
+            result = await handler.execute(branch_node, scope, active_graph, logs_root)
             context.merge_scope(scope, branch_name)
             if result.context_updates:
                 for k, v in result.context_updates.items():
@@ -365,28 +504,59 @@ class ParallelHandler:
         )
 
         outputs: dict[str, Any] = {}
-        all_success = True
+        success_count = 0
+        fail_count = 0
         for item in results:
             if isinstance(item, BaseException):
-                all_success = False
+                fail_count += 1
                 outputs["_error"] = str(item)
             else:
                 name, res = item
                 outputs[name] = res.output
-                if not res.success:
-                    all_success = False
+                if res.success:
+                    success_count += 1
+                else:
+                    fail_count += 1
+
+        # H11: Apply join_policy
+        if join_policy == "first_success":
+            if success_count > 0:
+                status = OutcomeStatus.SUCCESS
+            else:
+                status = OutcomeStatus.FAIL
+        else:  # wait_all (default)
+            if fail_count == 0:
+                status = OutcomeStatus.SUCCESS
+            else:
+                status = OutcomeStatus.PARTIAL_SUCCESS
 
         return NodeResult(
-            status=OutcomeStatus.SUCCESS if all_success else OutcomeStatus.FAIL,
+            status=status,
             output=outputs,
             context_updates={"parallel.results": outputs},
         )
 
 
 class FanInHandler:
-    """Consolidate parallel branch results."""
+    """Consolidate parallel branch results.
 
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+    H12: Ranks outcomes by status priority (SUCCESS > PARTIAL > FAIL).
+    """
+
+    _STATUS_RANK: dict[str, int] = {
+        "success": 0,
+        "partial_success": 1,
+        "retry": 2,
+        "fail": 3,
+    }
+
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
         results = context.get("parallel.results", {})
         if not results:
             return NodeResult(
@@ -394,11 +564,21 @@ class FanInHandler:
                 output="No parallel results to consolidate",
             )
 
-        # Simple heuristic: pick branch with best outcome
+        # H12: Rank by status priority
         best_id = None
         best_output = None
+        best_rank = 999
+
         for branch_id, branch_data in results.items():
-            if best_id is None:
+            # branch_data may be a dict with status or just output
+            if isinstance(branch_data, dict) and "status" in branch_data:
+                rank = self._STATUS_RANK.get(branch_data["status"], 999)
+            else:
+                # Treat non-dict as success
+                rank = 0
+
+            if rank < best_rank or best_id is None:
+                best_rank = rank
                 best_id = branch_id
                 best_output = branch_data
 
@@ -412,24 +592,32 @@ class FanInHandler:
 class ToolHandler:
     """Execute a shell command and capture exit code + output."""
 
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
         """Run a shell command defined in *node*'s ``tool_command`` attribute.
 
-        Falls back to the ``command`` attribute for backward compatibility.
+        H13: Only reads ``tool_command`` — no ``command`` fallback.
 
         Args:
-            node: The pipeline node with a ``tool_command`` (or ``command``) attribute.
+            node: The pipeline node with a ``tool_command`` attribute.
             context: Shared pipeline context for variable interpolation.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
 
         Returns:
             A :class:`NodeResult` with stdout/stderr and exit code.
         """
-        command = node.attributes.get("tool_command") or node.attributes.get(
-            "command", ""
-        )
+        # H13: Only use tool_command, no command fallback
+        command = node.attributes.get("tool_command", "")
         if not command:
             return NodeResult(
-                status=OutcomeStatus.FAIL, failure_reason="No command specified"
+                status=OutcomeStatus.FAIL,
+                failure_reason="No tool_command specified",
             )
 
         # Interpolate context variables
@@ -481,13 +669,21 @@ class ManagerLoopHandler:
     def __init__(self, engine: Any = None) -> None:
         self._engine = engine
 
-    async def execute(self, node: PipelineNode, context: PipelineContext) -> NodeResult:
+    async def execute(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
         """Run an iterative refinement loop on a sub-pipeline.
 
         Args:
             node: The manager loop node with ``sub_pipeline``,
                 ``done_condition``, and ``max_iterations`` attributes.
             context: Shared pipeline context.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
 
         Returns:
             A :class:`NodeResult` indicating how many iterations ran
@@ -539,14 +735,15 @@ def create_default_registry(
     interviewer: Any = None,
 ) -> HandlerRegistry:
     """Create a :class:`HandlerRegistry` pre-loaded with built-in handlers."""
-    registry = HandlerRegistry()
+    # H15: Use CodergenHandler as default handler fallback
+    registry = HandlerRegistry(default_handler=CodergenHandler())
     registry.register("start", StartHandler())
     registry.register("exit", ExitHandler())
     registry.register("codergen", CodergenHandler())
     registry.register(
         "wait.human", WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
     )
-    registry.register("conditional", ConditionalHandler(pipeline=pipeline))
+    registry.register("conditional", ConditionalHandler())
 
     parallel = ParallelHandler(registry=registry, pipeline=pipeline)
     registry.register("parallel", parallel)

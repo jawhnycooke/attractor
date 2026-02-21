@@ -70,7 +70,23 @@ def parse_dot_string(dot_content: str, name: str = "pipeline") -> Pipeline:
     if not graphs:
         raise ParseError("No graph found in DOT content")
 
+    if len(graphs) > 1:
+        raise ParseError(
+            "Multiple graphs found in DOT content; only a single digraph is allowed"
+        )
+
     graph = graphs[0]
+
+    # Reject undirected graphs
+    if graph.get_type() != "digraph":
+        raise ParseError(
+            f"Only directed graphs (digraph) are supported, got '{graph.get_type()}'"
+        )
+
+    # Reject strict modifier
+    if graph.get_strict():
+        raise ParseError("The 'strict' modifier is not supported")
+
     pipeline_name = _unquote(graph.get_name()) or name
 
     node_defaults, edge_defaults = _extract_defaults(graph)
@@ -92,6 +108,7 @@ def parse_dot_string(dot_content: str, name: str = "pipeline") -> Pipeline:
         start_node=start_node,
         metadata=graph_attrs,
         goal=str(graph_attrs.pop("goal", "")),
+        label=str(graph_attrs.pop("label", "")),
         default_max_retry=int(graph_attrs.pop("default_max_retry", 50)),
         retry_target=graph_attrs.pop("retry_target", None),
         fallback_retry_target=graph_attrs.pop("fallback_retry_target", None),
@@ -359,7 +376,7 @@ def _resolve_start(nodes: dict[str, PipelineNode]) -> str:
 
     Precedence:
     1. Node with ``handler_type == "start"`` (shape=Mdiamond)
-    2. Node named ``"start"``
+    2. Node whose name matches ``"start"`` (case-insensitive)
     3. Error
     """
     for node in nodes.values():
@@ -367,9 +384,10 @@ def _resolve_start(nodes: dict[str, PipelineNode]) -> str:
             node.is_start = True
             return node.name
 
-    if "start" in nodes:
-        nodes["start"].is_start = True
-        return "start"
+    for node in nodes.values():
+        if node.name.lower() == "start":
+            node.is_start = True
+            return node.name
 
     raise ParseError(
         "No start node found — use shape=Mdiamond or name a node 'start'"
@@ -380,11 +398,14 @@ def _mark_terminals(nodes: dict[str, PipelineNode], edges: list[PipelineEdge]) -
     """Mark terminal nodes.
 
     Nodes with handler_type == "exit" are terminal.
+    Nodes whose name matches "exit" or "end" (case-insensitive) are terminal.
     Nodes with no outgoing edges are implicitly terminal.
     """
     sources = {e.source for e in edges}
     for node in nodes.values():
         if node.handler_type == "exit":
+            node.is_terminal = True
+        elif node.name.lower() in ("exit", "end"):
             node.is_terminal = True
         elif node.name not in sources and not node.is_terminal:
             node.is_terminal = True

@@ -29,6 +29,7 @@ class AgentEventType(str, enum.Enum):
     STEERING_INJECTED = "steering_injected"
     TURN_LIMIT = "turn_limit"
     LOOP_DETECTION = "loop_detection"
+    CONTEXT_WINDOW_WARNING = "context_window_warning"
     ERROR = "error"
 
 

@@ -6,6 +6,7 @@ and node results used throughout the pipeline engine.
 
 from __future__ import annotations
 
+import copy
 import enum
 import json
 import time
@@ -157,6 +158,7 @@ class Pipeline:
     start_node: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     goal: str = ""
+    label: str = ""
     default_max_retry: int = 50
     retry_target: str | None = None
     fallback_retry_target: str | None = None
@@ -164,11 +166,10 @@ class Pipeline:
     model_stylesheet: str | None = None
 
     def outgoing_edges(self, node_name: str) -> list[PipelineEdge]:
-        """Return edges originating from *node_name*, sorted by weight descending."""
+        """Return edges originating from *node_name*, sorted by weight desc, then target asc."""
         return sorted(
             [e for e in self.edges if e.source == node_name],
-            key=lambda e: e.weight,
-            reverse=True,
+            key=lambda e: (-e.weight, e.target),
         )
 
     def incoming_edges(self, node_name: str) -> list[PipelineEdge]:
@@ -283,16 +284,29 @@ class PipelineContext:
         ctx._data = dict(data)
         return ctx
 
+    def clone(self) -> PipelineContext:
+        """Create a deep copy of this context for parallel branch isolation.
+
+        Returns:
+            A new :class:`PipelineContext` with deep-copied data.
+        """
+        ctx = PipelineContext()
+        ctx._data = copy.deepcopy(self._data)
+        return ctx
+
     def create_scope(self, prefix: str) -> PipelineContext:
         """Create a child context whose keys are prefixed on merge-back.
+
+        The child starts as a deep copy of the parent so that parallel
+        branches see the same initial state but cannot mutate each other.
 
         Args:
             prefix: The prefix applied when merging back.
 
         Returns:
-            A new empty :class:`PipelineContext`.
+            A new :class:`PipelineContext` cloned from this one.
         """
-        return PipelineContext()
+        return self.clone()
 
     def merge_scope(self, scope: PipelineContext, prefix: str) -> None:
         """Merge a scoped context back, prefixing its keys.

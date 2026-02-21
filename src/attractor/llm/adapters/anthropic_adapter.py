@@ -31,11 +31,11 @@ from attractor.llm.models import (
 
 logger = logging.getLogger(__name__)
 
-_FINISH_MAP = {
-    "end_turn": FinishReason.STOP,
-    "tool_use": FinishReason.TOOL_USE,
-    "max_tokens": FinishReason.LENGTH,
-    "stop_sequence": FinishReason.STOP,
+_FINISH_MAP: dict[str, FinishReason] = {
+    "end_turn": FinishReason("stop", raw="end_turn"),
+    "tool_use": FinishReason("tool_calls", raw="tool_use"),
+    "max_tokens": FinishReason("length", raw="max_tokens"),
+    "stop_sequence": FinishReason("stop", raw="stop_sequence"),
 }
 
 _THINKING_BUDGET = {
@@ -173,7 +173,10 @@ class AnthropicAdapter:
                     }
                 )
             elif isinstance(part, ThinkingContent):
-                parts.append({"type": "thinking", "thinking": part.text})
+                block: dict[str, Any] = {"type": "thinking", "thinking": part.text}
+                if part.signature:
+                    block["signature"] = part.signature
+                parts.append(block)
             elif isinstance(part, RedactedThinkingContent):
                 parts.append({"type": "redacted_thinking", "data": part.data})
         return parts or [{"type": "text", "text": "(empty)"}]
@@ -189,6 +192,46 @@ class AnthropicAdapter:
             }
             for t in tools
         ]
+
+    def _inject_cache_control(
+        self, kwargs: dict[str, Any], request: Request
+    ) -> None:
+        """Auto-inject cache_control on system prompt and long tool definitions.
+
+        Anthropic requires explicit cache_control breakpoints for prompt
+        caching. Without them, every turn re-processes the full system prompt
+        and conversation history at full price. This method automatically
+        adds cache_control to the system prompt and to tool definitions that
+        exceed a length threshold (4096 chars in their JSON representation).
+        """
+        # Check if auto-caching is disabled via provider_options
+        if request.provider_options:
+            anthropic_opts = request.provider_options.get("anthropic", {})
+            if isinstance(anthropic_opts, dict) and not anthropic_opts.get(
+                "auto_cache", True
+            ):
+                return
+
+        # Inject cache_control on system prompt
+        if "system" in kwargs and isinstance(kwargs["system"], str):
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": kwargs["system"],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+
+        # Inject cache_control on long tool definitions
+        tools = kwargs.get("tools")
+        if tools and isinstance(tools, list):
+            for tool in tools:
+                desc = tool.get("description", "")
+                schema = tool.get("input_schema", {})
+                # Mark tools with long descriptions or complex schemas
+                total_len = len(desc) + len(json.dumps(schema))
+                if total_len > 4096:
+                    tool["cache_control"] = {"type": "ephemeral"}
 
     def _build_kwargs(self, request: Request) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -215,6 +258,9 @@ class AnthropicAdapter:
                 "budget_tokens": budget,
             }
 
+        # Auto-inject cache_control for prompt caching
+        self._inject_cache_control(kwargs, request)
+
         return kwargs
 
     # -----------------------------------------------------------------
@@ -239,7 +285,10 @@ class AnthropicAdapter:
                     )
                 )
             elif block.type == "thinking":
-                content_parts.append(ThinkingContent(text=block.thinking))
+                content_parts.append(ThinkingContent(
+                    text=block.thinking,
+                    signature=getattr(block, "signature", None),
+                ))
             elif block.type == "redacted_thinking":
                 content_parts.append(
                     RedactedThinkingContent(
@@ -255,11 +304,13 @@ class AnthropicAdapter:
             or 0,
         )
 
-        finish = _FINISH_MAP.get(raw.stop_reason or "end_turn", FinishReason.STOP)
+        raw_reason = raw.stop_reason or "end_turn"
+        finish = _FINISH_MAP.get(raw_reason, FinishReason("stop", raw=raw_reason))
 
         return Response(
             message=Message(role=Role.ASSISTANT, content=content_parts),
             model=raw.model,
+            provider="anthropic",
             finish_reason=finish,
             usage=usage,
             provider_response_id=raw.id or "",
@@ -363,9 +414,10 @@ class AnthropicAdapter:
                     current_tool = None
 
             elif event_type == "message_delta":
+                raw_sr = getattr(event.delta, "stop_reason", None) or "end_turn"
                 finish = _FINISH_MAP.get(
-                    getattr(event.delta, "stop_reason", None) or "end_turn",
-                    FinishReason.STOP,
+                    raw_sr,
+                    FinishReason("stop", raw=raw_sr),
                 )
                 usage_data = getattr(event, "usage", None)
                 usage = None

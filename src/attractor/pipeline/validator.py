@@ -14,6 +14,16 @@ from typing import Protocol, runtime_checkable
 from attractor.pipeline.conditions import validate_condition_syntax
 from attractor.pipeline.models import Pipeline, PipelineEdge
 
+# Valid fidelity mode values per spec §5.4
+_VALID_FIDELITY_MODES = {
+    "full",
+    "truncate",
+    "compact",
+    "summary:low",
+    "summary:medium",
+    "summary:high",
+}
+
 # Handler types that are known to the built-in registry
 _KNOWN_HANDLERS = {
     "start",
@@ -64,6 +74,8 @@ class ValidationError:
 class LintRule(Protocol):
     """Protocol for custom validation rules."""
 
+    name: str
+
     def check(self, pipeline: Pipeline) -> list[ValidationError]: ...
 
 
@@ -75,8 +87,15 @@ def register_lint_rule(rule: LintRule) -> None:
     _custom_rules.append(rule)
 
 
-def validate_pipeline(pipeline: Pipeline) -> list[ValidationError]:
+def validate_pipeline(
+    pipeline: Pipeline,
+    extra_rules: list[LintRule] | None = None,
+) -> list[ValidationError]:
     """Run all validation checks on *pipeline*.
+
+    Args:
+        pipeline: The pipeline to validate.
+        extra_rules: Additional lint rules to run.
 
     Returns:
         A list of :class:`ValidationError` findings, possibly empty.
@@ -96,9 +115,15 @@ def validate_pipeline(pipeline: Pipeline) -> list[ValidationError]:
     _check_retry_target_exists(pipeline, errors)
     _check_goal_gate_has_retry(pipeline, errors)
     _check_prompt_on_llm_nodes(pipeline, errors)
+    _check_stylesheet_syntax(pipeline, errors)
+    _check_fidelity_valid(pipeline, errors)
 
     for rule in _custom_rules:
         errors.extend(rule.check(pipeline))
+
+    if extra_rules:
+        for rule in extra_rules:
+            errors.extend(rule.check(pipeline))
 
     return errors
 
@@ -106,6 +131,38 @@ def validate_pipeline(pipeline: Pipeline) -> list[ValidationError]:
 def has_errors(findings: list[ValidationError]) -> bool:
     """Return True if any finding is an error (not just a warning)."""
     return any(f.level == ValidationLevel.ERROR for f in findings)
+
+
+class ValidationException(Exception):
+    """Raised by :func:`validate_or_raise` when ERROR-level diagnostics exist."""
+
+    def __init__(self, errors: list[ValidationError]) -> None:
+        self.errors = errors
+        messages = [str(e) for e in errors]
+        super().__init__("\n".join(messages))
+
+
+def validate_or_raise(
+    pipeline: Pipeline,
+    extra_rules: list[LintRule] | None = None,
+) -> list[ValidationError]:
+    """Run validation and raise on any ERROR-level diagnostic.
+
+    Args:
+        pipeline: The pipeline to validate.
+        extra_rules: Additional lint rules to run.
+
+    Returns:
+        The full list of diagnostics (only warnings/info if no exception).
+
+    Raises:
+        ValidationException: If any ERROR-level diagnostics are found.
+    """
+    findings = validate_pipeline(pipeline, extra_rules=extra_rules)
+    error_findings = [f for f in findings if f.level == ValidationLevel.ERROR]
+    if error_findings:
+        raise ValidationException(error_findings)
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +187,19 @@ def _check_start_node(pipeline: Pipeline, errors: list[ValidationError]) -> None
                 rule="start_node",
             )
         )
+    else:
+        # Exactly one start node required
+        start_nodes = [n for n in pipeline.nodes.values() if n.is_start]
+        if len(start_nodes) > 1:
+            names = ", ".join(n.name for n in start_nodes)
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.ERROR,
+                    message=f"Multiple start nodes found: {names}",
+                    rule="start_node",
+                    fix="Ensure exactly one node has is_start=true or shape=Mdiamond",
+                )
+            )
 
 
 def _check_start_no_incoming(
@@ -159,6 +229,16 @@ def _check_terminal_nodes(pipeline: Pipeline, errors: list[ValidationError]) -> 
                 rule="terminal_node",
             )
         )
+    elif len(terminals) > 1:
+        names = ", ".join(n.name for n in terminals)
+        errors.append(
+            ValidationError(
+                level=ValidationLevel.ERROR,
+                message=f"Multiple terminal nodes found: {names}",
+                rule="terminal_node",
+                fix="Ensure exactly one node is terminal (shape=Msquare or named 'exit'/'end')",
+            )
+        )
 
 
 def _check_exit_no_outgoing(
@@ -183,7 +263,7 @@ def _check_handler_types(pipeline: Pipeline, errors: list[ValidationError]) -> N
         if node.handler_type not in _KNOWN_HANDLERS:
             errors.append(
                 ValidationError(
-                    level=ValidationLevel.ERROR,
+                    level=ValidationLevel.WARNING,
                     message=f"Unknown handler type '{node.handler_type}'",
                     node_name=node.name,
                     rule="type_known",
@@ -271,7 +351,7 @@ def _check_reachability(pipeline: Pipeline, errors: list[ValidationError]) -> No
         if name not in reachable:
             errors.append(
                 ValidationError(
-                    level=ValidationLevel.WARNING,
+                    level=ValidationLevel.ERROR,
                     message="Node is unreachable from start",
                     node_name=name,
                     rule="reachability",
@@ -393,5 +473,83 @@ def _check_prompt_on_llm_nodes(
                     node_name=node.name,
                     rule="prompt_on_llm_nodes",
                     fix="Add a prompt or label attribute",
+                )
+            )
+
+
+def _check_stylesheet_syntax(
+    pipeline: Pipeline, errors: list[ValidationError]
+) -> None:
+    """Check that model_stylesheet parses as valid stylesheet rules (V1)."""
+    if not pipeline.model_stylesheet:
+        return
+
+    try:
+        from attractor.pipeline.stylesheet import parse_stylesheet
+
+        result = parse_stylesheet(pipeline.model_stylesheet)
+        if not result.rules:
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.ERROR,
+                    message="model_stylesheet contains no valid rules",
+                    rule="stylesheet_syntax",
+                    fix="Ensure stylesheet uses valid selectors (*, #id, .class) and declarations",
+                )
+            )
+    except Exception as exc:
+        errors.append(
+            ValidationError(
+                level=ValidationLevel.ERROR,
+                message=f"Invalid model_stylesheet syntax: {exc}",
+                rule="stylesheet_syntax",
+            )
+        )
+
+
+def _check_fidelity_valid(
+    pipeline: Pipeline, errors: list[ValidationError]
+) -> None:
+    """Check that fidelity values are valid (V2)."""
+    # Check graph-level default_fidelity
+    if pipeline.default_fidelity and pipeline.default_fidelity not in _VALID_FIDELITY_MODES:
+        errors.append(
+            ValidationError(
+                level=ValidationLevel.WARNING,
+                message=(
+                    f"Invalid default_fidelity '{pipeline.default_fidelity}'; "
+                    f"must be one of: {', '.join(sorted(_VALID_FIDELITY_MODES))}"
+                ),
+                rule="fidelity_valid",
+            )
+        )
+
+    # Check per-node fidelity
+    for node in pipeline.nodes.values():
+        if node.fidelity and node.fidelity not in _VALID_FIDELITY_MODES:
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.WARNING,
+                    message=(
+                        f"Invalid fidelity '{node.fidelity}'; "
+                        f"must be one of: {', '.join(sorted(_VALID_FIDELITY_MODES))}"
+                    ),
+                    node_name=node.name,
+                    rule="fidelity_valid",
+                )
+            )
+
+    # Check per-edge fidelity
+    for edge in pipeline.edges:
+        if edge.fidelity and edge.fidelity not in _VALID_FIDELITY_MODES:
+            errors.append(
+                ValidationError(
+                    level=ValidationLevel.WARNING,
+                    message=(
+                        f"Invalid fidelity '{edge.fidelity}'; "
+                        f"must be one of: {', '.join(sorted(_VALID_FIDELITY_MODES))}"
+                    ),
+                    edge=edge,
+                    rule="fidelity_valid",
                 )
             )

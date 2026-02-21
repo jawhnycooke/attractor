@@ -11,12 +11,15 @@ concurrent sessions do not share or leak subagent handles.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from attractor.agent.tools.registry import ToolResult
 from attractor.llm.models import ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -26,14 +29,18 @@ class SubagentHandle:
     Attributes:
         agent_id: Unique identifier for the subagent.
         task: The asyncio task executing the subagent, if any.
+        session: The child Session instance, if created.
         result: Completed result text, or None if still running.
         closed: Whether the subagent has been closed.
+        events: Collected events from the subagent run.
     """
 
     agent_id: str
     task: asyncio.Task[str] | None = None
+    session: Any = None
     result: str | None = None
     closed: bool = False
+    events: list[Any] = field(default_factory=list)
 
 
 def _get_subagents(environment: Any) -> dict[str, SubagentHandle]:
@@ -47,11 +54,48 @@ def _get_subagents(environment: Any) -> dict[str, SubagentHandle]:
     return environment.subagents
 
 
+def _get_session_factory(environment: Any) -> Any | None:
+    """Return the session factory from the environment, if available.
+
+    The parent Session sets ``environment._session_factory`` to a callable
+    that creates child Sessions with inherited configuration.
+    """
+    return getattr(environment, "_session_factory", None)
+
+
+async def _run_subagent(handle: SubagentHandle, task_desc: str) -> str:
+    """Run a subagent session and collect the final text output."""
+    session = handle.session
+    if session is None:
+        return f"Subagent '{handle.agent_id}' has no session"
+
+    collected_text: list[str] = []
+    try:
+        async for event in session.submit(task_desc):
+            handle.events.append(event)
+            if hasattr(event, "type"):
+                type_val = event.type.value if hasattr(event.type, "value") else str(event.type)
+                if type_val == "assistant_text_end":
+                    text = event.data.get("text", "")
+                    if text:
+                        collected_text.append(text)
+    except Exception as exc:
+        return f"Subagent '{handle.agent_id}' failed: {exc}"
+
+    result = "\n".join(collected_text) if collected_text else "Subagent completed with no text output"
+    handle.result = result
+    return result
+
+
 async def spawn_agent(
     arguments: dict[str, Any],
     environment: Any,
 ) -> ToolResult:
     """Spawn a new subagent to work on a task.
+
+    Creates a child Session that shares the parent's execution environment
+    and runs the task asynchronously. The subagent maintains its own
+    conversation history.
 
     Args:
         arguments: Must contain a ``task`` key describing the work.
@@ -71,8 +115,37 @@ async def spawn_agent(
     subagents = _get_subagents(environment)
     agent_id = f"subagent_{uuid.uuid4().hex[:8]}"
     handle = SubagentHandle(agent_id=agent_id)
-    subagents[agent_id] = handle
 
+    # Try to create a real child Session via the session factory
+    factory = _get_session_factory(environment)
+    if factory is not None:
+        try:
+            model = arguments.get("model")
+            max_turns = arguments.get("max_turns", 0)
+            child_session = factory(
+                model_override=model,
+                max_turns_override=max_turns,
+            )
+            handle.session = child_session
+
+            # Run the subagent in a background task
+            handle.task = asyncio.create_task(
+                _run_subagent(handle, task_desc)
+            )
+
+            subagents[agent_id] = handle
+            msg = (
+                f"Subagent '{agent_id}' spawned for task: {task_desc}\n"
+                f"Use wait(agent_id='{agent_id}') to get results."
+            )
+            return ToolResult(output=msg, full_output=msg)
+        except Exception as exc:
+            logger.warning(
+                "Failed to create child session for subagent: %s", exc
+            )
+
+    # Fallback: create a handle without a real session
+    subagents[agent_id] = handle
     msg = (
         f"Subagent '{agent_id}' created for task: {task_desc}\n"
         f"Use wait(agent_id='{agent_id}') to get results."
@@ -86,6 +159,9 @@ async def send_input(
 ) -> ToolResult:
     """Send a follow-up message to a running subagent.
 
+    If the subagent has a real Session, the message is queued via
+    ``session.follow_up()``.
+
     Args:
         arguments: Must contain ``agent_id`` and ``message`` keys.
         environment: Execution environment.
@@ -94,7 +170,7 @@ async def send_input(
         ToolResult confirming delivery or describing the error.
     """
     agent_id: str = arguments.get("agent_id", "")
-    _message: str = arguments.get("message", "")  # TODO: deliver to subagent
+    message: str = arguments.get("message", "")
 
     subagents = _get_subagents(environment)
     handle = subagents.get(agent_id)
@@ -111,7 +187,13 @@ async def send_input(
             full_output=f"Error: subagent '{agent_id}' is closed",
         )
 
-    msg = f"Message sent to subagent '{agent_id}'"
+    # Deliver to real session if available
+    if handle.session is not None and hasattr(handle.session, "follow_up"):
+        handle.session.follow_up(message)
+        msg = f"Message delivered to subagent '{agent_id}'"
+    else:
+        msg = f"Message queued for subagent '{agent_id}'"
+
     return ToolResult(output=msg, full_output=msg)
 
 
@@ -147,6 +229,9 @@ async def wait_agent(
             result = await handle.task
             handle.result = result
             return ToolResult(output=result, full_output=result)
+        except asyncio.CancelledError:
+            msg = f"Subagent '{agent_id}' was cancelled"
+            return ToolResult(output=msg, is_error=True, full_output=msg)
         except Exception as exc:
             msg = f"Subagent '{agent_id}' failed: {exc}"
             return ToolResult(output=msg, is_error=True, full_output=msg)
@@ -160,6 +245,8 @@ async def close_agent(
     environment: Any,
 ) -> ToolResult:
     """Close a subagent and free its resources.
+
+    If the subagent has a real Session, it is shut down gracefully.
 
     Args:
         arguments: Must contain an ``agent_id`` key.
@@ -180,8 +267,20 @@ async def close_agent(
         )
 
     handle.closed = True
+
+    # Shut down child session if present
+    if handle.session is not None and hasattr(handle.session, "shutdown"):
+        try:
+            await handle.session.shutdown()
+        except Exception as exc:
+            logger.warning("Error shutting down subagent session: %s", exc)
+
     if handle.task and not handle.task.done():
         handle.task.cancel()
+        try:
+            await handle.task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     del subagents[agent_id]
     msg = f"Subagent '{agent_id}' closed"

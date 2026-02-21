@@ -52,17 +52,41 @@ from attractor.llm.models import Message, ReasoningEffort
 
 @dataclass
 class SessionConfig:
-    """Configuration for an agent session."""
+    """Configuration for an agent session.
+
+    Attributes:
+        max_turns: Maximum total LLM round-trips across the entire
+            session. 0 = unlimited.
+        max_tool_rounds_per_input: Maximum tool execution rounds within
+            a single submit(). 0 = unlimited.
+        default_command_timeout_ms: Default timeout for shell commands.
+        max_command_timeout_ms: Upper bound for shell command timeouts.
+            Even if the model requests a longer timeout, this ceiling
+            is enforced.
+        reasoning_effort: Optional reasoning effort level for the LLM.
+        enable_loop_detection: Whether to detect repeating tool patterns.
+        loop_detection_window: Number of recent tool calls to consider
+            when checking for repeating patterns.
+        max_subagent_depth: Max nesting level for subagents.
+        model_id: Model identifier string.
+        user_instructions: Extra user instructions for the system prompt.
+        truncation_config: Optional truncation settings for tool output.
+        context_window_warning_threshold: Fraction (0.0-1.0) of context
+            window usage that triggers a warning event.
+    """
 
     max_turns: int = 0  # 0 = unlimited
     max_tool_rounds_per_input: int = 0
     default_command_timeout_ms: int = 10_000
+    max_command_timeout_ms: int = 600_000
     reasoning_effort: ReasoningEffort | None = None
     enable_loop_detection: bool = True
+    loop_detection_window: int = 10
     max_subagent_depth: int = 1
     model_id: str = ""
     user_instructions: str = ""
     truncation_config: TruncationConfig | None = None
+    context_window_warning_threshold: float = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +96,8 @@ class SessionConfig:
 
 class SessionState(str, enum.Enum):
     IDLE = "idle"
-    RUNNING = "running"
+    PROCESSING = "processing"
+    AWAITING_INPUT = "awaiting_input"
     CLOSED = "closed"
 
 
@@ -92,6 +117,8 @@ class Session:
         environment: ExecutionEnvironment,
         config: SessionConfig,
         llm_client: LLMClientProtocol,
+        *,
+        _depth: int = 0,
     ) -> None:
         self._profile = profile
         self._env = environment
@@ -104,6 +131,39 @@ class Session:
         self._registry = self._build_registry()
         self._loop_detector = LoopDetector()
         self._current_loop: AgentLoop | None = None
+        self._depth = _depth
+
+        # Install session factory on the environment for subagent spawning
+        if _depth < config.max_subagent_depth:
+            self._env._session_factory = self._create_child_session  # type: ignore[attr-defined]
+
+    def _create_child_session(
+        self,
+        model_override: str | None = None,
+        max_turns_override: int = 0,
+    ) -> "Session":
+        """Create a child Session for subagent use."""
+        child_config = SessionConfig(
+            max_turns=max_turns_override or self._config.max_turns,
+            max_tool_rounds_per_input=self._config.max_tool_rounds_per_input,
+            default_command_timeout_ms=self._config.default_command_timeout_ms,
+            max_command_timeout_ms=self._config.max_command_timeout_ms,
+            reasoning_effort=self._config.reasoning_effort,
+            enable_loop_detection=self._config.enable_loop_detection,
+            loop_detection_window=self._config.loop_detection_window,
+            max_subagent_depth=self._config.max_subagent_depth,
+            model_id=model_override or self._config.model_id,
+            user_instructions=self._config.user_instructions,
+            truncation_config=self._config.truncation_config,
+            context_window_warning_threshold=self._config.context_window_warning_threshold,
+        )
+        return Session(
+            profile=self._profile,
+            environment=self._env,
+            config=child_config,
+            llm_client=self._llm,
+            _depth=self._depth + 1,
+        )
 
     @property
     def state(self) -> SessionState:
@@ -150,8 +210,10 @@ class Session:
         """
         if self._state == SessionState.CLOSED:
             raise RuntimeError("Session is closed")
+        if self._state == SessionState.PROCESSING:
+            raise RuntimeError("Session is already processing")
 
-        self._state = SessionState.RUNNING
+        self._state = SessionState.PROCESSING
         emitter = EventEmitter()
 
         emitter.emit(
@@ -165,11 +227,15 @@ class Session:
             max_turns=self._config.max_turns or None,
             max_tool_rounds=self._config.max_tool_rounds_per_input or None,
             enable_loop_detection=self._config.enable_loop_detection,
+            loop_detection_window=self._config.loop_detection_window,
             reasoning_effort=self._reasoning_effort,
             default_command_timeout_ms=self._config.default_command_timeout_ms,
+            max_command_timeout_ms=self._config.max_command_timeout_ms,
             truncation_config=self._config.truncation_config,
             model_id=self._config.model_id,
             user_instructions=self._config.user_instructions,
+            context_window_size=self._profile.context_window_size,
+            context_window_warning_threshold=self._config.context_window_warning_threshold,
         )
 
         loop = AgentLoop(

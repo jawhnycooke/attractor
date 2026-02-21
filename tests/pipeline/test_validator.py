@@ -1,9 +1,14 @@
 """Tests for the pipeline validator."""
 
+import pytest
+
 from attractor.pipeline.models import Pipeline, PipelineEdge, PipelineNode
 from attractor.pipeline.validator import (
+    ValidationError,
+    ValidationException,
     ValidationLevel,
     has_errors,
+    validate_or_raise,
     validate_pipeline,
 )
 
@@ -59,7 +64,8 @@ class TestValidatePipeline:
             for f in findings
         )
 
-    def test_unknown_handler_type(self) -> None:
+    def test_unknown_handler_type_is_warning(self) -> None:
+        """V4: Unknown handler type should be WARNING, not ERROR."""
         nodes = {
             "start": PipelineNode(
                 name="start", handler_type="unknown_type", is_start=True
@@ -70,7 +76,9 @@ class TestValidatePipeline:
         }
         pipeline = _make_pipeline(nodes=nodes)
         findings = validate_pipeline(pipeline)
-        assert any("unknown_type" in f.message for f in findings)
+        type_findings = [f for f in findings if "unknown_type" in f.message]
+        assert len(type_findings) >= 1
+        assert all(f.level == ValidationLevel.WARNING for f in type_findings)
 
     def test_edge_references_nonexistent_source(self) -> None:
         edges = [PipelineEdge(source="ghost", target="end")]
@@ -90,7 +98,8 @@ class TestValidatePipeline:
         findings = validate_pipeline(pipeline)
         assert any("condition" in f.message.lower() for f in findings)
 
-    def test_unreachable_node_warning(self) -> None:
+    def test_unreachable_node_is_error(self) -> None:
+        """V3: Unreachable nodes should be ERROR, not WARNING."""
         nodes = {
             "start": PipelineNode(name="start", handler_type="codergen", is_start=True),
             "end": PipelineNode(
@@ -101,12 +110,13 @@ class TestValidatePipeline:
         edges = [PipelineEdge(source="start", target="end")]
         pipeline = _make_pipeline(nodes=nodes, edges=edges)
         findings = validate_pipeline(pipeline)
-        warnings = [
+        reachability_errors = [
             f
             for f in findings
-            if f.level == ValidationLevel.WARNING and f.node_name == "orphan"
+            if f.node_name == "orphan" and f.rule == "reachability"
         ]
-        assert len(warnings) >= 1
+        assert len(reachability_errors) >= 1
+        assert all(f.level == ValidationLevel.ERROR for f in reachability_errors)
 
     def test_missing_required_tool_attribute(self) -> None:
         nodes = {
@@ -122,10 +132,209 @@ class TestValidatePipeline:
         assert any("tool_command" in f.message for f in findings)
 
     def test_has_errors_helper(self) -> None:
-        from attractor.pipeline.validator import ValidationError
-
         assert has_errors([ValidationError(level=ValidationLevel.ERROR, message="bad")])
         assert not has_errors(
             [ValidationError(level=ValidationLevel.WARNING, message="meh")]
         )
         assert not has_errors([])
+
+
+class TestMultipleStartNodes:
+    """V5: Exactly one start node required."""
+
+    def test_multiple_start_nodes_error(self) -> None:
+        nodes = {
+            "s1": PipelineNode(name="s1", handler_type="start", is_start=True),
+            "s2": PipelineNode(name="s2", handler_type="start", is_start=True),
+            "end": PipelineNode(
+                name="end", handler_type="exit", is_terminal=True
+            ),
+        }
+        edges = [
+            PipelineEdge(source="s1", target="end"),
+            PipelineEdge(source="s2", target="end"),
+        ]
+        pipeline = _make_pipeline(
+            nodes=nodes, edges=edges, start_node="s1"
+        )
+        findings = validate_pipeline(pipeline)
+        assert any(
+            f.level == ValidationLevel.ERROR
+            and f.rule == "start_node"
+            and "multiple" in f.message.lower()
+            for f in findings
+        )
+
+
+class TestMultipleTerminalNodes:
+    """V6: Exactly one terminal node required."""
+
+    def test_multiple_terminal_nodes_error(self) -> None:
+        nodes = {
+            "start": PipelineNode(
+                name="start", handler_type="codergen", is_start=True
+            ),
+            "end1": PipelineNode(
+                name="end1", handler_type="exit", is_terminal=True
+            ),
+            "end2": PipelineNode(
+                name="end2", handler_type="exit", is_terminal=True
+            ),
+        }
+        edges = [
+            PipelineEdge(source="start", target="end1"),
+            PipelineEdge(source="start", target="end2"),
+        ]
+        pipeline = _make_pipeline(
+            nodes=nodes, edges=edges, start_node="start"
+        )
+        findings = validate_pipeline(pipeline)
+        assert any(
+            f.level == ValidationLevel.ERROR
+            and f.rule == "terminal_node"
+            and "multiple" in f.message.lower()
+            for f in findings
+        )
+
+
+class TestStylesheetSyntax:
+    """V1: stylesheet_syntax validation rule."""
+
+    def test_valid_stylesheet_no_error(self) -> None:
+        pipeline = _make_pipeline(
+            model_stylesheet='* { llm_model: gpt-4o; }'
+        )
+        findings = validate_pipeline(pipeline)
+        assert not any(f.rule == "stylesheet_syntax" for f in findings)
+
+    def test_no_stylesheet_no_error(self) -> None:
+        pipeline = _make_pipeline()
+        findings = validate_pipeline(pipeline)
+        assert not any(f.rule == "stylesheet_syntax" for f in findings)
+
+    def test_empty_stylesheet_error(self) -> None:
+        pipeline = _make_pipeline(model_stylesheet="not a valid stylesheet")
+        findings = validate_pipeline(pipeline)
+        stylesheet_findings = [f for f in findings if f.rule == "stylesheet_syntax"]
+        assert len(stylesheet_findings) >= 1
+        assert all(f.level == ValidationLevel.ERROR for f in stylesheet_findings)
+
+
+class TestFidelityValid:
+    """V2: fidelity_valid validation rule."""
+
+    def test_valid_fidelity_no_warning(self) -> None:
+        nodes = {
+            "start": PipelineNode(
+                name="start", handler_type="codergen", is_start=True,
+                fidelity="full",
+            ),
+            "end": PipelineNode(
+                name="end", handler_type="conditional", is_terminal=True,
+                fidelity="compact",
+            ),
+        }
+        pipeline = _make_pipeline(nodes=nodes)
+        findings = validate_pipeline(pipeline)
+        assert not any(f.rule == "fidelity_valid" for f in findings)
+
+    def test_invalid_node_fidelity_warning(self) -> None:
+        nodes = {
+            "start": PipelineNode(
+                name="start", handler_type="codergen", is_start=True,
+                fidelity="invalid_mode",
+            ),
+            "end": PipelineNode(
+                name="end", handler_type="conditional", is_terminal=True,
+            ),
+        }
+        pipeline = _make_pipeline(nodes=nodes)
+        findings = validate_pipeline(pipeline)
+        fidelity_findings = [f for f in findings if f.rule == "fidelity_valid"]
+        assert len(fidelity_findings) >= 1
+        assert all(f.level == ValidationLevel.WARNING for f in fidelity_findings)
+
+    def test_invalid_default_fidelity_warning(self) -> None:
+        pipeline = _make_pipeline(default_fidelity="bad_mode")
+        findings = validate_pipeline(pipeline)
+        fidelity_findings = [f for f in findings if f.rule == "fidelity_valid"]
+        assert len(fidelity_findings) >= 1
+        assert all(f.level == ValidationLevel.WARNING for f in fidelity_findings)
+
+    def test_invalid_edge_fidelity_warning(self) -> None:
+        edges = [PipelineEdge(source="start", target="end", fidelity="wrong")]
+        pipeline = _make_pipeline(edges=edges)
+        findings = validate_pipeline(pipeline)
+        fidelity_findings = [f for f in findings if f.rule == "fidelity_valid"]
+        assert len(fidelity_findings) >= 1
+        assert all(f.level == ValidationLevel.WARNING for f in fidelity_findings)
+
+    def test_valid_summary_fidelity_modes(self) -> None:
+        """All summary:* modes should be accepted."""
+        for mode in ("summary:low", "summary:medium", "summary:high"):
+            nodes = {
+                "start": PipelineNode(
+                    name="start", handler_type="codergen", is_start=True,
+                    fidelity=mode,
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="conditional", is_terminal=True,
+                ),
+            }
+            pipeline = _make_pipeline(nodes=nodes)
+            findings = validate_pipeline(pipeline)
+            assert not any(f.rule == "fidelity_valid" for f in findings), (
+                f"Valid fidelity mode '{mode}' should not produce a warning"
+            )
+
+
+class TestValidateOrRaise:
+    """V7: validate_or_raise convenience function."""
+
+    def test_valid_pipeline_returns_findings(self) -> None:
+        pipeline = _make_pipeline()
+        findings = validate_or_raise(pipeline)
+        assert isinstance(findings, list)
+        # No errors, so no exception raised
+        assert not has_errors(findings)
+
+    def test_error_pipeline_raises(self) -> None:
+        pipeline = _make_pipeline(start_node="")
+        with pytest.raises(ValidationException) as exc_info:
+            validate_or_raise(pipeline)
+        assert len(exc_info.value.errors) >= 1
+        assert all(
+            e.level == ValidationLevel.ERROR for e in exc_info.value.errors
+        )
+
+    def test_warning_only_does_not_raise(self) -> None:
+        """Warnings should not cause an exception."""
+        nodes = {
+            "start": PipelineNode(
+                name="start", handler_type="unknown_type", is_start=True
+            ),
+            "end": PipelineNode(
+                name="end", handler_type="conditional", is_terminal=True
+            ),
+        }
+        pipeline = _make_pipeline(nodes=nodes)
+        findings = validate_or_raise(pipeline)
+        # type_known is WARNING, so no exception
+        assert any(f.rule == "type_known" for f in findings)
+
+
+class TestLintRuleName:
+    """V8: LintRule protocol has name attribute."""
+
+    def test_lint_rule_protocol_has_name(self) -> None:
+        from attractor.pipeline.validator import LintRule
+
+        class MyRule:
+            name: str = "my_rule"
+
+            def check(self, pipeline: Pipeline) -> list:
+                return []
+
+        rule = MyRule()
+        assert isinstance(rule, LintRule)
+        assert rule.name == "my_rule"

@@ -67,3 +67,27 @@ class TestLoopDetector:
             detector.record_call(f"tool_{i}", f"hash_{i}")
         # The loop was 15+ calls ago, outside default window of 10
         assert detector.check_for_loops() is None
+
+    def test_window_boundary_just_inside(self) -> None:
+        """A loop pattern at exactly the window edge should still be detected."""
+        detector = LoopDetector()
+        # Add some non-looping calls first to push the loop to the window edge
+        for i in range(7):
+            detector.record_call(f"setup_{i}", f"s_{i}")
+        # Now add a 1-call loop (3 repetitions = 3 calls)
+        # With window=10, these 3 calls are within the last 10
+        for _ in range(3):
+            detector.record_call("read_file", "same")
+        assert detector.check_for_loops(window_size=10) is not None
+
+    def test_window_boundary_just_outside(self) -> None:
+        """A loop pushed just outside the window should not be detected."""
+        detector = LoopDetector()
+        # Add a 1-call loop
+        for _ in range(3):
+            detector.record_call("read_file", "same")
+        # Now add exactly enough unique calls to push the loop out of window
+        for i in range(10):
+            detector.record_call(f"unique_{i}", f"u_{i}")
+        # Window of 10 only sees the 10 unique calls, not the loop
+        assert detector.check_for_loops(window_size=10) is None

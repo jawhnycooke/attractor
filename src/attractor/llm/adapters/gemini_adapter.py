@@ -29,11 +29,11 @@ from attractor.llm.models import (
 
 logger = logging.getLogger(__name__)
 
-_FINISH_MAP = {
-    "STOP": FinishReason.STOP,
-    "MAX_TOKENS": FinishReason.LENGTH,
-    "SAFETY": FinishReason.CONTENT_FILTER,
-    "RECITATION": FinishReason.CONTENT_FILTER,
+_FINISH_MAP: dict[str, FinishReason] = {
+    "STOP": FinishReason("stop", raw="STOP"),
+    "MAX_TOKENS": FinishReason("length", raw="MAX_TOKENS"),
+    "SAFETY": FinishReason("content_filter", raw="SAFETY"),
+    "RECITATION": FinishReason("content_filter", raw="RECITATION"),
 }
 
 
@@ -223,9 +223,9 @@ class GeminiAdapter:
                 output_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
             )
 
-        finish = _FINISH_MAP.get(finish_str, FinishReason.STOP)
+        finish = _FINISH_MAP.get(finish_str, FinishReason("stop", raw=finish_str))
         if content_parts and any(isinstance(p, ToolCallContent) for p in content_parts):
-            finish = FinishReason.TOOL_USE
+            finish = FinishReason("tool_calls", raw=finish_str)
 
         return Response(
             message=Message(role=Role.ASSISTANT, content=content_parts),
@@ -312,7 +312,7 @@ class GeminiAdapter:
                     )
                 yield StreamEvent(
                     type=StreamEventType.FINISH,
-                    finish_reason=_FINISH_MAP.get(fr_str, FinishReason.STOP),
+                    finish_reason=_FINISH_MAP.get(fr_str, FinishReason("stop", raw=fr_str)),
                     usage=usage,
                     metadata={"latency_ms": (time.monotonic() - t0) * 1000},
                 )
