@@ -48,6 +48,9 @@ target-version = "py311"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore::pyparsing.exceptions.PyparsingDeprecationWarning",
+]
 
 [tool.mypy]
 python_version = "3.11"
