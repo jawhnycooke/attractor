@@ -2814,3 +2814,292 @@ class TestPipelineFailedEvent:
             e for e in events if e.type == PipelineEventType.PIPELINE_FAILED
         ]
         assert len(failed_events) == 0
+
+
+# ---------------------------------------------------------------------------
+# P-F01: manifest.json written at pipeline start (spec §5.6)
+# ---------------------------------------------------------------------------
+
+
+class TestManifestJson:
+    @pytest.mark.asyncio
+    async def test_manifest_written_at_pipeline_start(self, tmp_path) -> None:
+        """P-F01: Engine writes manifest.json to logs_root at pipeline start."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("start", handler)
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="test_pipe",
+            goal="Build something",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="start", is_start=True),
+                "work": PipelineNode(name="work", handler_type="echo", is_terminal=True),
+            },
+            edges=[PipelineEdge(source="start", target="work")],
+            start_node="start",
+            metadata={"version": "1.0"},
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        await engine.run(pipeline)
+
+        manifest_path = tmp_path / "manifest.json"
+        assert manifest_path.exists()
+        data = json.loads(manifest_path.read_text())
+        assert data["name"] == "test_pipe"
+        assert data["goal"] == "Build something"
+        assert "start_time" in data
+        assert "nodes" in data
+        assert set(data["nodes"]) == {"start", "work"}
+        assert data["graph_attributes"]["version"] == "1.0"
+
+    @pytest.mark.asyncio
+    async def test_manifest_not_written_without_logs_root(self) -> None:
+        """P-F01: No manifest.json when logs_root is None."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("start", handler)
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"start": PipelineNode(name="start", handler_type="start", is_start=True, is_terminal=True)},
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        await engine.run(pipeline)
+        # No crash — logs_root is None, so manifest is not written
+
+    @pytest.mark.asyncio
+    async def test_manifest_contains_iso_timestamp(self, tmp_path) -> None:
+        """P-F01: manifest.json start_time is ISO 8601 formatted."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("start", handler)
+
+        pipeline = Pipeline(
+            name="ts_test",
+            nodes={"start": PipelineNode(name="start", handler_type="start", is_start=True, is_terminal=True)},
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        await engine.run(pipeline)
+
+        data = json.loads((tmp_path / "manifest.json").read_text())
+        # ISO 8601 format contains 'T' separator
+        assert "T" in data["start_time"]
+
+
+# ---------------------------------------------------------------------------
+# P-P01/P-P03: Engine centralizes status.json with spec-compliant fields
+# ---------------------------------------------------------------------------
+
+
+class TestEngineStatusJson:
+    @pytest.mark.asyncio
+    async def test_engine_writes_status_json_for_node(self, tmp_path) -> None:
+        """P-P03: Engine writes status.json after handler execution."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("start", handler)
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="status_test",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="start", is_start=True),
+                "work": PipelineNode(name="work", handler_type="echo", is_terminal=True),
+            },
+            edges=[PipelineEdge(source="start", target="work")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        await engine.run(pipeline)
+
+        # Both nodes should have status.json
+        for node_name in ["start", "work"]:
+            status_path = tmp_path / node_name / "status.json"
+            assert status_path.exists(), f"Missing status.json for {node_name}"
+
+    @pytest.mark.asyncio
+    async def test_status_json_has_spec_fields(self, tmp_path) -> None:
+        """P-P01: status.json includes all spec Appendix C fields."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("start", handler)
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fields_test",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="start", is_start=True),
+                "work": PipelineNode(name="work", handler_type="echo", is_terminal=True),
+            },
+            edges=[PipelineEdge(source="start", target="work")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        await engine.run(pipeline)
+
+        status_path = tmp_path / "start" / "status.json"
+        data = json.loads(status_path.read_text())
+
+        # Spec Appendix C required/optional fields
+        assert "outcome" in data
+        assert data["outcome"] == "success"
+        assert "preferred_next_label" in data
+        assert "suggested_next_ids" in data
+        assert isinstance(data["suggested_next_ids"], list)
+        assert "context_updates" in data
+        assert isinstance(data["context_updates"], dict)
+        assert "notes" in data
+
+    @pytest.mark.asyncio
+    async def test_status_json_captures_failure(self, tmp_path) -> None:
+        """P-P01: status.json outcome reflects handler failure."""
+        registry = HandlerRegistry()
+        registry.register("start", EchoHandler())
+        registry.register("fail", FailHandler())
+
+        pipeline = Pipeline(
+            name="fail_test",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="start", is_start=True),
+                "fail_node": PipelineNode(name="fail_node", handler_type="fail"),
+                "error": PipelineNode(name="error", handler_type="start", is_terminal=True),
+            },
+            edges=[
+                PipelineEdge(source="start", target="fail_node"),
+                PipelineEdge(source="fail_node", target="error", condition="outcome = fail"),
+            ],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        await engine.run(pipeline)
+
+        status_path = tmp_path / "fail_node" / "status.json"
+        data = json.loads(status_path.read_text())
+        assert data["outcome"] == "fail"
+
+    @pytest.mark.asyncio
+    async def test_status_json_not_written_without_logs_root(self) -> None:
+        """P-P03: No status.json when logs_root is None."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("start", handler)
+
+        pipeline = Pipeline(
+            name="no_logs",
+            nodes={"start": PipelineNode(name="start", handler_type="start", is_start=True, is_terminal=True)},
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        await engine.run(pipeline)
+        # No crash — no logs_root means no status.json
+
+    @pytest.mark.asyncio
+    async def test_auto_status_note_synthesis(self, tmp_path) -> None:
+        """P-P01: auto_status=true synthesizes note when handler provides none."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("start", handler)
+
+        pipeline = Pipeline(
+            name="auto_status_test",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="start",
+                    is_start=True,
+                    is_terminal=True,
+                    auto_status=True,
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        await engine.run(pipeline)
+
+        status_path = tmp_path / "start" / "status.json"
+        data = json.loads(status_path.read_text())
+        assert "auto-status" in data["notes"]
+
+    @pytest.mark.asyncio
+    async def test_status_json_preserves_handler_notes(self, tmp_path) -> None:
+        """P-P01: Handler-provided notes are preserved in status.json."""
+
+        class NotesHandler:
+            async def execute(self, node, context, graph=None, logs_root=None):
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    notes="Handler did important work",
+                )
+
+        registry = HandlerRegistry()
+        registry.register("notes", NotesHandler())
+
+        pipeline = Pipeline(
+            name="notes_test",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="notes",
+                    is_start=True,
+                    is_terminal=True,
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        await engine.run(pipeline)
+
+        data = json.loads((tmp_path / "start" / "status.json").read_text())
+        assert data["notes"] == "Handler did important work"
+
+    @pytest.mark.asyncio
+    async def test_status_json_captures_suggested_next_ids(self, tmp_path) -> None:
+        """P-P01: suggested_next_ids from handler result are in status.json."""
+
+        class SuggestHandler:
+            async def execute(self, node, context, graph=None, logs_root=None):
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    suggested_next_ids=["node_a", "node_b"],
+                )
+
+        registry = HandlerRegistry()
+        registry.register("suggest", SuggestHandler())
+
+        pipeline = Pipeline(
+            name="suggest_test",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="suggest",
+                    is_start=True,
+                    is_terminal=True,
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        await engine.run(pipeline)
+
+        data = json.loads((tmp_path / "start" / "status.json").read_text())
+        assert data["suggested_next_ids"] == ["node_a", "node_b"]

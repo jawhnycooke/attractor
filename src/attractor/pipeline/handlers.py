@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from attractor.pipeline.conditions import evaluate_condition
+from attractor.pipeline.events import PipelineEvent, PipelineEventEmitter, PipelineEventType
 from attractor.pipeline.interviewer import (
     Answer,
     AnswerValue,
@@ -403,10 +404,6 @@ class CodergenHandler:
             result_text = f"[Simulated] Response for stage: {node.name}"
             if stage_dir is not None:
                 (stage_dir / "response.md").write_text(result_text)
-                (stage_dir / "status.json").write_text(
-                    json.dumps({"status": "success", "node": node.name,
-                                "notes": "simulation mode"})
-                )
             return NodeResult(
                 status=OutcomeStatus.SUCCESS,
                 output=result_text,
@@ -417,12 +414,9 @@ class CodergenHandler:
         try:
             result_text = await backend.run(node, prompt, context)
 
-            # H2: Write response.md and status.json
+            # H2: Write response.md
             if stage_dir is not None:
                 (stage_dir / "response.md").write_text(result_text)
-                (stage_dir / "status.json").write_text(
-                    json.dumps({"status": "success", "node": node.name})
-                )
 
             # H5: Set last_response context key (not last_codergen_output)
             return NodeResult(
@@ -432,11 +426,6 @@ class CodergenHandler:
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
-            if stage_dir is not None:
-                (stage_dir / "status.json").write_text(
-                    json.dumps({"status": "fail", "node": node.name,
-                                "reason": str(exc)})
-                )
             return NodeResult(status=OutcomeStatus.FAIL, failure_reason=str(exc))
 
 
@@ -474,9 +463,16 @@ class WaitHumanHandler:
         self,
         interviewer: Any = None,
         pipeline: Pipeline | None = None,
+        event_emitter: PipelineEventEmitter | None = None,
     ) -> None:
         self._interviewer = interviewer
         self._pipeline = pipeline
+        self._event_emitter = event_emitter
+
+    async def _emit(self, event: PipelineEvent) -> None:
+        """Emit a pipeline event if an emitter is configured."""
+        if self._event_emitter is not None:
+            await self._event_emitter.emit(event)
 
     async def execute(
         self,
@@ -545,6 +541,11 @@ class WaitHumanHandler:
                 await interviewer.inform(f"Node '{node.name}': {prompt}")
 
                 # P-C10: Call interviewer.ask(question) per spec §6.1
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.INTERVIEW_STARTED,
+                    node_name=node.name,
+                    data={"prompt": prompt},
+                ))
                 try:
                     ask_coro = interviewer.ask(question)
                     if timeout is not None:
@@ -554,6 +555,11 @@ class WaitHumanHandler:
                     else:
                         raw_answer = await ask_coro
                 except asyncio.TimeoutError:
+                    await self._emit(PipelineEvent(
+                        type=PipelineEventType.INTERVIEW_TIMEOUT,
+                        node_name=node.name,
+                        data={"prompt": prompt, "timeout": timeout},
+                    ))
                     return self._handle_timeout(node, edges)
 
                 # Normalize to Answer for backward compat with mocked interviewers
@@ -561,6 +567,12 @@ class WaitHumanHandler:
                     answer = raw_answer
                 else:
                     answer = Answer(value=str(raw_answer))
+
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.INTERVIEW_COMPLETED,
+                    node_name=node.name,
+                    data={"prompt": prompt, "answer": str(answer.value)},
+                ))
 
                 # H8: Handle SKIPPED
                 if answer.value in (AnswerValue.SKIPPED, "SKIPPED"):
@@ -605,6 +617,11 @@ class WaitHumanHandler:
 
         # Fallback: simple confirm
         # H8: Wrap with timeout if configured
+        await self._emit(PipelineEvent(
+            type=PipelineEventType.INTERVIEW_STARTED,
+            node_name=node.name,
+            data={"prompt": prompt},
+        ))
         try:
             confirm_coro = interviewer.confirm(prompt)
             if timeout is not None:
@@ -612,6 +629,11 @@ class WaitHumanHandler:
             else:
                 approved = await confirm_coro
         except asyncio.TimeoutError:
+            await self._emit(PipelineEvent(
+                type=PipelineEventType.INTERVIEW_TIMEOUT,
+                node_name=node.name,
+                data={"prompt": prompt, "timeout": timeout},
+            ))
             default_choice = node.attributes.get("human.default_choice")
             if default_choice:
                 return NodeResult(
@@ -625,6 +647,12 @@ class WaitHumanHandler:
                 status=OutcomeStatus.RETRY,
                 failure_reason="human gate timeout, no default",
             )
+
+        await self._emit(PipelineEvent(
+            type=PipelineEventType.INTERVIEW_COMPLETED,
+            node_name=node.name,
+            data={"prompt": prompt, "answer": str(approved)},
+        ))
 
         # H8: Handle SKIPPED
         if approved == "SKIPPED":
@@ -741,9 +769,16 @@ class ParallelHandler:
         self,
         registry: HandlerRegistry | None = None,
         pipeline: Pipeline | None = None,
+        event_emitter: PipelineEventEmitter | None = None,
     ) -> None:
         self._registry = registry
         self._pipeline = pipeline
+        self._event_emitter = event_emitter
+
+    async def _emit(self, event: PipelineEvent) -> None:
+        """Emit a pipeline event if an emitter is configured."""
+        if self._event_emitter is not None:
+            await self._event_emitter.emit(event)
 
     async def execute(
         self,
@@ -792,25 +827,53 @@ class ParallelHandler:
         error_policy = node.attributes.get("error_policy", "continue")
         k_value = int(node.attributes.get("k", 1))
 
+        await self._emit(PipelineEvent(
+            type=PipelineEventType.PARALLEL_STARTED,
+            node_name=node.name,
+            data={"branches": branches},
+        ))
+
         async def _run_branch(branch_name: str) -> tuple[str, NodeResult]:
+            await self._emit(PipelineEvent(
+                type=PipelineEventType.PARALLEL_BRANCH_STARTED,
+                node_name=node.name,
+                data={"branch": branch_name},
+            ))
             branch_node = active_graph.nodes.get(branch_name)
             if not branch_node:
-                return branch_name, NodeResult(
+                result = NodeResult(
                     status=OutcomeStatus.FAIL,
                     failure_reason=f"Branch node '{branch_name}' not found",
                 )
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.PARALLEL_BRANCH_COMPLETED,
+                    node_name=node.name,
+                    data={"branch": branch_name, "status": result.status.value},
+                ))
+                return branch_name, result
             handler = registry.get(branch_node.handler_type)
             if not handler:
-                return branch_name, NodeResult(
+                result = NodeResult(
                     status=OutcomeStatus.FAIL,
                     failure_reason=f"No handler for '{branch_node.handler_type}'",
                 )
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.PARALLEL_BRANCH_COMPLETED,
+                    node_name=node.name,
+                    data={"branch": branch_name, "status": result.status.value},
+                ))
+                return branch_name, result
             scope = context.create_scope(branch_name)
             result = await handler.execute(branch_node, scope, active_graph, logs_root)
             context.merge_scope(scope, branch_name)
             if result.context_updates:
                 for ctx_key, v in result.context_updates.items():
                     context.set(f"{branch_name}.{ctx_key}", v)
+            await self._emit(PipelineEvent(
+                type=PipelineEventType.PARALLEL_BRANCH_COMPLETED,
+                node_name=node.name,
+                data={"branch": branch_name, "status": result.status.value},
+            ))
             return branch_name, result
 
         # Execute based on error_policy
@@ -865,6 +928,17 @@ class ParallelHandler:
                 status = OutcomeStatus.SUCCESS
             else:
                 status = OutcomeStatus.PARTIAL_SUCCESS
+
+        await self._emit(PipelineEvent(
+            type=PipelineEventType.PARALLEL_COMPLETED,
+            node_name=node.name,
+            data={
+                "branches": branches,
+                "success_count": success_count,
+                "fail_count": fail_count,
+                "status": status.value,
+            },
+        ))
 
         return NodeResult(
             status=status,
@@ -1111,7 +1185,7 @@ class ToolHandler:
                 timeout=float(node.attributes.get("timeout", 300)),
             )
             success = proc.returncode == 0
-            result = NodeResult(
+            return NodeResult(
                 status=OutcomeStatus.SUCCESS if success else OutcomeStatus.FAIL,
                 output=proc.stdout,
                 failure_reason=proc.stderr if not success else None,
@@ -1122,19 +1196,8 @@ class ToolHandler:
                     "stderr": proc.stderr,
                 },
             )
-            # #12: Write status file
-            if logs_root is not None:
-                _write_status_file(
-                    logs_root,
-                    node,
-                    "success" if success else "fail",
-                    proc.stderr if not success else None,
-                )
-            return result
         except subprocess.TimeoutExpired:
             reason = f"Command timed out: {command}"
-            if logs_root is not None:
-                _write_status_file(logs_root, node, "fail", reason)
             return NodeResult(
                 status=OutcomeStatus.FAIL,
                 failure_reason=reason,
@@ -1142,11 +1205,8 @@ class ToolHandler:
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
-            reason = str(exc)
-            if logs_root is not None:
-                _write_status_file(logs_root, node, "fail", reason)
             return NodeResult(
-                status=OutcomeStatus.FAIL, failure_reason=reason
+                status=OutcomeStatus.FAIL, failure_reason=str(exc)
             )
 
 
@@ -1273,8 +1333,6 @@ class ManagerLoopHandler:
                 if child_outcome == "success" or (
                     child_status == "completed" and child_outcome != "fail"
                 ):
-                    if logs_root is not None:
-                        _write_status_file(logs_root, node, "success")
                     return NodeResult(
                         status=OutcomeStatus.SUCCESS,
                         output=(
@@ -1285,8 +1343,6 @@ class ManagerLoopHandler:
                     )
                 if child_status == "failed":
                     reason = "Child pipeline failed"
-                    if logs_root is not None:
-                        _write_status_file(logs_root, node, "fail", reason)
                     return NodeResult(
                         status=OutcomeStatus.FAIL,
                         failure_reason=reason,
@@ -1297,8 +1353,6 @@ class ManagerLoopHandler:
             if stop_condition and evaluate_condition(
                 stop_condition, context
             ):
-                if logs_root is not None:
-                    _write_status_file(logs_root, node, "success")
                 return NodeResult(
                     status=OutcomeStatus.SUCCESS,
                     output=(
@@ -1313,8 +1367,6 @@ class ManagerLoopHandler:
                 await asyncio.sleep(poll_interval)
 
         reason = f"Max cycles exceeded ({max_cycles})"
-        if logs_root is not None:
-            _write_status_file(logs_root, node, "fail", reason)
         return NodeResult(
             status=OutcomeStatus.FAIL,
             failure_reason=reason,
@@ -1402,8 +1454,6 @@ class ManagerLoopHandler:
                     f"Sub-pipeline failed {consecutive_failures} "
                     f"consecutive times"
                 )
-                if logs_root is not None:
-                    _write_status_file(logs_root, node, "fail", reason)
                 return NodeResult(
                     status=OutcomeStatus.FAIL,
                     failure_reason=reason,
@@ -1411,16 +1461,12 @@ class ManagerLoopHandler:
                 )
 
             if done_condition and evaluate_condition(done_condition, context):
-                if logs_root is not None:
-                    _write_status_file(logs_root, node, "success")
                 return NodeResult(
                     status=OutcomeStatus.SUCCESS,
                     output=f"Manager loop done after {i + 1} iterations",
                     context_updates={"_supervisor_iterations": i + 1},
                 )
 
-        if logs_root is not None:
-            _write_status_file(logs_root, node, "success")
         return NodeResult(
             status=OutcomeStatus.SUCCESS,
             output=f"Manager loop reached max iterations ({max_iterations})",
@@ -1435,6 +1481,7 @@ SupervisorHandler = ManagerLoopHandler
 def create_default_registry(
     pipeline: Pipeline | None = None,
     interviewer: Any = None,
+    event_emitter: PipelineEventEmitter | None = None,
 ) -> HandlerRegistry:
     """Create a :class:`HandlerRegistry` pre-loaded with built-in handlers."""
     # H15: Use CodergenHandler as default handler fallback
@@ -1443,11 +1490,18 @@ def create_default_registry(
     registry.register("exit", ExitHandler())
     registry.register("codergen", CodergenHandler())
     registry.register(
-        "wait.human", WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+        "wait.human",
+        WaitHumanHandler(
+            interviewer=interviewer,
+            pipeline=pipeline,
+            event_emitter=event_emitter,
+        ),
     )
     registry.register("conditional", ConditionalHandler())
 
-    parallel = ParallelHandler(registry=registry, pipeline=pipeline)
+    parallel = ParallelHandler(
+        registry=registry, pipeline=pipeline, event_emitter=event_emitter
+    )
     registry.register("parallel", parallel)
     registry.register("parallel.fan_in", FanInHandler())
     registry.register("tool", ToolHandler())

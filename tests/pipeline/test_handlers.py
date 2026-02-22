@@ -6,6 +6,7 @@ import json
 import logging
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -29,6 +30,11 @@ from attractor.pipeline.handlers import (
     _parse_accelerator_key,
     _write_status_file,
     create_default_registry,
+)
+from attractor.pipeline.events import (
+    PipelineEvent,
+    PipelineEventEmitter,
+    PipelineEventType,
 )
 from attractor.pipeline.models import (
     NodeResult,
@@ -210,16 +216,14 @@ class TestCodergenHandler:
 
         assert result.status == OutcomeStatus.SUCCESS
 
-        # Check that prompt.md, response.md, and status.json were written
+        # Check that prompt.md and response.md were written
+        # (status.json is now centralized in the engine per P-P03)
         stage_dir = tmp_path / "test_node"
         assert stage_dir.exists()
         assert (stage_dir / "prompt.md").exists()
         assert (stage_dir / "prompt.md").read_text() == "do stuff"
         assert (stage_dir / "response.md").exists()
         assert "[Simulated]" in (stage_dir / "response.md").read_text()
-        assert (stage_dir / "status.json").exists()
-        status = json.loads((stage_dir / "status.json").read_text())
-        assert status["status"] == "success"
 
     @pytest.mark.asyncio
     async def test_codergen_sets_last_response_context_key(self) -> None:
@@ -399,38 +403,27 @@ class TestToolHandler:
         assert "No tool_command" in (result.failure_reason or "")
 
     @pytest.mark.asyncio
-    async def test_tool_handler_writes_status_file_on_success(self, tmp_path) -> None:
-        """#12: ToolHandler writes status.json on success."""
+    async def test_tool_handler_returns_success_result(self, tmp_path) -> None:
+        """#12: ToolHandler returns correct NodeResult on success (status.json centralized in engine)."""
         handler = ToolHandler()
         node = _make_node(handler_type="tool", tool_command="echo ok")
         ctx = PipelineContext()
 
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.success is True
-
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "success"
-        assert status["node"] == "test_node"
-        assert status["handler"] == "tool"
+        assert result.status == OutcomeStatus.SUCCESS
 
     @pytest.mark.asyncio
-    async def test_tool_handler_writes_status_file_on_failure(self, tmp_path) -> None:
-        """#12: ToolHandler writes status.json on failure."""
+    async def test_tool_handler_returns_failure_result(self, tmp_path) -> None:
+        """#12: ToolHandler returns correct NodeResult on failure (status.json centralized in engine)."""
         handler = ToolHandler()
         node = _make_node(handler_type="tool", tool_command="exit 1")
         ctx = PipelineContext()
 
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.success is False
-
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "fail"
-        assert status["node"] == "test_node"
-        assert status["handler"] == "tool"
+        assert result.status == OutcomeStatus.FAIL
+        assert result.failure_reason is not None
 
     @pytest.mark.asyncio
     async def test_tool_handler_no_status_file_without_logs_root(self) -> None:
@@ -1077,8 +1070,8 @@ class TestManagerLoopHandler:
         assert iteration == 4  # All 4 iterations ran (no early termination)
 
     @pytest.mark.asyncio
-    async def test_manager_loop_writes_status_file_on_success(self, tmp_path) -> None:
-        """#12: ManagerLoopHandler writes status.json on success."""
+    async def test_manager_loop_returns_success_result(self, tmp_path) -> None:
+        """#12: ManagerLoopHandler returns correct NodeResult on success (status.json centralized in engine)."""
         engine = AsyncMock()
         engine.run_sub_pipeline = AsyncMock()
 
@@ -1092,17 +1085,11 @@ class TestManagerLoopHandler:
 
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.success is True
-
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "success"
-        assert status["node"] == "test_node"
-        assert status["handler"] == "stack.manager_loop"
+        assert result.status == OutcomeStatus.SUCCESS
 
     @pytest.mark.asyncio
-    async def test_manager_loop_writes_status_file_on_failure(self, tmp_path) -> None:
-        """#12: ManagerLoopHandler writes status.json on consecutive failure."""
+    async def test_manager_loop_returns_failure_result(self, tmp_path) -> None:
+        """#12: ManagerLoopHandler returns correct NodeResult on consecutive failure (status.json centralized in engine)."""
         engine = AsyncMock()
 
         async def mock_run_sub(name, context):
@@ -1121,13 +1108,9 @@ class TestManagerLoopHandler:
 
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.success is False
-
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "fail"
-        assert "reason" in status
-        assert "consecutive" in status["reason"]
+        assert result.status == OutcomeStatus.FAIL
+        assert result.failure_reason is not None
+        assert "consecutive" in result.failure_reason
 
 
 # ---------------------------------------------------------------------------
@@ -1442,7 +1425,7 @@ class TestCodergenSimulationMode:
 
     @pytest.mark.asyncio
     async def test_simulation_mode_writes_logs(self, tmp_path) -> None:
-        """P-C02: Simulation mode writes prompt.md, response.md, status.json."""
+        """P-C02: Simulation mode writes prompt.md and response.md (status.json centralized in engine)."""
         handler = CodergenHandler(backend=None)
         node = _make_node(
             handler_type="codergen", prompt="build feature", model="gpt-4o"
@@ -1452,16 +1435,13 @@ class TestCodergenSimulationMode:
         result = await handler.execute(node, ctx, logs_root=tmp_path)
 
         assert result.success is True
+        assert result.notes == "simulation mode"
         stage_dir = tmp_path / "test_node"
         assert stage_dir.exists()
         assert (stage_dir / "prompt.md").read_text() == "build feature"
         assert (stage_dir / "response.md").read_text() == (
             "[Simulated] Response for stage: test_node"
         )
-        status = json.loads((stage_dir / "status.json").read_text())
-        assert status["status"] == "success"
-        assert status["node"] == "test_node"
-        assert status["notes"] == "simulation mode"
 
     @pytest.mark.asyncio
     async def test_simulation_mode_no_logs_without_logs_root(self) -> None:
@@ -2867,14 +2847,10 @@ class TestManagerLoopChildPipeline:
         ctx = PipelineContext()
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.status == OutcomeStatus.SUCCESS
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "success"
 
     @pytest.mark.asyncio
-    async def test_child_pipeline_writes_status_on_failure(self, tmp_path) -> None:
-        """P-C11: Status file written on child failure."""
+    async def test_child_pipeline_returns_failure_result(self, tmp_path) -> None:
+        """P-C11: Handler returns FAIL on child failure (status.json centralized in engine)."""
         engine = AsyncMock()
         engine.start_child_pipeline = AsyncMock()
 
@@ -2897,10 +2873,7 @@ class TestManagerLoopChildPipeline:
         ctx = PipelineContext()
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.status == OutcomeStatus.FAIL
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "fail"
+        assert result.failure_reason is not None
 
     @pytest.mark.asyncio
     async def test_legacy_mode_still_works(self) -> None:
@@ -2950,3 +2923,407 @@ class TestManagerLoopChildPipeline:
         result = await handler.execute(node, ctx)
         assert result.status == OutcomeStatus.SUCCESS
         assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# P-F02: Parallel execution events
+# ---------------------------------------------------------------------------
+
+
+class TestParallelHandlerEvents:
+    """P-F02: ParallelHandler emits PARALLEL_STARTED, PARALLEL_BRANCH_STARTED,
+    PARALLEL_BRANCH_COMPLETED, and PARALLEL_COMPLETED events."""
+
+    @staticmethod
+    def _make_emitter() -> tuple["PipelineEventEmitter", list["PipelineEvent"]]:
+
+        captured: list[PipelineEvent] = []
+        emitter = PipelineEventEmitter()
+
+        async def _capture(event: PipelineEvent) -> None:
+            captured.append(event)
+
+        for evt_type in PipelineEventType:
+            emitter.on(evt_type, _capture)
+        return emitter, captured
+
+    @pytest.mark.asyncio
+    async def test_parallel_emits_all_four_event_types(self) -> None:
+        """All 4 parallel event types should fire during a normal run."""
+
+        emitter, captured = self._make_emitter()
+
+        registry = HandlerRegistry()
+        registry.register("start", StartHandler())
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={
+                "par": PipelineNode(name="par", handler_type="parallel"),
+                "a": PipelineNode(name="a", handler_type="start"),
+                "b": PipelineNode(name="b", handler_type="start"),
+            },
+            edges=[
+                PipelineEdge(source="par", target="a"),
+                PipelineEdge(source="par", target="b"),
+            ],
+        )
+
+        handler = ParallelHandler(
+            registry=registry, pipeline=pipeline, event_emitter=emitter
+        )
+        node = _make_node(name="par", handler_type="parallel")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.success is True
+
+        types = [e.type for e in captured]
+        assert PipelineEventType.PARALLEL_STARTED in types
+        assert PipelineEventType.PARALLEL_COMPLETED in types
+        assert types.count(PipelineEventType.PARALLEL_BRANCH_STARTED) == 2
+        assert types.count(PipelineEventType.PARALLEL_BRANCH_COMPLETED) == 2
+
+    @pytest.mark.asyncio
+    async def test_parallel_started_contains_branch_names(self) -> None:
+
+        emitter, captured = self._make_emitter()
+
+        registry = HandlerRegistry()
+        registry.register("start", StartHandler())
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={
+                "par": PipelineNode(name="par", handler_type="parallel"),
+                "x": PipelineNode(name="x", handler_type="start"),
+            },
+            edges=[PipelineEdge(source="par", target="x")],
+        )
+
+        handler = ParallelHandler(
+            registry=registry, pipeline=pipeline, event_emitter=emitter
+        )
+        node = _make_node(name="par", handler_type="parallel")
+        ctx = PipelineContext()
+
+        await handler.execute(node, ctx, graph=pipeline)
+
+        started = [
+            e for e in captured if e.type == PipelineEventType.PARALLEL_STARTED
+        ]
+        assert len(started) == 1
+        assert started[0].data["branches"] == ["x"]
+        assert started[0].node_name == "par"
+
+    @pytest.mark.asyncio
+    async def test_parallel_completed_contains_status_summary(self) -> None:
+
+        emitter, captured = self._make_emitter()
+
+        registry = HandlerRegistry()
+        registry.register("start", StartHandler())
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={
+                "par": PipelineNode(name="par", handler_type="parallel"),
+                "a": PipelineNode(name="a", handler_type="start"),
+            },
+            edges=[PipelineEdge(source="par", target="a")],
+        )
+
+        handler = ParallelHandler(
+            registry=registry, pipeline=pipeline, event_emitter=emitter
+        )
+        node = _make_node(name="par", handler_type="parallel")
+        ctx = PipelineContext()
+
+        await handler.execute(node, ctx, graph=pipeline)
+
+        completed = [
+            e for e in captured if e.type == PipelineEventType.PARALLEL_COMPLETED
+        ]
+        assert len(completed) == 1
+        assert completed[0].data["success_count"] == 1
+        assert completed[0].data["fail_count"] == 0
+        assert completed[0].data["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_parallel_no_emitter_does_not_raise(self) -> None:
+        """Handler without event_emitter should work without errors."""
+        registry = HandlerRegistry()
+        registry.register("start", StartHandler())
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={
+                "par": PipelineNode(name="par", handler_type="parallel"),
+                "a": PipelineNode(name="a", handler_type="start"),
+            },
+            edges=[PipelineEdge(source="par", target="a")],
+        )
+
+        handler = ParallelHandler(registry=registry, pipeline=pipeline)
+        node = _make_node(name="par", handler_type="parallel")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_parallel_branch_events_emitted_for_failed_branches(self) -> None:
+        """Branch events should be emitted even when the branch node is not found."""
+
+        emitter, captured = self._make_emitter()
+
+        registry = HandlerRegistry()
+        registry.register("start", StartHandler())
+
+        # Pipeline with edge to a node that doesn't exist
+        pipeline = Pipeline(
+            name="test",
+            nodes={
+                "par": PipelineNode(name="par", handler_type="parallel"),
+            },
+            edges=[PipelineEdge(source="par", target="missing")],
+        )
+
+        handler = ParallelHandler(
+            registry=registry, pipeline=pipeline, event_emitter=emitter
+        )
+        node = _make_node(name="par", handler_type="parallel")
+        ctx = PipelineContext()
+
+        await handler.execute(node, ctx, graph=pipeline)
+
+        branch_started = [
+            e for e in captured
+            if e.type == PipelineEventType.PARALLEL_BRANCH_STARTED
+        ]
+        branch_completed = [
+            e for e in captured
+            if e.type == PipelineEventType.PARALLEL_BRANCH_COMPLETED
+        ]
+        assert len(branch_started) == 1
+        assert branch_started[0].data["branch"] == "missing"
+        assert len(branch_completed) == 1
+        assert branch_completed[0].data["status"] == "fail"
+
+
+# ---------------------------------------------------------------------------
+# P-F03: Human interaction events
+# ---------------------------------------------------------------------------
+
+
+class TestWaitHumanHandlerEvents:
+    """P-F03: WaitHumanHandler emits INTERVIEW_STARTED, INTERVIEW_COMPLETED,
+    and INTERVIEW_TIMEOUT events."""
+
+    @staticmethod
+    def _make_emitter() -> tuple["PipelineEventEmitter", list["PipelineEvent"]]:
+
+        captured: list[PipelineEvent] = []
+        emitter = PipelineEventEmitter()
+
+        async def _capture(event: PipelineEvent) -> None:
+            captured.append(event)
+
+        for evt_type in PipelineEventType:
+            emitter.on(evt_type, _capture)
+        return emitter, captured
+
+    @pytest.mark.asyncio
+    async def test_interview_started_and_completed_on_confirm(self) -> None:
+        """Confirm path should emit INTERVIEW_STARTED and INTERVIEW_COMPLETED."""
+
+        emitter, captured = self._make_emitter()
+
+        interviewer = AsyncMock()
+        interviewer.confirm = AsyncMock(return_value=True)
+        interviewer.inform = AsyncMock()
+
+        handler = WaitHumanHandler(
+            interviewer=interviewer, event_emitter=emitter
+        )
+        node = _make_node(handler_type="wait.human", prompt="Continue?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+
+        types = [e.type for e in captured]
+        assert PipelineEventType.INTERVIEW_STARTED in types
+        assert PipelineEventType.INTERVIEW_COMPLETED in types
+        assert PipelineEventType.INTERVIEW_TIMEOUT not in types
+
+    @pytest.mark.asyncio
+    async def test_interview_started_and_completed_on_ask(self) -> None:
+        """Ask path (with edges) should emit INTERVIEW_STARTED and INTERVIEW_COMPLETED."""
+
+        emitter, captured = self._make_emitter()
+
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+        interviewer.ask = AsyncMock(return_value="approve")
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="approve"),
+                PipelineEdge(source="gate", target="retry", label="reject"),
+            ],
+        )
+
+        handler = WaitHumanHandler(
+            interviewer=interviewer, pipeline=pipeline, event_emitter=emitter
+        )
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Choose?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+
+        types = [e.type for e in captured]
+        assert PipelineEventType.INTERVIEW_STARTED in types
+        assert PipelineEventType.INTERVIEW_COMPLETED in types
+
+        # Verify data payloads
+        started = [
+            e for e in captured if e.type == PipelineEventType.INTERVIEW_STARTED
+        ]
+        assert started[0].data["prompt"] == "Choose?"
+        assert started[0].node_name == "gate"
+
+        completed = [
+            e for e in captured if e.type == PipelineEventType.INTERVIEW_COMPLETED
+        ]
+        assert completed[0].data["answer"] == "approve"
+
+    @pytest.mark.asyncio
+    async def test_interview_timeout_on_ask_path(self) -> None:
+        """INTERVIEW_TIMEOUT should be emitted when ask() times out."""
+
+        emitter, captured = self._make_emitter()
+
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+
+        async def slow_ask(*args: Any, **kwargs: Any) -> str:
+            await asyncio.sleep(10)
+            return "too late"
+
+        interviewer.ask = slow_ask
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="approve"),
+            ],
+        )
+
+        handler = WaitHumanHandler(
+            interviewer=interviewer, pipeline=pipeline, event_emitter=emitter
+        )
+        node = PipelineNode(
+            name="gate",
+            handler_type="wait.human",
+            attributes={"prompt": "Choose?"},
+            timeout=0.01,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        # Should be RETRY (no default_choice set)
+        assert result.status == OutcomeStatus.RETRY
+
+        types = [e.type for e in captured]
+        assert PipelineEventType.INTERVIEW_STARTED in types
+        assert PipelineEventType.INTERVIEW_TIMEOUT in types
+        assert PipelineEventType.INTERVIEW_COMPLETED not in types
+
+        timeout_events = [
+            e for e in captured if e.type == PipelineEventType.INTERVIEW_TIMEOUT
+        ]
+        assert timeout_events[0].data["timeout"] == 0.01
+
+    @pytest.mark.asyncio
+    async def test_interview_timeout_on_confirm_path(self) -> None:
+        """INTERVIEW_TIMEOUT should be emitted when confirm() times out."""
+
+        emitter, captured = self._make_emitter()
+
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+
+        async def slow_confirm(*args: Any, **kwargs: Any) -> bool:
+            await asyncio.sleep(10)
+            return True
+
+        interviewer.confirm = slow_confirm
+
+        handler = WaitHumanHandler(
+            interviewer=interviewer, event_emitter=emitter
+        )
+        node = PipelineNode(
+            name="test_node",
+            handler_type="wait.human",
+            attributes={"prompt": "Go?"},
+            timeout=0.01,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.RETRY
+
+        types = [e.type for e in captured]
+        assert PipelineEventType.INTERVIEW_STARTED in types
+        assert PipelineEventType.INTERVIEW_TIMEOUT in types
+        assert PipelineEventType.INTERVIEW_COMPLETED not in types
+
+    @pytest.mark.asyncio
+    async def test_no_emitter_does_not_raise(self) -> None:
+        """Handler without event_emitter should work without errors."""
+        interviewer = AsyncMock()
+        interviewer.confirm = AsyncMock(return_value=True)
+        interviewer.inform = AsyncMock()
+
+        handler = WaitHumanHandler(interviewer=interviewer)
+        node = _make_node(handler_type="wait.human", prompt="OK?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# P-F02/P-F03: Event type enum completeness
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineEventTypes:
+    """Verify all required event types exist in the enum."""
+
+    def test_parallel_event_types_exist(self) -> None:
+        assert hasattr(PipelineEventType, "PARALLEL_STARTED")
+        assert hasattr(PipelineEventType, "PARALLEL_BRANCH_STARTED")
+        assert hasattr(PipelineEventType, "PARALLEL_BRANCH_COMPLETED")
+        assert hasattr(PipelineEventType, "PARALLEL_COMPLETED")
+
+    def test_interview_event_types_exist(self) -> None:
+        assert hasattr(PipelineEventType, "INTERVIEW_STARTED")
+        assert hasattr(PipelineEventType, "INTERVIEW_COMPLETED")
+        assert hasattr(PipelineEventType, "INTERVIEW_TIMEOUT")
+
+    def test_parallel_event_type_values(self) -> None:
+        assert PipelineEventType.PARALLEL_STARTED.value == "parallel_started"
+        assert PipelineEventType.PARALLEL_BRANCH_STARTED.value == "parallel_branch_started"
+        assert PipelineEventType.PARALLEL_BRANCH_COMPLETED.value == "parallel_branch_completed"
+        assert PipelineEventType.PARALLEL_COMPLETED.value == "parallel_completed"
+
+    def test_interview_event_type_values(self) -> None:
+        assert PipelineEventType.INTERVIEW_STARTED.value == "interview_started"
+        assert PipelineEventType.INTERVIEW_COMPLETED.value == "interview_completed"
+        assert PipelineEventType.INTERVIEW_TIMEOUT.value == "interview_timeout"

@@ -8,6 +8,8 @@ for routing, and checkpointing state after every completed node.
 from __future__ import annotations
 
 import asyncio
+import datetime
+import json
 import logging
 import random
 import re
@@ -177,6 +179,9 @@ class PipelineEngine:
             type=PipelineEventType.PIPELINE_START,
             pipeline_name=pipeline.name,
         ))
+
+        # P-F01: Write manifest.json at pipeline start (spec §5.6)
+        self._write_manifest(pipeline, start_time)
 
         steps = 0
         while steps < self._max_steps:
@@ -369,6 +374,9 @@ class PipelineEngine:
 
             assert result is not None  # At least one iteration always runs
 
+            # P-P03/P-P01: Engine centralizes status.json writing (spec §3.2 step 5, Appendix C)
+            self._write_node_status(node, result)
+
             # Merge context updates
             if result.context_updates:
                 ctx.update(result.context_updates)
@@ -550,6 +558,71 @@ class PipelineEngine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _write_manifest(self, pipeline: Pipeline, start_time: float) -> None:
+        """Write ``manifest.json`` to ``{logs_root}/`` at pipeline start.
+
+        Contains pipeline metadata per spec §5.6: name, goal, start time,
+        node list, and graph-level attributes.
+
+        Args:
+            pipeline: The pipeline definition.
+            start_time: UNIX timestamp when the pipeline run started.
+        """
+        if self._logs_root is None:
+            return
+
+        self._logs_root.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "name": pipeline.name,
+            "goal": pipeline.goal,
+            "start_time": datetime.datetime.fromtimestamp(
+                start_time, tz=datetime.timezone.utc
+            ).isoformat(),
+            "nodes": list(pipeline.nodes.keys()),
+            "graph_attributes": dict(pipeline.metadata),
+        }
+        (self._logs_root / "manifest.json").write_text(
+            json.dumps(manifest, indent=2)
+        )
+
+    def _write_node_status(
+        self, node: PipelineNode, result: NodeResult
+    ) -> None:
+        """Write spec-compliant ``status.json`` for *node* after execution.
+
+        Per spec Appendix C, the status file includes: ``outcome``,
+        ``preferred_next_label``, ``suggested_next_ids``,
+        ``context_updates``, and ``notes``.
+
+        When ``auto_status=true`` on the node and the handler provided
+        no notes, the engine synthesizes an auto-status note per spec.
+
+        Args:
+            node: The pipeline node that was executed.
+            result: The handler's execution result.
+        """
+        if self._logs_root is None:
+            return
+
+        stage_dir = self._logs_root / node.name
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        notes = result.notes or ""
+        # Spec Appendix C: auto_status synthesis
+        if node.auto_status and not notes:
+            notes = "auto-status: handler completed without writing status"
+
+        status_data: dict[str, object] = {
+            "outcome": result.status.value,
+            "preferred_next_label": result.preferred_label or "",
+            "suggested_next_ids": list(result.suggested_next_ids),
+            "context_updates": dict(result.context_updates),
+            "notes": notes,
+        }
+        (stage_dir / "status.json").write_text(
+            json.dumps(status_data, indent=2, default=str)
+        )
 
     @staticmethod
     def _resolve_fidelity(

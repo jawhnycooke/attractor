@@ -120,6 +120,38 @@ class TestQueueInterviewer:
         await qi.inform("msg2", stage="stage2")
         assert len(qi.messages) == 2
 
+    async def test_ask_empty_queue_returns_skipped(self) -> None:
+        """When the queue is empty, ask() returns SKIPPED immediately."""
+        qi = QueueInterviewer()
+        q = Question(text="Proceed?", type=QuestionType.YES_NO)
+        result = await qi.ask(q)
+        assert result.value == AnswerValue.SKIPPED
+
+    async def test_ask_multiple_partially_empty_queue(self) -> None:
+        """When the queue runs out mid-batch, remaining answers are SKIPPED."""
+        qi = QueueInterviewer()
+        await qi.responses.put(Answer(value=AnswerValue.YES))
+
+        questions = [
+            Question(text="Q1?", type=QuestionType.YES_NO),
+            Question(text="Q2?", type=QuestionType.YES_NO),
+            Question(text="Q3?", type=QuestionType.YES_NO),
+        ]
+        results = await qi.ask_multiple(questions)
+        assert len(results) == 3
+        assert results[0].value == AnswerValue.YES
+        assert results[1].value == AnswerValue.SKIPPED
+        assert results[2].value == AnswerValue.SKIPPED
+
+    async def test_ask_empty_queue_does_not_block(self) -> None:
+        """Verify ask() on empty queue returns immediately without blocking."""
+        import asyncio
+        qi = QueueInterviewer()
+        q = Question(text="Proceed?", type=QuestionType.YES_NO)
+        # Should complete nearly instantly, not block waiting for queue
+        result = await asyncio.wait_for(qi.ask(q), timeout=1.0)
+        assert result.value == AnswerValue.SKIPPED
+
     async def test_protocol_compliance(self) -> None:
         qi = QueueInterviewer()
         assert isinstance(qi, Interviewer)

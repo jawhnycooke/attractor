@@ -27,6 +27,13 @@ class PipelineEventType(str, enum.Enum):
     NODE_RETRY = "node_retry"
     NODE_FAIL = "node_fail"
     CHECKPOINT_SAVED = "checkpoint_saved"
+    PARALLEL_STARTED = "parallel_started"
+    PARALLEL_BRANCH_STARTED = "parallel_branch_started"
+    PARALLEL_BRANCH_COMPLETED = "parallel_branch_completed"
+    PARALLEL_COMPLETED = "parallel_completed"
+    INTERVIEW_STARTED = "interview_started"
+    INTERVIEW_COMPLETED = "interview_completed"
+    INTERVIEW_TIMEOUT = "interview_timeout"
 
 
 @dataclass

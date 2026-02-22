@@ -167,7 +167,10 @@ class OpenAIAdapter:
 
         # User / developer messages
         content = self._map_content_parts(msg.content)
-        role = msg.role.value
+        if msg.role == Role.DEVELOPER:
+            role = "developer"
+        else:
+            role = "user"
         return {"role": role, "content": content}
 
     def _map_content_parts(
@@ -356,6 +359,7 @@ class OpenAIAdapter:
         return Response(
             message=Message(role=Role.ASSISTANT, content=content_parts),
             model=raw.model if isinstance(raw.model, str) else str(raw.model),
+            provider="openai",
             finish_reason=finish,
             usage=usage,
             provider_response_id=raw.id or "",
