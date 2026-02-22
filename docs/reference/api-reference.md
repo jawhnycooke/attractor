@@ -196,6 +196,17 @@ digraph my_pipeline {
 }
 ```
 
+```mermaid
+graph LR
+    start(["start"]) --> implement["implement<br/>codergen"]
+    implement --> review["review<br/>codergen"]
+    review -->|"review_passed = true"| done(["done"])
+    review -->|"review_passed = false<br/>weight=2"| implement
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
+```
+
 ### Node Attributes
 
 Set as key=value pairs inside node brackets: `nodename [attr="value"]`.

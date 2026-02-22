@@ -22,6 +22,18 @@ digraph refactor {
 }
 ```
 
+```mermaid
+graph LR
+    start(["start"]) --> analyze["analyze<br/>codergen"]
+    analyze --> remove["remove<br/>codergen"]
+    remove --> verify["verify<br/>codergen"]
+    verify -->|"tests_passed = true"| done(["done"])
+    verify -->|"tests_passed = false<br/>weight=2"| remove
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
+```
+
 ```bash
 attractor run refactor.dot --model claude-sonnet-4-20250514 --verbose
 ```

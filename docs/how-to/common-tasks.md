@@ -86,6 +86,16 @@ digraph fix_bug {
 }
 ```
 
+```mermaid
+graph LR
+    start(["start"]) --> implement["implement<br/>codergen"]
+    implement --> test["test<br/>codergen"]
+    test --> done(["done"])
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
+```
+
 **Node attributes reference**:
 
 | Attribute     | Purpose                                              | Default    |
@@ -206,6 +216,17 @@ digraph retry_example {
 }
 ```
 
+```mermaid
+graph LR
+    start(["start"]) --> implement["implement<br/>codergen"]
+    implement --> verify["verify<br/>codergen"]
+    verify -->|"tests_passed = true<br/>weight=2"| done(["done"])
+    verify -->|"tests_passed = false"| implement
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
+```
+
 **Expected result**: The pipeline loops through implement and verify until tests pass, then exits.
 
 ### Step 2: Write a multi-branch routing pattern
@@ -234,6 +255,20 @@ digraph classify {
     medium_fix -> done
     high_fix   -> done
 }
+```
+
+```mermaid
+graph LR
+    start(["start"]) --> classify["classify<br/>codergen"]
+    classify -->|"severity = high<br/>weight=3"| high_fix["high_fix"]
+    classify -->|"severity = medium<br/>weight=2"| medium_fix["medium_fix"]
+    classify -->|"severity = low"| low_fix["low_fix"]
+    high_fix --> done(["done"])
+    medium_fix --> done
+    low_fix --> done
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
 ```
 
 ### Step 3: React to engine-internal context keys
@@ -332,6 +367,16 @@ digraph interpolation_example {
 }
 ```
 
+```mermaid
+graph LR
+    start(["start"]) --> analyze["analyze<br/>codergen"]
+    analyze -->|"sets target_file,<br/>issue_count"| refactor["refactor<br/>codergen<br/>uses {target_file}, {issue_count}"]
+    refactor --> done(["done"])
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
+```
+
 **Expected result**: The `refactor` node receives a prompt with the actual file path and issue count substituted in.
 
 ### Troubleshooting
@@ -390,6 +435,16 @@ digraph multi_model {
     analyze -> implement
     implement -> done
 }
+```
+
+```mermaid
+graph LR
+    start(["start"]) --> analyze["analyze<br/>gpt-4o<br/>temp=0.1"]
+    analyze --> implement["implement<br/>claude-opus-4-6<br/>temp=0.3"]
+    implement --> done(["done"])
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
 ```
 
 ### Step 2: Configure reliability attributes
@@ -511,6 +566,17 @@ digraph styled_pipeline {
     review -> final_review
     final_review -> done
 }
+```
+
+```mermaid
+graph LR
+    start(["start"]) --> implement["implement<br/>.implementation"]
+    implement --> review["review<br/>.review"]
+    review --> final_review["final_review<br/>#final_review"]
+    final_review --> done(["done"])
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
 ```
 
 ### Step 3: Pass the stylesheet to PipelineEngine
@@ -1215,6 +1281,16 @@ digraph with_notifications {
     deploy -> notify
     notify -> done
 }
+```
+
+```mermaid
+graph LR
+    start(["start"]) --> deploy["deploy<br/>codergen"]
+    deploy --> notify["notify<br/>slack_notify"]
+    notify --> done(["done"])
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
 ```
 
 ### Troubleshooting

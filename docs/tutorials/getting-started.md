@@ -140,6 +140,15 @@ digraph hello_pipeline {
 }
 ```
 
+```mermaid
+graph LR
+    start(["start"]) --> write_script["write_script<br/>codergen"]
+    write_script --> done(["done"])
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
+```
+
 What this file says:
 
 - `digraph hello_pipeline` — the pipeline is named `hello_pipeline`.
@@ -237,6 +246,18 @@ digraph broken {
     generate -> review
     review -> nonexistent_node
 }
+```
+
+```mermaid
+graph LR
+    start(["start"]) --> generate["generate<br/>codergen"]
+    generate --> review["review<br/>badhandler"]
+    review -.->|"target missing"| missing["nonexistent_node ❌"]
+    orphan["orphan<br/>unreachable ❌"]
+
+    style start fill:#d4edda
+    style missing fill:#f8d7da,stroke-dasharray: 5 5
+    style orphan fill:#f8d7da,stroke-dasharray: 5 5
 ```
 
 This pipeline has three problems: `review` uses an unknown handler type
@@ -338,6 +359,17 @@ digraph review_pipeline {
     review -> finalize  [condition="last_codergen_output = PASS" weight=1]
     review -> generate  [condition="last_codergen_output = FAIL" weight=2]
 }
+```
+
+```mermaid
+graph LR
+    start(["start"]) --> generate["generate<br/>codergen"]
+    generate --> review["review<br/>codergen"]
+    review -->|"output = PASS"| finalize(["finalize<br/>codergen"])
+    review -->|"output = FAIL<br/>weight=2"| generate
+
+    style start fill:#d4edda
+    style finalize fill:#f8d7da
 ```
 
 Key things to notice:
@@ -473,6 +505,18 @@ digraph full_pipeline {
     self_check -> fix_code   [condition="last_codergen_output = FAIL" weight=1]
     fix_code -> self_check
 }
+```
+
+```mermaid
+graph LR
+    start(["start"]) --> write_code["write_code<br/>codergen"]
+    write_code --> self_check["self_check<br/>codergen"]
+    self_check -->|"output = PASS<br/>weight=2"| write_docs(["write_docs<br/>codergen"])
+    self_check -->|"output = FAIL"| fix_code["fix_code<br/>codergen"]
+    fix_code --> self_check
+
+    style start fill:#d4edda
+    style write_docs fill:#f8d7da
 ```
 
 New things in this pipeline:

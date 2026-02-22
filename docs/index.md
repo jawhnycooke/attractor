@@ -44,6 +44,17 @@ digraph code_review {
 }
 ```
 
+```mermaid
+graph LR
+    start(["start"]) --> write["write<br/>codergen"]
+    write --> review["review<br/>codergen"]
+    review -->|"review_passed = true"| done(["done"])
+    review -->|"review_passed = false<br/>weight=2"| write
+
+    style start fill:#d4edda
+    style done fill:#f8d7da
+```
+
 ```bash
 attractor run code_review.dot --model claude-sonnet-4-20250514 --verbose
 ```
