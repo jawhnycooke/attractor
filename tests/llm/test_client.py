@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 import attractor.llm as llm_module
 from attractor.llm.client import LLMClient
-from attractor.llm.errors import AbortError, RequestTimeoutError
+from attractor.llm.errors import AbortError, NoObjectGeneratedError, RequestTimeoutError
 from attractor.llm.middleware import (
     LoggingMiddleware,
     TokenTrackingMiddleware,
@@ -555,7 +556,8 @@ class TestGenerateObject:
         result = await client.generate_object(
             "Give me a person", model="mock-v1", schema=schema
         )
-        assert result == {"name": "Alice", "age": 30}
+        assert result.output == {"name": "Alice", "age": 30}
+        assert result.text == json_text
 
     @pytest.mark.asyncio
     async def test_generate_object_sets_response_format(self) -> None:
@@ -589,7 +591,7 @@ class TestGenerateObject:
         )
         client = LLMClient(adapters=[adapter])
 
-        with pytest.raises(ValueError, match="not valid JSON"):
+        with pytest.raises(NoObjectGeneratedError, match="not valid JSON"):
             await client.generate_object(
                 "test",
                 model="mock-v1",
@@ -612,7 +614,7 @@ class TestGenerateObject:
             model="mock-v1",
             schema={"type": "object", "properties": {"result": {"type": "boolean"}}},
         )
-        assert result == {"result": True}
+        assert result.output == {"result": True}
 
 
 # ---------------------------------------------------------------------------
@@ -871,7 +873,7 @@ class TestModuleLevelFunctions:
             model="mock-v1",
             schema={"type": "object", "properties": {"x": {"type": "integer"}}},
         )
-        assert result == {"x": 42}
+        assert result.output == {"x": 42}
 
 
 # ---------------------------------------------------------------------------
@@ -1931,3 +1933,647 @@ class TestClientClose:
         assert "a" in close_log
         assert "b" in close_log
         assert len(close_log) == 2
+
+
+# ---------------------------------------------------------------------------
+# L-C09: generate_object() — enhanced tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateObjectEnhanced:
+    """Tests for generate_object() spec compliance (L-C09)."""
+
+    @pytest.mark.asyncio
+    async def test_generate_object_uses_generate_internally(self) -> None:
+        """generate_object() should delegate to generate() under the hood."""
+        generate_called = False
+
+        class TrackingClient(LLMClient):
+            async def generate(self, *args: Any, **kwargs: Any) -> Any:
+                nonlocal generate_called
+                generate_called = True
+                return await super().generate(*args, **kwargs)
+
+        adapter = MockAdapter(
+            response=Response(
+                message=Message.assistant('{"val": 1}'),
+                model="mock-v1",
+                usage=TokenUsage(input_tokens=5, output_tokens=3),
+            ),
+        )
+        client = TrackingClient(adapters=[adapter])
+
+        result = await client.generate_object(
+            "test",
+            model="mock-v1",
+            schema={"type": "object", "properties": {"val": {"type": "integer"}}},
+        )
+        assert generate_called is True
+        assert result.output == {"val": 1}
+
+    @pytest.mark.asyncio
+    async def test_generate_object_nested_schema(self) -> None:
+        """generate_object() should handle nested JSON schemas."""
+        json_text = '{"user": {"name": "Bob", "address": {"city": "NYC", "zip": "10001"}}}'
+        adapter = MockAdapter(
+            response=Response(
+                message=Message.assistant(json_text),
+                model="mock-v1",
+                usage=TokenUsage(input_tokens=10, output_tokens=15),
+            ),
+        )
+        client = LLMClient(adapters=[adapter])
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "user": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "address": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "zip": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+            "required": ["user"],
+        }
+
+        result = await client.generate_object(
+            "Give me a user",
+            model="mock-v1",
+            schema=schema,
+        )
+        assert result.output["user"]["name"] == "Bob"
+        assert result.output["user"]["address"]["city"] == "NYC"
+        assert result.output["user"]["address"]["zip"] == "10001"
+
+    @pytest.mark.asyncio
+    async def test_generate_object_array_schema(self) -> None:
+        """generate_object() should handle schemas with array types."""
+        json_text = '{"items": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]}'
+        adapter = MockAdapter(
+            response=Response(
+                message=Message.assistant(json_text),
+                model="mock-v1",
+                usage=TokenUsage(input_tokens=5, output_tokens=10),
+            ),
+        )
+        client = LLMClient(adapters=[adapter])
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "name": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        }
+
+        result = await client.generate_object(
+            "List items",
+            model="mock-v1",
+            schema=schema,
+        )
+        assert len(result.output["items"]) == 2
+        assert result.output["items"][0]["id"] == 1
+        assert result.output["items"][1]["name"] == "b"
+
+    @pytest.mark.asyncio
+    async def test_generate_object_strict_false(self) -> None:
+        """generate_object() should support strict=False."""
+        adapter = MockAdapter(
+            response=Response(
+                message=Message.assistant('{"x": 1}'),
+                model="mock-v1",
+            ),
+        )
+        client = LLMClient(adapters=[adapter])
+
+        await client.generate_object(
+            "test",
+            model="mock-v1",
+            schema={"type": "object", "properties": {"x": {"type": "integer"}}},
+            strict=False,
+        )
+
+        req = adapter.complete_calls[0]
+        assert req.response_format is not None
+        assert req.response_format["json_schema"]["strict"] is False
+
+    @pytest.mark.asyncio
+    async def test_generate_object_empty_json_raises(self) -> None:
+        """generate_object() should raise NoObjectGeneratedError on empty response."""
+        adapter = MockAdapter(
+            response=Response(
+                message=Message.assistant(""),
+                model="mock-v1",
+            ),
+        )
+        client = LLMClient(adapters=[adapter])
+
+        with pytest.raises(NoObjectGeneratedError, match="not valid JSON"):
+            await client.generate_object(
+                "test",
+                model="mock-v1",
+                schema={"type": "object"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_generate_object_truncated_json_raises(self) -> None:
+        """generate_object() should raise NoObjectGeneratedError on truncated JSON."""
+        adapter = MockAdapter(
+            response=Response(
+                message=Message.assistant('{"name": "Alice", "age":'),
+                model="mock-v1",
+            ),
+        )
+        client = LLMClient(adapters=[adapter])
+
+        with pytest.raises(NoObjectGeneratedError, match="not valid JSON"):
+            await client.generate_object(
+                "test",
+                model="mock-v1",
+                schema={"type": "object"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_generate_object_passes_kwargs(self) -> None:
+        """generate_object() should forward extra kwargs to generate()."""
+        adapter = MockAdapter(
+            response=Response(
+                message=Message.assistant('{"ok": true}'),
+                model="mock-v1",
+                usage=TokenUsage(input_tokens=5, output_tokens=3),
+            ),
+        )
+        client = LLMClient(adapters=[adapter])
+
+        await client.generate_object(
+            "test",
+            model="mock-v1",
+            schema={"type": "object"},
+            temperature=0.5,
+            max_tokens=100,
+        )
+
+        req = adapter.complete_calls[0]
+        assert req.temperature == 0.5
+        assert req.max_tokens == 100
+
+    @pytest.mark.asyncio
+    async def test_generate_object_after_close_raises(self) -> None:
+        """generate_object() should raise RuntimeError after close()."""
+        adapter = MockAdapter()
+        client = LLMClient(adapters=[adapter])
+        await client.close()
+
+        with pytest.raises(RuntimeError, match="LLMClient is closed"):
+            await client.generate_object(
+                "test",
+                model="mock-v1",
+                schema={"type": "object"},
+            )
+
+
+# ---------------------------------------------------------------------------
+# L-C10: stream_object()
+# ---------------------------------------------------------------------------
+
+
+class TestStreamObject:
+    """Tests for stream_object() (L-C10)."""
+
+    @pytest.mark.asyncio
+    async def test_stream_object_yields_parsed_result(self) -> None:
+        """stream_object() should yield a parsed dict from streamed JSON."""
+
+        class JSONStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text='{"name"')
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=': "Alice"')
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=', "age": 30}')
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                    usage=TokenUsage(input_tokens=10, output_tokens=8),
+                )
+
+        adapter = JSONStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+        }
+
+        results = []
+        async for obj in client.stream_object(
+            "Extract person info",
+            model="mock-v1",
+            schema=schema,
+        ):
+            results.append(obj)
+
+        assert len(results) == 1
+        assert results[0] == {"name": "Alice", "age": 30}
+
+    @pytest.mark.asyncio
+    async def test_stream_object_sets_response_format(self) -> None:
+        """stream_object() should set response_format on the request."""
+        captured_requests: list[Request] = []
+
+        class TrackingStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                captured_requests.append(request)
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text='{"x": 1}')
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                    usage=TokenUsage(input_tokens=5, output_tokens=3),
+                )
+
+        adapter = TrackingStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        async for _ in client.stream_object(
+            "test",
+            model="mock-v1",
+            schema=schema,
+            schema_name="my_schema",
+        ):
+            pass
+
+        assert len(captured_requests) == 1
+        req = captured_requests[0]
+        assert req.response_format is not None
+        assert req.response_format["type"] == "json_schema"
+        assert req.response_format["json_schema"]["name"] == "my_schema"
+        assert req.response_format["json_schema"]["strict"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_object_invalid_json_raises(self) -> None:
+        """stream_object() should raise ValueError on non-JSON output."""
+
+        class BadStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(
+                    type=StreamEventType.TEXT_DELTA, text="not valid json {[["
+                )
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                )
+
+        adapter = BadStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        with pytest.raises(NoObjectGeneratedError, match="not valid JSON"):
+            async for _ in client.stream_object(
+                "test",
+                model="mock-v1",
+                schema={"type": "object"},
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_stream_object_nested_schema(self) -> None:
+        """stream_object() should handle nested JSON objects."""
+        json_text = '{"user": {"name": "Eve", "roles": ["admin", "user"]}}'
+
+        class NestedStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=json_text)
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                    usage=TokenUsage(input_tokens=5, output_tokens=10),
+                )
+
+        adapter = NestedStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "user": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "roles": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+        }
+
+        results = []
+        async for obj in client.stream_object(
+            "Get user",
+            model="mock-v1",
+            schema=schema,
+        ):
+            results.append(obj)
+
+        assert len(results) == 1
+        assert results[0]["user"]["name"] == "Eve"
+        assert results[0]["user"]["roles"] == ["admin", "user"]
+
+    @pytest.mark.asyncio
+    async def test_stream_object_array_result(self) -> None:
+        """stream_object() should handle array-typed schemas."""
+        json_text = '{"tags": ["python", "async", "llm"]}'
+
+        class ArrayStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=json_text)
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                )
+
+        adapter = ArrayStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+        }
+
+        results = []
+        async for obj in client.stream_object(
+            "List tags",
+            model="mock-v1",
+            schema=schema,
+        ):
+            results.append(obj)
+
+        assert len(results) == 1
+        assert results[0]["tags"] == ["python", "async", "llm"]
+
+    @pytest.mark.asyncio
+    async def test_stream_object_with_message_list(self) -> None:
+        """stream_object() should accept a list of Messages as prompt."""
+
+        class MessageStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(
+                    type=StreamEventType.TEXT_DELTA, text='{"status": "ok"}'
+                )
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                )
+
+        adapter = MessageStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        messages = [Message.system("Be precise"), Message.user("status check")]
+        results = []
+        async for obj in client.stream_object(
+            messages,
+            model="mock-v1",
+            schema={
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+            },
+        ):
+            results.append(obj)
+
+        assert len(results) == 1
+        assert results[0] == {"status": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_stream_object_after_close_raises(self) -> None:
+        """stream_object() should raise RuntimeError after close()."""
+        adapter = MockAdapter()
+        client = LLMClient(adapters=[adapter])
+        await client.close()
+
+        with pytest.raises(RuntimeError, match="LLMClient is closed"):
+            async for _ in client.stream_object(
+                "test",
+                model="mock-v1",
+                schema={"type": "object"},
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_stream_object_empty_stream_raises(self) -> None:
+        """stream_object() should raise ValueError on empty stream output."""
+
+        class EmptyStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                )
+
+        adapter = EmptyStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        with pytest.raises(NoObjectGeneratedError, match="not valid JSON"):
+            async for _ in client.stream_object(
+                "test",
+                model="mock-v1",
+                schema={"type": "object"},
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_stream_object_strict_false(self) -> None:
+        """stream_object() should support strict=False."""
+        captured_requests: list[Request] = []
+
+        class TrackingStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                captured_requests.append(request)
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text='{"x": 1}')
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                )
+
+        adapter = TrackingStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        async for _ in client.stream_object(
+            "test",
+            model="mock-v1",
+            schema={"type": "object", "properties": {"x": {"type": "integer"}}},
+            strict=False,
+        ):
+            pass
+
+        req = captured_requests[0]
+        assert req.response_format["json_schema"]["strict"] is False
+
+    @pytest.mark.asyncio
+    async def test_stream_object_multiple_deltas_concatenated(self) -> None:
+        """stream_object() should correctly concatenate multiple text deltas."""
+
+        class MultiDeltaAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="{")
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text='"k')
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text='ey"')
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=": ")
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text='"val')
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text='ue"')
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="}")
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                )
+
+        adapter = MultiDeltaAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        results = []
+        async for obj in client.stream_object(
+            "test",
+            model="mock-v1",
+            schema={"type": "object", "properties": {"key": {"type": "string"}}},
+        ):
+            results.append(obj)
+
+        assert len(results) == 1
+        assert results[0] == {"key": "value"}
+
+
+# ---------------------------------------------------------------------------
+# L-C10: Module-level stream_object()
+# ---------------------------------------------------------------------------
+
+
+class TestModuleLevelStreamObject:
+    @pytest.fixture(autouse=True)
+    def reset_default_client(self) -> None:
+        """Reset module-level _default_client after each test."""
+        yield  # type: ignore[misc]
+        llm_module._default_client = None
+
+    @pytest.mark.asyncio
+    async def test_stream_object_delegates_to_client(self) -> None:
+        """Module-level stream_object() should delegate to the default client."""
+
+        class JSONStreamAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(
+                    type=StreamEventType.TEXT_DELTA, text='{"val": 42}'
+                )
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                    usage=TokenUsage(input_tokens=5, output_tokens=3),
+                )
+
+        adapter = JSONStreamAdapter()
+        client = LLMClient(adapters=[adapter])
+        llm_module.set_default_client(client)
+
+        results = []
+        async for obj in llm_module.stream_object(
+            "test",
+            model="mock-v1",
+            schema={"type": "object", "properties": {"val": {"type": "integer"}}},
+        ):
+            results.append(obj)
+
+        assert len(results) == 1
+        assert results[0] == {"val": 42}
+
+
+# ---------------------------------------------------------------------------
+# ResponseFormat dataclass
+# ---------------------------------------------------------------------------
+
+
+class TestResponseFormat:
+    """Tests for the ResponseFormat dataclass (spec §3.10)."""
+
+    def test_default_values(self) -> None:
+        from attractor.llm.models import ResponseFormat
+
+        rf = ResponseFormat()
+        assert rf.type == "text"
+        assert rf.json_schema is None
+        assert rf.strict is False
+
+    def test_json_schema_type(self) -> None:
+        from attractor.llm.models import ResponseFormat
+
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        rf = ResponseFormat(type="json_schema", json_schema=schema, strict=True)
+        assert rf.type == "json_schema"
+        assert rf.json_schema == schema
+        assert rf.strict is True
+
+    def test_json_type(self) -> None:
+        from attractor.llm.models import ResponseFormat
+
+        rf = ResponseFormat(type="json")
+        assert rf.type == "json"
+
+    def test_invalid_type_raises(self) -> None:
+        from attractor.llm.models import ResponseFormat
+
+        with pytest.raises(ValueError, match="Invalid response format type"):
+            ResponseFormat(type="xml")
+
+    def test_json_schema_type_without_schema_raises(self) -> None:
+        from attractor.llm.models import ResponseFormat
+
+        with pytest.raises(ValueError, match="json_schema is required"):
+            ResponseFormat(type="json_schema")
+
+    def test_to_dict_json_schema(self) -> None:
+        from attractor.llm.models import ResponseFormat
+
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        rf = ResponseFormat(type="json_schema", json_schema=schema, strict=True)
+        d = rf.to_dict()
+        assert d["type"] == "json_schema"
+        assert d["json_schema"] == schema
+        assert d["strict"] is True
+
+    def test_to_dict_text(self) -> None:
+        from attractor.llm.models import ResponseFormat
+
+        rf = ResponseFormat(type="text")
+        d = rf.to_dict()
+        assert d == {"type": "text"}
+
+    def test_to_dict_json(self) -> None:
+        from attractor.llm.models import ResponseFormat
+
+        rf = ResponseFormat(type="json")
+        d = rf.to_dict()
+        assert d == {"type": "json"}

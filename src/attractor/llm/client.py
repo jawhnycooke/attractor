@@ -9,7 +9,13 @@ import random
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any
 
-from attractor.llm.errors import AbortError, ProviderError, RequestTimeoutError, SDKError
+from attractor.llm.errors import (
+    AbortError,
+    NoObjectGeneratedError,
+    ProviderError,
+    RequestTimeoutError,
+    SDKError,
+)
 from attractor.llm.models import (
     FinishReason,
     GenerateResult,
@@ -618,11 +624,13 @@ class LLMClient:
         schema_name: str = "response",
         strict: bool = True,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> GenerateResult:
         """Generate a structured JSON object validated against a schema.
 
         Uses the provider's structured output / response_format capability
         to constrain the model to produce JSON matching the given schema.
+        Internally delegates to :meth:`generate` with ``response_format``
+        set on the request.
 
         Args:
             prompt: A string or list of Messages.
@@ -633,11 +641,72 @@ class LLMClient:
             **kwargs: Additional Request fields.
 
         Returns:
-            The parsed JSON object as a Python dict.
+            A :class:`GenerateResult` with ``output`` set to the parsed
+            JSON object and ``text`` set to the raw response string.
 
         Raises:
-            ValueError: If the model output cannot be parsed as valid JSON.
+            NoObjectGeneratedError: If the model output cannot be parsed
+                as valid JSON.
         """
+        response_format: dict[str, Any] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "schema": schema,
+                "strict": strict,
+            },
+        }
+
+        result = await self.generate(
+            prompt,
+            model,
+            response_format=response_format,
+            max_tool_rounds=0,
+            **kwargs,
+        )
+        text = result.text
+
+        try:
+            result.output = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise NoObjectGeneratedError(
+                f"Model output is not valid JSON: {text[:200]!r}"
+            ) from exc
+
+        return result
+
+    async def stream_object(
+        self,
+        prompt: str | list[Message],
+        model: str,
+        schema: dict[str, Any],
+        schema_name: str = "response",
+        strict: bool = True,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream a structured JSON object validated against a schema.
+
+        Streams the LLM response, accumulates text, and yields the final
+        parsed JSON object once the stream completes.
+
+        Args:
+            prompt: A string or list of Messages.
+            model: Model identifier string.
+            schema: JSON Schema dict describing the expected output shape.
+            schema_name: A name for the schema (used by some providers).
+            strict: Whether to enforce strict schema adherence.
+            **kwargs: Additional Request fields.
+
+        Yields:
+            The parsed JSON object as a Python dict (single yield at
+            stream completion).
+
+        Raises:
+            NoObjectGeneratedError: If the accumulated output cannot be
+                parsed as valid JSON.
+        """
+        self._check_closed()
+
         response_format: dict[str, Any] = {
             "type": "json_schema",
             "json_schema": {
@@ -659,10 +728,19 @@ class LLMClient:
             **kwargs,
         )
 
-        response = await self.complete(request)
-        text = response.message.text()
+        # Stream and accumulate text
+        accumulated_text: list[str] = []
+        async for event in self.stream(request):
+            if event.type == StreamEventType.TEXT_DELTA and event.text:
+                accumulated_text.append(event.text)
+
+        text = "".join(accumulated_text)
 
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"Model output is not valid JSON: {text[:200]!r}") from exc
+            raise NoObjectGeneratedError(
+                f"Model output is not valid JSON: {text[:200]!r}"
+            ) from exc
+
+        yield parsed

@@ -116,6 +116,53 @@ class ReasoningEffort(str, enum.Enum):
 
 
 # ---------------------------------------------------------------------------
+# ResponseFormat (spec §3.10)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ResponseFormat:
+    """Structured output format constraint for LLM responses.
+
+    Controls how the model formats its output. Supports plain text,
+    JSON mode, or JSON schema-constrained generation.
+
+    Args:
+        type: Output format — ``"text"``, ``"json"``, or ``"json_schema"``.
+        json_schema: JSON Schema dict. Required when type is ``"json_schema"``.
+        strict: When True, the provider enforces the schema strictly.
+    """
+
+    type: str = "text"
+    json_schema: dict[str, Any] | None = None
+    strict: bool = False
+
+    def __post_init__(self) -> None:
+        valid_types = {"text", "json", "json_schema"}
+        if self.type not in valid_types:
+            raise ValueError(
+                f"Invalid response format type: {self.type!r}, "
+                f"must be one of {valid_types}"
+            )
+        if self.type == "json_schema" and self.json_schema is None:
+            raise ValueError("json_schema is required when type is 'json_schema'")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to the dict format expected by provider adapters.
+
+        Returns:
+            A dict suitable for ``Request.response_format``.
+        """
+        if self.type == "json_schema":
+            return {
+                "type": "json_schema",
+                "json_schema": self.json_schema,
+                "strict": self.strict,
+            }
+        return {"type": self.type}
+
+
+# ---------------------------------------------------------------------------
 # Content Parts (Tagged Union)
 # ---------------------------------------------------------------------------
 

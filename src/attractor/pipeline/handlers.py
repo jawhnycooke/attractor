@@ -719,8 +719,22 @@ class ParallelHandler:
     """Fan-out execution across multiple sub-paths.
 
     Uses outgoing edges as branches per spec (§4.8). Supports
-    ``join_policy`` (wait_all/first_success) and ``error_policy``
-    (fail_fast/continue) attributes.
+    ``join_policy`` (wait_all/k_of_n/first_success/quorum) and
+    ``error_policy`` (fail_fast/continue/ignore) attributes.
+
+    Join policies:
+        - ``wait_all``: All branches must complete. SUCCESS if none fail,
+          PARTIAL_SUCCESS otherwise.
+        - ``k_of_n``: At least ``k`` branches must succeed (``k`` from
+          node attribute, default 1).
+        - ``first_success``: SUCCESS as soon as one branch succeeds.
+        - ``quorum``: Majority of branches must succeed.
+
+    Error policies:
+        - ``continue``: Run all branches, collect all results (default).
+        - ``fail_fast``: Cancel remaining branches on first failure.
+        - ``ignore``: Treat failures as SKIPPED; don't count them as
+          failures for join evaluation.
     """
 
     def __init__(
@@ -776,6 +790,7 @@ class ParallelHandler:
 
         join_policy = node.attributes.get("join_policy", "wait_all")
         error_policy = node.attributes.get("error_policy", "continue")
+        k_value = int(node.attributes.get("k", 1))
 
         async def _run_branch(branch_name: str) -> tuple[str, NodeResult]:
             branch_node = active_graph.nodes.get(branch_name)
@@ -794,35 +809,57 @@ class ParallelHandler:
             result = await handler.execute(branch_node, scope, active_graph, logs_root)
             context.merge_scope(scope, branch_name)
             if result.context_updates:
-                for k, v in result.context_updates.items():
-                    context.set(f"{branch_name}.{k}", v)
+                for ctx_key, v in result.context_updates.items():
+                    context.set(f"{branch_name}.{ctx_key}", v)
             return branch_name, result
 
-        results = await asyncio.gather(
-            *[_run_branch(b) for b in branches], return_exceptions=True
-        )
+        # Execute based on error_policy
+        if error_policy == "fail_fast":
+            raw_results = await self._run_fail_fast(branches, _run_branch)
+        else:
+            # "continue" and "ignore" both run all branches
+            raw_results = await asyncio.gather(
+                *[_run_branch(b) for b in branches], return_exceptions=True
+            )
 
+        # Collect outputs
         outputs: dict[str, Any] = {}
         success_count = 0
         fail_count = 0
-        for item in results:
+        for item in raw_results:
             if isinstance(item, BaseException):
-                fail_count += 1
+                if error_policy != "ignore":
+                    fail_count += 1
                 outputs["_error"] = str(item)
             else:
-                name, res = item
-                outputs[name] = res.output
+                bname, res = item
                 if res.success:
                     success_count += 1
+                    outputs[bname] = res.output
                 else:
-                    fail_count += 1
+                    if error_policy == "ignore":
+                        # Treat failures as SKIPPED — exclude from outputs
+                        pass
+                    else:
+                        fail_count += 1
+                        outputs[bname] = res.output
 
-        # H11: Apply join_policy
+        # Apply join_policy
+        total = success_count + fail_count
         if join_policy == "first_success":
-            if success_count > 0:
-                status = OutcomeStatus.SUCCESS
-            else:
-                status = OutcomeStatus.FAIL
+            status = OutcomeStatus.SUCCESS if success_count > 0 else OutcomeStatus.FAIL
+        elif join_policy == "k_of_n":
+            status = (
+                OutcomeStatus.SUCCESS
+                if success_count >= k_value
+                else OutcomeStatus.FAIL
+            )
+        elif join_policy == "quorum":
+            status = (
+                OutcomeStatus.SUCCESS
+                if total > 0 and success_count > total / 2
+                else OutcomeStatus.FAIL
+            )
         else:  # wait_all (default)
             if fail_count == 0:
                 status = OutcomeStatus.SUCCESS
@@ -835,11 +872,62 @@ class ParallelHandler:
             context_updates={"parallel.results": outputs},
         )
 
+    @staticmethod
+    async def _run_fail_fast(
+        branches: list[str],
+        run_fn: Any,
+    ) -> list[tuple[str, NodeResult] | BaseException]:
+        """Run branches concurrently, cancelling remaining on first failure.
+
+        Args:
+            branches: List of branch node names.
+            run_fn: Async callable taking a branch name and returning
+                ``(name, NodeResult)``.
+
+        Returns:
+            List of completed results (may be fewer than total branches
+            if cancellation occurred).
+        """
+        tasks = [asyncio.create_task(run_fn(b)) for b in branches]
+        results: list[tuple[str, NodeResult] | BaseException] = []
+        pending = set(tasks)
+
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                try:
+                    result = task.result()
+                    results.append(result)
+                    _name, res = result
+                    if not res.success:
+                        # Cancel all remaining
+                        for p in pending:
+                            p.cancel()
+                        if pending:
+                            await asyncio.wait(pending)
+                        pending = set()
+                        break
+                except Exception as exc:
+                    results.append(exc)
+                    for p in pending:
+                        p.cancel()
+                    if pending:
+                        await asyncio.wait(pending)
+                    pending = set()
+                    break
+
+        return results
+
 
 class FanInHandler:
     """Consolidate parallel branch results.
 
     H12: Ranks outcomes by status priority (SUCCESS > PARTIAL > FAIL).
+    P-P12: When ``node.prompt`` is set and a backend is provided, uses
+    LLM-based evaluation to rank candidates.
+    P-P13: Returns FAIL when results are empty or all candidates failed.
     """
 
     _STATUS_RANK: dict[str, int] = {
@@ -849,6 +937,9 @@ class FanInHandler:
         "fail": 3,
     }
 
+    def __init__(self, backend: CodergenBackend | None = None) -> None:
+        self._backend = backend
+
     async def execute(
         self,
         node: PipelineNode,
@@ -856,14 +947,51 @@ class FanInHandler:
         graph: Pipeline | None = None,
         logs_root: Path | None = None,
     ) -> NodeResult:
+        """Consolidate parallel results and select the best candidate.
+
+        Args:
+            node: The fan-in node. When ``prompt`` is set and a backend
+                is configured, LLM-based evaluation is used.
+            context: Shared pipeline context (reads ``parallel.results``).
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
+
+        Returns:
+            A :class:`NodeResult` with the selected best candidate.
+        """
         results = context.get("parallel.results", {})
+
+        # P-P13: Empty results → FAIL per spec
         if not results:
             return NodeResult(
-                status=OutcomeStatus.SUCCESS,
-                output="No parallel results to consolidate",
+                status=OutcomeStatus.FAIL,
+                failure_reason="No parallel results to evaluate",
             )
 
-        # H12: Rank by status priority
+        # P-P13: Check if ALL candidates failed
+        all_failed = True
+        for branch_data in results.values():
+            if isinstance(branch_data, dict) and "status" in branch_data:
+                if branch_data["status"] != "fail":
+                    all_failed = False
+                    break
+            else:
+                # Non-dict data treated as success
+                all_failed = False
+                break
+
+        if all_failed:
+            return NodeResult(
+                status=OutcomeStatus.FAIL,
+                failure_reason="All candidates failed",
+            )
+
+        # P-P12: LLM-based evaluation when node.prompt is set
+        prompt = node.attributes.get("prompt", "") or node.prompt
+        if prompt and self._backend:
+            return await self._llm_evaluate(node, prompt, results, context)
+
+        # H12: Heuristic — rank by status priority
         best_id = None
         best_output = None
         best_rank = 999
@@ -886,6 +1014,56 @@ class FanInHandler:
             output=best_output,
             context_updates={"parallel.fan_in.best_id": best_id},
         )
+
+    async def _llm_evaluate(
+        self,
+        node: PipelineNode,
+        prompt: str,
+        results: dict[str, Any],
+        context: PipelineContext,
+    ) -> NodeResult:
+        """Use LLM backend to evaluate and rank candidates.
+
+        Args:
+            node: The fan-in node.
+            prompt: Evaluation prompt from the node.
+            results: Parallel branch results to evaluate.
+            context: Shared pipeline context.
+
+        Returns:
+            A :class:`NodeResult` with the LLM-selected best candidate.
+        """
+        results_text = json.dumps(results, indent=2, default=str)
+        full_prompt = f"{prompt}\n\nCandidate results:\n{results_text}"
+
+        try:
+            assert self._backend is not None
+            evaluation = await self._backend.run(node, full_prompt, context)
+
+            # Try to identify best_id from evaluation text
+            best_id = None
+            for branch_id in results:
+                if branch_id in evaluation:
+                    best_id = branch_id
+                    break
+            if best_id is None:
+                best_id = next(iter(results))
+
+            return NodeResult(
+                status=OutcomeStatus.SUCCESS,
+                output=evaluation,
+                context_updates={
+                    "parallel.fan_in.best_id": best_id,
+                    "parallel.fan_in.evaluation": evaluation,
+                },
+                notes=f"LLM evaluation selected: {best_id}",
+            )
+        except Exception as exc:
+            logger.exception("FanIn LLM evaluation failed")
+            return NodeResult(
+                status=OutcomeStatus.FAIL,
+                failure_reason=f"LLM evaluation failed: {exc}",
+            )
 
 
 class ToolHandler:
@@ -973,17 +1151,23 @@ class ToolHandler:
 
 
 class ManagerLoopHandler:
-    """Iterative refinement loop with supervisor pattern.
+    """Orchestrates sprint-based iteration by supervising a child pipeline.
 
-    Executes a sub-pipeline (identified by the ``sub_pipeline`` attribute)
-    repeatedly until a ``done_condition`` evaluates to True,
-    ``max_iterations`` is reached, or the sub-pipeline fails repeatedly
-    (H14: ``max_consecutive_failures``).
+    Per spec §4.11: observes child telemetry, evaluates progress via
+    stop conditions, and optionally steers the child through intervention.
 
-    After each iteration the handler evaluates the sub-pipeline outcome,
-    sets ``_supervisor_feedback`` and ``_supervisor_assessment`` context
-    keys for feedback between iterations, and writes ``status.json``
-    when ``logs_root`` is provided (#12).
+    Supports two operation modes:
+
+    1. **Child pipeline mode** (spec §4.11): Uses ``child_dotfile``,
+       ``manager.poll_interval``, ``manager.max_cycles``,
+       ``manager.stop_condition``, and ``manager.actions``
+       (observe/steer/wait).
+    2. **Legacy sub-pipeline mode**: Uses ``sub_pipeline``,
+       ``max_iterations``, ``done_condition`` for backward
+       compatibility.
+
+    The mode is auto-detected: if ``child_dotfile`` is present (on the
+    node or in the graph metadata), child pipeline mode is used.
     """
 
     def __init__(self, engine: Any = None) -> None:
@@ -996,7 +1180,159 @@ class ManagerLoopHandler:
         graph: Pipeline | None = None,
         logs_root: Path | None = None,
     ) -> NodeResult:
-        """Run an iterative refinement loop on a sub-pipeline.
+        """Run a manager loop on a child or sub-pipeline.
+
+        Auto-detects mode based on the presence of ``child_dotfile``.
+
+        Args:
+            node: The manager loop node.
+            context: Shared pipeline context.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
+
+        Returns:
+            A :class:`NodeResult` indicating how many cycles/iterations
+            ran and whether the stop/done condition was met.
+        """
+        child_dotfile = node.attributes.get("child_dotfile", "")
+        if not child_dotfile and graph is not None:
+            child_dotfile = graph.metadata.get("stack.child_dotfile", "")
+
+        if child_dotfile:
+            return await self._execute_child_pipeline(
+                node, context, graph, logs_root, child_dotfile
+            )
+        return await self._execute_legacy(node, context, graph, logs_root)
+
+    # ------------------------------------------------------------------
+    # Child pipeline mode (spec §4.11)
+    # ------------------------------------------------------------------
+
+    async def _execute_child_pipeline(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None,
+        logs_root: Path | None,
+        child_dotfile: str,
+    ) -> NodeResult:
+        """Execute in child pipeline mode per spec §4.11.
+
+        Args:
+            node: The manager loop node.
+            context: Shared pipeline context.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
+            child_dotfile: Path to the child pipeline DOT file.
+
+        Returns:
+            A :class:`NodeResult` for the child pipeline supervision.
+        """
+        from attractor.pipeline.models import parse_duration
+
+        poll_interval = parse_duration(
+            node.attributes.get("manager.poll_interval", "45s")
+        )
+        max_cycles = int(node.attributes.get("manager.max_cycles", 1000))
+        stop_condition = node.attributes.get("manager.stop_condition", "")
+        actions = [
+            a.strip()
+            for a in node.attributes.get(
+                "manager.actions", "observe,wait"
+            ).split(",")
+        ]
+
+        if self._engine is None:
+            return NodeResult(
+                status=OutcomeStatus.FAIL,
+                failure_reason="No engine configured for manager_loop handler",
+            )
+
+        # Auto-start child if configured
+        autostart = node.attributes.get("stack.child_autostart", "true")
+        if autostart == "true" and hasattr(self._engine, "start_child_pipeline"):
+            await self._engine.start_child_pipeline(child_dotfile, context)
+
+        for cycle in range(1, max_cycles + 1):
+            context.set("_manager_cycle", cycle)
+
+            # Observe: ingest child telemetry
+            if "observe" in actions and hasattr(self._engine, "observe_child"):
+                await self._engine.observe_child(context)
+
+            # Steer: inject context into child
+            if "steer" in actions and hasattr(self._engine, "steer_child"):
+                await self._engine.steer_child(context, node)
+
+            # Check child status
+            child_status = context.get_string("stack.child.status", "")
+            if child_status in ("completed", "failed"):
+                child_outcome = context.get_string(
+                    "stack.child.outcome", ""
+                )
+                if child_outcome == "success" or (
+                    child_status == "completed" and child_outcome != "fail"
+                ):
+                    if logs_root is not None:
+                        _write_status_file(logs_root, node, "success")
+                    return NodeResult(
+                        status=OutcomeStatus.SUCCESS,
+                        output=(
+                            f"Child pipeline completed after {cycle} cycles"
+                        ),
+                        context_updates={"_manager_cycles": cycle},
+                        notes="Child completed",
+                    )
+                if child_status == "failed":
+                    reason = "Child pipeline failed"
+                    if logs_root is not None:
+                        _write_status_file(logs_root, node, "fail", reason)
+                    return NodeResult(
+                        status=OutcomeStatus.FAIL,
+                        failure_reason=reason,
+                        context_updates={"_manager_cycles": cycle},
+                    )
+
+            # Evaluate stop condition
+            if stop_condition and evaluate_condition(
+                stop_condition, context
+            ):
+                if logs_root is not None:
+                    _write_status_file(logs_root, node, "success")
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    output=(
+                        f"Stop condition satisfied after {cycle} cycles"
+                    ),
+                    context_updates={"_manager_cycles": cycle},
+                    notes="Stop condition satisfied",
+                )
+
+            # Wait: sleep for poll_interval
+            if "wait" in actions:
+                await asyncio.sleep(poll_interval)
+
+        reason = f"Max cycles exceeded ({max_cycles})"
+        if logs_root is not None:
+            _write_status_file(logs_root, node, "fail", reason)
+        return NodeResult(
+            status=OutcomeStatus.FAIL,
+            failure_reason=reason,
+            context_updates={"_manager_cycles": max_cycles},
+        )
+
+    # ------------------------------------------------------------------
+    # Legacy sub-pipeline mode (backward compat)
+    # ------------------------------------------------------------------
+
+    async def _execute_legacy(
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None,
+        logs_root: Path | None,
+    ) -> NodeResult:
+        """Legacy sub-pipeline execution mode.
 
         Args:
             node: The manager loop node with ``sub_pipeline``,

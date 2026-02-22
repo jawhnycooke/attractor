@@ -33,6 +33,7 @@ from attractor.llm.models import (
     RateLimitInfo,
     Request,
     Response,
+    ResponseFormat,
     Role,
     StepResult,
     StreamEvent,
@@ -111,7 +112,7 @@ async def generate_object(
     strict: bool = True,
     client: LLMClient | None = None,
     **kwargs: Any,
-) -> dict[str, Any]:
+) -> GenerateResult:
     """Module-level generate_object using the default client."""
     c = client or get_default_client()
     return await c.generate_object(
@@ -124,6 +125,28 @@ async def generate_object(
     )
 
 
+async def stream_object(
+    prompt: str | list[Message],
+    model: str,
+    schema: dict[str, Any],
+    schema_name: str = "response",
+    strict: bool = True,
+    client: LLMClient | None = None,
+    **kwargs: Any,
+) -> AsyncIterator[dict[str, Any]]:
+    """Module-level stream_object using the default client."""
+    c = client or get_default_client()
+    async for obj in c.stream_object(
+        prompt,
+        model,
+        schema=schema,
+        schema_name=schema_name,
+        strict=strict,
+        **kwargs,
+    ):
+        yield obj
+
+
 __all__ = [
     "LLMClient",
     "ToolExecutor",
@@ -133,6 +156,7 @@ __all__ = [
     "generate",
     "stream",
     "generate_object",
+    "stream_object",
     # Streaming
     "StreamResult",
     # Catalog
@@ -167,6 +191,7 @@ __all__ = [
     "RateLimitInfo",
     "Request",
     "Response",
+    "ResponseFormat",
     "Role",
     "StepResult",
     "StreamEvent",

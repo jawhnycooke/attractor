@@ -507,15 +507,15 @@ All items ✅ PASS
 | 20 | A-C05 | Agent | `ExecResult.duration_ms` | §4.2 (line 751) | ✅ Fixed — `duration_ms: int` field, populated via `time.monotonic()` |
 | 21 | A-C02 | Agent | `SystemTurn` type | §2.4 (line 204) | ✅ Fixed — `SystemTurn` dataclass with `content`/`timestamp`, added to `Turn` union |
 
-### Tier 4 — Low Priority / Optional
+### Tier 4 — Low Priority / Optional ✅ ALL FIXED (2026-02-22, parallel agent team)
 
-| # | Gap ID | Subsystem | Description | Spec Section |
-|---|---|---|---|---|
-| 22 | P-P11 | Pipeline | `k_of_n`, `quorum`, `fail_fast`, `ignore` policies | §4.8 (line 796) |
-| 23 | P-P12 | Pipeline | LLM-based evaluation in FanInHandler | §4.9 (line 856) |
-| 24 | P-C11 | Pipeline | Rearchitect ManagerLoopHandler | §4.11 (line 920) |
-| 25 | P-C09 | Pipeline | HTTP server mode (optional per spec) | §9.5 (line 1590) |
-| 26 | L-C09/C10 | LLM | `generate_object()` / `stream_object()` | §4.5/4.6 (line 959/991) |
+| # | Gap ID | Subsystem | Description | Spec Section | Status |
+|---|---|---|---|---|---|
+| 22 | P-P11 | Pipeline | `k_of_n`, `quorum`, `fail_fast`, `ignore` policies | §4.8 (line 796) | ✅ Fixed — 4 join policies + 3 error policies with `fail_fast` task cancellation |
+| 23 | P-P12 | Pipeline | LLM-based evaluation in FanInHandler | §4.9 (line 856) | ✅ Fixed — LLM evaluation when `node.prompt` set, also fixed P-P13 (FAIL on empty) |
+| 24 | P-C11 | Pipeline | Rearchitect ManagerLoopHandler | §4.11 (line 920) | ✅ Fixed — child pipeline mode with `child_dotfile`, observe/steer/wait cycle, legacy compat |
+| 25 | P-C09 | Pipeline | HTTP server mode (optional per spec) | §9.5 (line 1590) | ✅ Fixed — stdlib async HTTP server with submit/status/events/cancel/validate endpoints |
+| 26 | L-C09/C10 | LLM | `generate_object()` / `stream_object()` | §4.5/4.6 (line 959/991) | ✅ Fixed — `generate_object()` returns `GenerateResult` with `.output`, `stream_object()` async generator, `ResponseFormat` model |
 
 ---
 

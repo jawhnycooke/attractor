@@ -839,13 +839,15 @@ class TestConditionalHandler:
 class TestFanInHandler:
     @pytest.mark.asyncio
     async def test_fan_in_no_results(self) -> None:
+        """P-P13: Empty parallel results → FAIL per spec §4.9."""
         handler = FanInHandler()
         node = _make_node(handler_type="parallel.fan_in")
         ctx = PipelineContext()
 
         result = await handler.execute(node, ctx)
-        assert result.success is True
-        assert "No parallel results" in result.output
+        assert result.success is False
+        assert result.status == OutcomeStatus.FAIL
+        assert "No parallel results" in (result.failure_reason or "")
 
     @pytest.mark.asyncio
     async def test_fan_in_with_results(self) -> None:
@@ -1884,3 +1886,1067 @@ class TestWaitHumanQuestionAnswer:
         # Verify inform was called
         assert len(interviewer.messages) == 1
         assert "gate" in interviewer.messages[0]
+
+
+# ---------------------------------------------------------------------------
+# P-P11: ParallelHandler join/error policies (spec §4.8)
+# ---------------------------------------------------------------------------
+
+
+def _make_parallel_pipeline(
+    branch_handlers: dict[str, NodeHandler],
+    registry: HandlerRegistry | None = None,
+) -> tuple[ParallelHandler, Pipeline, HandlerRegistry]:
+    """Helper to build a parallel pipeline with custom branch handlers.
+
+    Args:
+        branch_handlers: Mapping of branch name to handler instance.
+        registry: Optional registry; created if not provided.
+
+    Returns:
+        Tuple of (ParallelHandler, Pipeline, HandlerRegistry).
+    """
+    if registry is None:
+        registry = HandlerRegistry()
+
+    nodes: dict[str, PipelineNode] = {
+        "parallel_node": PipelineNode(
+            name="parallel_node", handler_type="parallel"
+        ),
+    }
+    edges: list[PipelineEdge] = []
+
+    for name, handler in branch_handlers.items():
+        handler_type = f"branch_{name}"
+        registry.register(handler_type, handler)
+        nodes[name] = PipelineNode(
+            name=name, handler_type=handler_type
+        )
+        edges.append(PipelineEdge(source="parallel_node", target=name))
+
+    pipeline = Pipeline(name="test", nodes=nodes, edges=edges)
+    parallel = ParallelHandler(registry=registry, pipeline=pipeline)
+    return parallel, pipeline, registry
+
+
+class _SuccessHandler:
+    """Handler that always succeeds with configurable output."""
+
+    def __init__(self, output: str = "ok", delay: float = 0.0) -> None:
+        self._output = output
+        self._delay = delay
+
+    async def execute(self, node, context, graph=None, logs_root=None):
+        if self._delay > 0:
+            await asyncio.sleep(self._delay)
+        return NodeResult(
+            status=OutcomeStatus.SUCCESS,
+            output=self._output,
+        )
+
+
+class _FailHandler:
+    """Handler that always fails with configurable reason."""
+
+    def __init__(self, reason: str = "failed", delay: float = 0.0) -> None:
+        self._reason = reason
+        self._delay = delay
+
+    async def execute(self, node, context, graph=None, logs_root=None):
+        if self._delay > 0:
+            await asyncio.sleep(self._delay)
+        return NodeResult(
+            status=OutcomeStatus.FAIL,
+            failure_reason=self._reason,
+        )
+
+
+class TestParallelJoinPolicies:
+    """P-P11: Tests for all 4 join policies."""
+
+    @pytest.mark.asyncio
+    async def test_wait_all_all_succeed(self) -> None:
+        """wait_all: All branches succeed → SUCCESS."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler("a_out"),
+            "b": _SuccessHandler("b_out"),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="wait_all",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.output["a"] == "a_out"
+        assert result.output["b"] == "b_out"
+
+    @pytest.mark.asyncio
+    async def test_wait_all_one_fails(self) -> None:
+        """wait_all: One branch fails → PARTIAL_SUCCESS."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler("a_out"),
+            "b": _FailHandler("b_failed"),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="wait_all",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.PARTIAL_SUCCESS
+        assert result.success is True  # PARTIAL_SUCCESS is still .success
+
+    @pytest.mark.asyncio
+    async def test_k_of_n_satisfied(self) -> None:
+        """k_of_n: 2 of 3 succeed with k=2 → SUCCESS."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _SuccessHandler(),
+            "c": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="k_of_n", k=2,
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_k_of_n_not_satisfied(self) -> None:
+        """k_of_n: 1 of 3 succeed with k=2 → FAIL."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _FailHandler(),
+            "c": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="k_of_n", k=2,
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.FAIL
+
+    @pytest.mark.asyncio
+    async def test_k_of_n_exact_k(self) -> None:
+        """k_of_n: Exactly k succeed → SUCCESS."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _FailHandler(),
+            "c": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="k_of_n", k=1,
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_first_success_one_succeeds(self) -> None:
+        """first_success: At least one succeeds → SUCCESS."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _FailHandler(),
+            "b": _SuccessHandler("winner"),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="first_success",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_first_success_all_fail(self) -> None:
+        """first_success: All fail → FAIL."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _FailHandler(),
+            "b": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="first_success",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.FAIL
+
+    @pytest.mark.asyncio
+    async def test_quorum_majority_succeed(self) -> None:
+        """quorum: 2 of 3 succeed → SUCCESS (majority)."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _SuccessHandler(),
+            "c": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="quorum",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_quorum_minority_succeed(self) -> None:
+        """quorum: 1 of 3 succeed → FAIL (not majority)."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _FailHandler(),
+            "c": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="quorum",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.FAIL
+
+    @pytest.mark.asyncio
+    async def test_quorum_even_split_fails(self) -> None:
+        """quorum: 1 of 2 succeed → FAIL (not strict majority)."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="quorum",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.FAIL
+
+    @pytest.mark.asyncio
+    async def test_k_of_n_configurable_via_attribute(self) -> None:
+        """k_of_n: k value is read from node attribute."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _SuccessHandler(),
+            "c": _SuccessHandler(),
+            "d": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            join_policy="k_of_n", k=3,
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.SUCCESS
+
+
+class TestParallelErrorPolicies:
+    """P-P11: Tests for all 3 error policies."""
+
+    @pytest.mark.asyncio
+    async def test_continue_runs_all_branches(self) -> None:
+        """continue: All branches run even if some fail."""
+        call_count = 0
+
+        class CountingSuccessHandler:
+            async def execute(self, node, context, graph=None, logs_root=None):
+                nonlocal call_count
+                call_count += 1
+                return NodeResult(status=OutcomeStatus.SUCCESS, output="ok")
+
+        class CountingFailHandler:
+            async def execute(self, node, context, graph=None, logs_root=None):
+                nonlocal call_count
+                call_count += 1
+                return NodeResult(
+                    status=OutcomeStatus.FAIL, failure_reason="fail"
+                )
+
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": CountingSuccessHandler(),
+            "b": CountingFailHandler(),
+            "c": CountingSuccessHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            error_policy="continue",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert call_count == 3  # All 3 branches ran
+
+    @pytest.mark.asyncio
+    async def test_fail_fast_cancels_remaining(self) -> None:
+        """fail_fast: Remaining branches are cancelled on first failure."""
+        executed_branches: list[str] = []
+
+        class TrackingSuccessHandler:
+            def __init__(self, name: str) -> None:
+                self._name = name
+
+            async def execute(self, node, context, graph=None, logs_root=None):
+                # Use a delay to ensure the fast-fail branch finishes first
+                await asyncio.sleep(0.1)
+                executed_branches.append(self._name)
+                return NodeResult(status=OutcomeStatus.SUCCESS, output="ok")
+
+        class ImmediateFailHandler:
+            async def execute(self, node, context, graph=None, logs_root=None):
+                executed_branches.append("fail")
+                return NodeResult(
+                    status=OutcomeStatus.FAIL, failure_reason="fail"
+                )
+
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": TrackingSuccessHandler("a"),
+            "b": ImmediateFailHandler(),
+            "c": TrackingSuccessHandler("c"),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            error_policy="fail_fast",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        # The fail branch should have executed
+        assert "fail" in executed_branches
+        # Result should reflect the failure
+        assert result.status != OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_fail_fast_immediate_failure_stops_execution(self) -> None:
+        """fail_fast: A fast-failing branch prevents slow branches from completing."""
+        slow_completed = False
+
+        class SlowHandler:
+            async def execute(self, node, context, graph=None, logs_root=None):
+                nonlocal slow_completed
+                await asyncio.sleep(5.0)  # Very slow
+                slow_completed = True
+                return NodeResult(status=OutcomeStatus.SUCCESS, output="ok")
+
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "fast_fail": _FailHandler(),
+            "slow": SlowHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            error_policy="fail_fast",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert not slow_completed  # Slow branch should have been cancelled
+
+    @pytest.mark.asyncio
+    async def test_ignore_treats_failures_as_skipped(self) -> None:
+        """ignore: Failures are excluded from outputs and don't count as fails."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler("a_out"),
+            "b": _FailHandler("b_failed"),
+            "c": _SuccessHandler("c_out"),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            error_policy="ignore", join_policy="wait_all",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        # With ignore policy, failures don't count → wait_all sees 0 failures
+        assert result.status == OutcomeStatus.SUCCESS
+        # Failed branch output should be excluded
+        assert "b" not in result.output
+        assert result.output["a"] == "a_out"
+        assert result.output["c"] == "c_out"
+
+    @pytest.mark.asyncio
+    async def test_ignore_with_quorum(self) -> None:
+        """ignore + quorum: Only successful branches count for quorum."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _FailHandler(),
+            "c": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            error_policy="ignore", join_policy="quorum",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        # With ignore, fail_count=0, so total=1 (only success_count),
+        # 1 > 0.5 → SUCCESS
+        assert result.status == OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_continue_with_k_of_n(self) -> None:
+        """continue + k_of_n: Normal failure counting with k threshold."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler(),
+            "b": _SuccessHandler(),
+            "c": _FailHandler(),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+            error_policy="continue", join_policy="k_of_n", k=2,
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert result.status == OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_parallel_results_stored_in_context(self) -> None:
+        """Parallel results should be stored in context_updates."""
+        handler, pipeline, _ = _make_parallel_pipeline({
+            "a": _SuccessHandler("output_a"),
+            "b": _SuccessHandler("output_b"),
+        })
+        node = _make_node(
+            name="parallel_node", handler_type="parallel",
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=pipeline)
+        assert "parallel.results" in result.context_updates
+        pr = result.context_updates["parallel.results"]
+        assert pr["a"] == "output_a"
+        assert pr["b"] == "output_b"
+
+
+# ---------------------------------------------------------------------------
+# P-P12: FanInHandler LLM-based evaluation (spec §4.9)
+# ---------------------------------------------------------------------------
+
+
+class TestFanInLLMEvaluation:
+    """P-P12: FanIn with LLM-based evaluation when node.prompt is set."""
+
+    @pytest.mark.asyncio
+    async def test_llm_evaluation_with_backend(self) -> None:
+        """P-P12: When prompt is set and backend exists, LLM evaluates."""
+
+        class EvalBackend:
+            async def run(self, node, prompt, context):
+                # Simulate LLM picking branch_b as best
+                return "branch_b is the best candidate"
+
+        handler = FanInHandler(backend=EvalBackend())
+        node = PipelineNode(
+            name="fan_in",
+            handler_type="parallel.fan_in",
+            prompt="Select the best implementation",
+        )
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "branch_a": "output_a",
+                "branch_b": "output_b",
+            }
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.context_updates["parallel.fan_in.best_id"] == "branch_b"
+        assert "parallel.fan_in.evaluation" in result.context_updates
+        assert "LLM evaluation selected" in (result.notes or "")
+
+    @pytest.mark.asyncio
+    async def test_llm_evaluation_prompt_includes_results(self) -> None:
+        """P-P12: The LLM receives both prompt and candidate results."""
+        received_prompts: list[str] = []
+
+        class CapturingBackend:
+            async def run(self, node, prompt, context):
+                received_prompts.append(prompt)
+                return "branch_a is best"
+
+        handler = FanInHandler(backend=CapturingBackend())
+        node = PipelineNode(
+            name="fan_in",
+            handler_type="parallel.fan_in",
+            prompt="Rank these candidates",
+        )
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "branch_a": "code solution A",
+                "branch_b": "code solution B",
+            }
+        })
+        await handler.execute(node, ctx)
+        assert len(received_prompts) == 1
+        assert "Rank these candidates" in received_prompts[0]
+        assert "branch_a" in received_prompts[0]
+        assert "branch_b" in received_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_llm_evaluation_no_match_falls_back_to_first(self) -> None:
+        """P-P12: If LLM response doesn't mention any branch, use first."""
+
+        class VagueBackend:
+            async def run(self, node, prompt, context):
+                return "The results look great overall"
+
+        handler = FanInHandler(backend=VagueBackend())
+        node = PipelineNode(
+            name="fan_in",
+            handler_type="parallel.fan_in",
+            prompt="Evaluate",
+        )
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "alpha": "out_a",
+                "beta": "out_b",
+            }
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        # Falls back to first key
+        assert result.context_updates["parallel.fan_in.best_id"] == "alpha"
+
+    @pytest.mark.asyncio
+    async def test_llm_evaluation_failure_returns_fail(self) -> None:
+        """P-P12: LLM backend error → FAIL result."""
+
+        class FailingBackend:
+            async def run(self, node, prompt, context):
+                raise RuntimeError("LLM unavailable")
+
+        handler = FanInHandler(backend=FailingBackend())
+        node = PipelineNode(
+            name="fan_in",
+            handler_type="parallel.fan_in",
+            prompt="Evaluate",
+        )
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {"a": "out_a"}
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.FAIL
+        assert "LLM evaluation failed" in (result.failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_heuristic_used_when_no_prompt(self) -> None:
+        """P-P12: Without prompt, heuristic selection is used."""
+        handler = FanInHandler(backend=None)
+        node = _make_node(handler_type="parallel.fan_in")
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "fail_branch": {"status": "fail", "output": "bad"},
+                "ok_branch": {"status": "success", "output": "good"},
+            }
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.context_updates["parallel.fan_in.best_id"] == "ok_branch"
+
+    @pytest.mark.asyncio
+    async def test_heuristic_used_when_no_backend(self) -> None:
+        """P-P12: Prompt set but no backend → falls back to heuristic."""
+        handler = FanInHandler(backend=None)
+        node = PipelineNode(
+            name="fan_in",
+            handler_type="parallel.fan_in",
+            prompt="This prompt is ignored without backend",
+        )
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "a": {"status": "success", "output": "good"},
+                "b": {"status": "fail", "output": "bad"},
+            }
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.context_updates["parallel.fan_in.best_id"] == "a"
+
+    @pytest.mark.asyncio
+    async def test_prompt_from_attribute_used(self) -> None:
+        """P-P12: Prompt from node.attributes['prompt'] is also checked."""
+        received_prompts: list[str] = []
+
+        class CapturingBackend:
+            async def run(self, node, prompt, context):
+                received_prompts.append(prompt)
+                return "a is best"
+
+        handler = FanInHandler(backend=CapturingBackend())
+        node = _make_node(
+            handler_type="parallel.fan_in",
+            prompt="Evaluate from attribute",
+        )
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {"a": "out_a"}
+        })
+        await handler.execute(node, ctx)
+        assert len(received_prompts) == 1
+        assert "Evaluate from attribute" in received_prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# P-P13: FanInHandler FAIL on all-failed / empty results (spec §4.9)
+# ---------------------------------------------------------------------------
+
+
+class TestFanInFailOnAllFailed:
+    """P-P13: FanIn returns FAIL when results are empty or all failed."""
+
+    @pytest.mark.asyncio
+    async def test_empty_results_returns_fail(self) -> None:
+        """P-P13: Empty parallel results → FAIL."""
+        handler = FanInHandler()
+        node = _make_node(handler_type="parallel.fan_in")
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.FAIL
+        assert result.success is False
+        assert "No parallel results" in (result.failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_all_candidates_failed_returns_fail(self) -> None:
+        """P-P13: All candidates with status=fail → FAIL."""
+        handler = FanInHandler()
+        node = _make_node(handler_type="parallel.fan_in")
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "branch_a": {"status": "fail", "output": "error_a"},
+                "branch_b": {"status": "fail", "output": "error_b"},
+            }
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.FAIL
+        assert result.success is False
+        assert "All candidates failed" in (result.failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_one_success_among_failures_returns_success(self) -> None:
+        """P-P13: At least one success among failures → SUCCESS."""
+        handler = FanInHandler()
+        node = _make_node(handler_type="parallel.fan_in")
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "branch_a": {"status": "fail", "output": "error"},
+                "branch_b": {"status": "success", "output": "good"},
+                "branch_c": {"status": "fail", "output": "error"},
+            }
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.success is True
+        assert result.context_updates["parallel.fan_in.best_id"] == "branch_b"
+
+    @pytest.mark.asyncio
+    async def test_non_dict_results_treated_as_success(self) -> None:
+        """P-P13: Non-dict results (plain strings) are not treated as failures."""
+        handler = FanInHandler()
+        node = _make_node(handler_type="parallel.fan_in")
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "branch_a": "plain text output",
+            }
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_partial_success_not_treated_as_fail(self) -> None:
+        """P-P13: partial_success status is not 'all failed'."""
+        handler = FanInHandler()
+        node = _make_node(handler_type="parallel.fan_in")
+        ctx = PipelineContext.from_dict({
+            "parallel.results": {
+                "branch_a": {"status": "partial_success", "output": "partial"},
+                "branch_b": {"status": "fail", "output": "error"},
+            }
+        })
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.context_updates["parallel.fan_in.best_id"] == "branch_a"
+
+
+# ---------------------------------------------------------------------------
+# P-C11: ManagerLoopHandler child pipeline mode (spec §4.11)
+# ---------------------------------------------------------------------------
+
+
+class TestManagerLoopChildPipeline:
+    """P-C11: ManagerLoopHandler with child_dotfile, poll_interval, etc."""
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_mode_detected(self) -> None:
+        """P-C11: child_dotfile attribute triggers child pipeline mode."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+        engine.observe_child = AsyncMock()
+
+        # Simulate child completing on first observe
+        async def mock_observe(context):
+            context.set("stack.child.status", "completed")
+            context.set("stack.child.outcome", "success")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "0.01s",
+                "manager.max_cycles": "10",
+                "manager.actions": "observe",
+            },
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert "Child pipeline completed" in result.output
+        assert result.context_updates["_manager_cycles"] == 1
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_autostart(self) -> None:
+        """P-C11: Child pipeline is auto-started when configured."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        # Complete immediately on first observe
+        async def mock_observe(context):
+            context.set("stack.child.status", "completed")
+            context.set("stack.child.outcome", "success")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "stack.child_autostart": "true",
+                "manager.poll_interval": "0.01s",
+                "manager.max_cycles": "5",
+                "manager.actions": "observe",
+            },
+        )
+        ctx = PipelineContext()
+        await handler.execute(node, ctx)
+        engine.start_child_pipeline.assert_called_once_with("child.dot", ctx)
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_no_autostart(self) -> None:
+        """P-C11: Auto-start is skipped when set to 'false'."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        async def mock_observe(context):
+            context.set("stack.child.status", "completed")
+            context.set("stack.child.outcome", "success")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "stack.child_autostart": "false",
+                "manager.poll_interval": "0.01s",
+                "manager.max_cycles": "5",
+                "manager.actions": "observe",
+            },
+        )
+        ctx = PipelineContext()
+        await handler.execute(node, ctx)
+        engine.start_child_pipeline.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_failure(self) -> None:
+        """P-C11: Child failure → FAIL result."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        async def mock_observe(context):
+            context.set("stack.child.status", "failed")
+            context.set("stack.child.outcome", "fail")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "0.01s",
+                "manager.max_cycles": "10",
+                "manager.actions": "observe",
+            },
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.FAIL
+        assert "Child pipeline failed" in (result.failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_stop_condition(self) -> None:
+        """P-C11: Stop condition triggers early exit."""
+        cycle_count = 0
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        async def mock_observe(context):
+            nonlocal cycle_count
+            cycle_count += 1
+            if cycle_count >= 3:
+                context.set("quality_met", "true")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "0.001s",
+                "manager.max_cycles": "100",
+                "manager.stop_condition": "quality_met = true",
+                "manager.actions": "observe,wait",
+            },
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert "Stop condition satisfied" in result.output
+        assert result.context_updates["_manager_cycles"] == 3
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_max_cycles_exceeded(self) -> None:
+        """P-C11: Exceeding max_cycles → FAIL."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+        engine.observe_child = AsyncMock()  # Never sets completion
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "0.001s",
+                "manager.max_cycles": "3",
+                "manager.actions": "observe,wait",
+            },
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.FAIL
+        assert "Max cycles exceeded" in (result.failure_reason or "")
+        assert result.context_updates["_manager_cycles"] == 3
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_steer_action(self) -> None:
+        """P-C11: Steer action invokes engine.steer_child."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+        engine.steer_child = AsyncMock()
+
+        steer_count = 0
+
+        async def mock_observe(context):
+            nonlocal steer_count
+            steer_count += 1
+            if steer_count >= 2:
+                context.set("stack.child.status", "completed")
+                context.set("stack.child.outcome", "success")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "0.001s",
+                "manager.max_cycles": "10",
+                "manager.actions": "observe,steer,wait",
+            },
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        # steer_child should have been called at least once
+        assert engine.steer_child.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_no_engine_fails(self) -> None:
+        """P-C11: No engine configured → FAIL."""
+        handler = ManagerLoopHandler(engine=None)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{"manager.max_cycles": "5"},
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.FAIL
+        assert "No engine" in (result.failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_child_dotfile_from_graph_metadata(self) -> None:
+        """P-C11: child_dotfile can come from graph metadata."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        async def mock_observe(context):
+            context.set("stack.child.status", "completed")
+            context.set("stack.child.outcome", "success")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            **{
+                "manager.poll_interval": "0.01s",
+                "manager.max_cycles": "5",
+                "manager.actions": "observe",
+            },
+        )
+        graph = Pipeline(
+            name="parent",
+            metadata={"stack.child_dotfile": "from_graph.dot"},
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, graph=graph)
+        assert result.status == OutcomeStatus.SUCCESS
+        engine.start_child_pipeline.assert_called_once_with(
+            "from_graph.dot", ctx
+        )
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_manager_cycle_context(self) -> None:
+        """P-C11: _manager_cycle is set in context for each cycle."""
+        cycles_seen: list[int] = []
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        async def mock_observe(context):
+            cycles_seen.append(context.get("_manager_cycle"))
+            if len(cycles_seen) >= 3:
+                context.set("stack.child.status", "completed")
+                context.set("stack.child.outcome", "success")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "0.001s",
+                "manager.max_cycles": "10",
+                "manager.actions": "observe,wait",
+            },
+        )
+        ctx = PipelineContext()
+        await handler.execute(node, ctx)
+        assert cycles_seen == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_writes_status_on_success(self, tmp_path) -> None:
+        """P-C11: Status file written on child success."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        async def mock_observe(context):
+            context.set("stack.child.status", "completed")
+            context.set("stack.child.outcome", "success")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "0.01s",
+                "manager.max_cycles": "5",
+                "manager.actions": "observe",
+            },
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, logs_root=tmp_path)
+        assert result.status == OutcomeStatus.SUCCESS
+        status_path = tmp_path / "test_node" / "status.json"
+        assert status_path.exists()
+        status = json.loads(status_path.read_text())
+        assert status["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_child_pipeline_writes_status_on_failure(self, tmp_path) -> None:
+        """P-C11: Status file written on child failure."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        async def mock_observe(context):
+            context.set("stack.child.status", "failed")
+            context.set("stack.child.outcome", "fail")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "0.01s",
+                "manager.max_cycles": "5",
+                "manager.actions": "observe",
+            },
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx, logs_root=tmp_path)
+        assert result.status == OutcomeStatus.FAIL
+        status_path = tmp_path / "test_node" / "status.json"
+        assert status_path.exists()
+        status = json.loads(status_path.read_text())
+        assert status["status"] == "fail"
+
+    @pytest.mark.asyncio
+    async def test_legacy_mode_still_works(self) -> None:
+        """P-C11: Legacy sub_pipeline mode is unaffected."""
+        engine = AsyncMock()
+        engine.run_sub_pipeline = AsyncMock()
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            sub_pipeline="inner",
+            max_iterations=2,
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+        engine.run_sub_pipeline.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_poll_interval_parsed_correctly(self) -> None:
+        """P-C11: poll_interval is parsed as a duration string."""
+        engine = AsyncMock()
+        engine.start_child_pipeline = AsyncMock()
+
+        call_count = 0
+
+        async def mock_observe(context):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                context.set("stack.child.status", "completed")
+                context.set("stack.child.outcome", "success")
+
+        engine.observe_child = mock_observe
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            child_dotfile="child.dot",
+            **{
+                "manager.poll_interval": "10ms",
+                "manager.max_cycles": "10",
+                "manager.actions": "observe,wait",
+            },
+        )
+        ctx = PipelineContext()
+        result = await handler.execute(node, ctx)
+        assert result.status == OutcomeStatus.SUCCESS
+        assert call_count == 2
