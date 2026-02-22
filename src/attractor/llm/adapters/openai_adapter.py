@@ -62,7 +62,7 @@ class OpenAIAdapter:
     than the older ``chat.completions`` choices array.
     """
 
-    _MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4")
+    _MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "codex-")
 
     def __init__(self, api_key: str | None = None) -> None:
         import openai

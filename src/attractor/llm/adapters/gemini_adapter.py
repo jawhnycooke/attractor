@@ -25,6 +25,7 @@ from attractor.llm.models import (
     FinishReason,
     ImageContent,
     Message,
+    ReasoningEffort,
     Request,
     Response,
     Role,
@@ -39,6 +40,12 @@ from attractor.llm.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+_THINKING_BUDGET = {
+    ReasoningEffort.LOW: 2048,
+    ReasoningEffort.MEDIUM: 8192,
+    ReasoningEffort.HIGH: 32768,
+}
 
 _FINISH_MAP: dict[str, FinishReason] = {
     "STOP": FinishReason("stop", raw="STOP"),
@@ -301,6 +308,19 @@ class GeminiAdapter:
             config["top_p"] = request.top_p
         if request.stop_sequences:
             config["stop_sequences"] = request.stop_sequences
+
+        # Structured output (response_format → response_mime_type + response_schema)
+        if request.response_format:
+            json_schema_block = request.response_format.get("json_schema", {})
+            schema = json_schema_block.get("schema", {})
+            if schema:
+                config["response_mime_type"] = "application/json"
+                config["response_schema"] = schema
+
+        # Reasoning effort → thinking_config
+        if request.reasoning_effort and "thinking_config" not in config:
+            budget = _THINKING_BUDGET.get(request.reasoning_effort, 8192)
+            config["thinking_config"] = {"thinking_budget": budget}
 
         tools = self._map_tools(request.tools)
         if tools:

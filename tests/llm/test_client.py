@@ -20,6 +20,7 @@ from attractor.llm.middleware import (
 from attractor.llm.models import (
     FinishReason,
     Message,
+    ReasoningEffort,
     Request,
     Response,
     RetryPolicy,
@@ -2588,3 +2589,330 @@ class TestResponseFormat:
         rf = ResponseFormat(type="json")
         d = rf.to_dict()
         assert d == {"type": "json"}
+
+
+# ---------------------------------------------------------------------------
+# Adapter-specific: OpenAI Codex model detection
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAICodexDetection:
+    """Tests for OpenAI adapter detecting codex- prefixed models."""
+
+    def test_codex_mini_latest_detected(self) -> None:
+        """OpenAI adapter should detect codex-mini-latest as an OpenAI model."""
+        from attractor.llm.adapters.openai_adapter import OpenAIAdapter
+
+        # Instantiation requires the openai SDK; test detect_model statically
+        assert OpenAIAdapter._MODEL_PREFIXES == ("gpt-", "o1", "o3", "o4", "codex-")
+
+    def test_codex_prefix_in_mock_adapter(self) -> None:
+        """MockAdapter with OpenAI prefixes should match codex- models."""
+        adapter = MockAdapter(
+            name="openai",
+            prefixes=("gpt-", "o1", "o3", "o4", "codex-"),
+        )
+        assert adapter.detect_model("codex-mini-latest") is True
+        assert adapter.detect_model("gpt-4o") is True
+        assert adapter.detect_model("claude-opus") is False
+
+
+# ---------------------------------------------------------------------------
+# Adapter-specific: Gemini structured output and reasoning effort
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiAdapterFeatures:
+    """Tests for Gemini adapter _build_kwargs: structured output and reasoning."""
+
+    def test_structured_output_maps_response_format(self) -> None:
+        """Gemini _build_kwargs should map response_format to response_mime_type + response_schema."""
+        from attractor.llm.adapters.gemini_adapter import GeminiAdapter
+
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        request = Request(
+            messages=[Message.user("test")],
+            model="gemini-3-pro-preview",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "test_schema",
+                    "schema": schema,
+                    "strict": True,
+                },
+            },
+        )
+
+        # Call _build_kwargs without constructing the full adapter (avoids SDK import)
+        # We test the logic by calling the method on a partially-constructed instance
+        adapter = GeminiAdapter.__new__(GeminiAdapter)
+        adapter._client = None  # type: ignore[assignment]
+        kwargs = adapter._build_kwargs(request)
+
+        config = kwargs.get("config", {})
+        assert config.get("response_mime_type") == "application/json"
+        assert config.get("response_schema") == schema
+
+    def test_reasoning_effort_maps_to_thinking_config(self) -> None:
+        """Gemini _build_kwargs should map reasoning_effort to thinking_config."""
+        from attractor.llm.adapters.gemini_adapter import GeminiAdapter, _THINKING_BUDGET
+
+        request = Request(
+            messages=[Message.user("test")],
+            model="gemini-3-pro-preview",
+            reasoning_effort=ReasoningEffort.HIGH,
+        )
+
+        adapter = GeminiAdapter.__new__(GeminiAdapter)
+        adapter._client = None  # type: ignore[assignment]
+        kwargs = adapter._build_kwargs(request)
+
+        config = kwargs.get("config", {})
+        assert "thinking_config" in config
+        assert config["thinking_config"]["thinking_budget"] == _THINKING_BUDGET[ReasoningEffort.HIGH]
+
+    def test_reasoning_effort_does_not_override_explicit_thinking_config(self) -> None:
+        """Provider-specific thinking_config should take precedence over reasoning_effort."""
+        from attractor.llm.adapters.gemini_adapter import GeminiAdapter
+
+        request = Request(
+            messages=[Message.user("test")],
+            model="gemini-3-pro-preview",
+            reasoning_effort=ReasoningEffort.HIGH,
+            provider_options={
+                "gemini": {
+                    "thinking_config": {"thinking_budget": 99999},
+                },
+            },
+        )
+
+        adapter = GeminiAdapter.__new__(GeminiAdapter)
+        adapter._client = None  # type: ignore[assignment]
+        kwargs = adapter._build_kwargs(request)
+
+        config = kwargs.get("config", {})
+        # Provider-specific override should win
+        assert config["thinking_config"]["thinking_budget"] == 99999
+
+
+# ---------------------------------------------------------------------------
+# Adapter-specific: Anthropic adaptive thinking
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicAdaptiveThinking:
+    """Tests for Anthropic adapter adaptive vs legacy thinking."""
+
+    def _make_adapter(self) -> Any:
+        """Create a bare AnthropicAdapter without SDK import."""
+        from attractor.llm.adapters.anthropic_adapter import AnthropicAdapter
+
+        adapter = AnthropicAdapter.__new__(AnthropicAdapter)
+        adapter._client = None  # type: ignore[assignment]
+        return adapter
+
+    def test_supports_adaptive_thinking_claude_4_6(self) -> None:
+        """Claude 4.6 models should support adaptive thinking."""
+        from attractor.llm.adapters.anthropic_adapter import AnthropicAdapter
+
+        assert AnthropicAdapter._supports_adaptive_thinking("claude-opus-4-6") is True
+        assert AnthropicAdapter._supports_adaptive_thinking("claude-sonnet-4-6") is True
+
+    def test_does_not_support_adaptive_thinking_older_models(self) -> None:
+        """Older Claude models should not support adaptive thinking."""
+        from attractor.llm.adapters.anthropic_adapter import AnthropicAdapter
+
+        assert AnthropicAdapter._supports_adaptive_thinking("claude-sonnet-4-5") is False
+        assert AnthropicAdapter._supports_adaptive_thinking("claude-opus-4-5") is False
+        assert AnthropicAdapter._supports_adaptive_thinking("claude-haiku-4-5") is False
+
+    def test_adaptive_thinking_for_4_6_model(self) -> None:
+        """_build_kwargs should produce adaptive thinking for claude-opus-4-6."""
+        adapter = self._make_adapter()
+
+        request = Request(
+            messages=[Message.user("test")],
+            model="claude-opus-4-6",
+            reasoning_effort=ReasoningEffort.MEDIUM,
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        assert kwargs["thinking"] == {"type": "adaptive"}
+        assert "output_config" in kwargs
+        assert kwargs["output_config"]["effort"] == "medium"
+
+    def test_legacy_thinking_for_4_5_model(self) -> None:
+        """_build_kwargs should produce legacy enabled thinking for claude-sonnet-4-5."""
+        adapter = self._make_adapter()
+
+        request = Request(
+            messages=[Message.user("test")],
+            model="claude-sonnet-4-5",
+            reasoning_effort=ReasoningEffort.HIGH,
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        assert kwargs["thinking"]["type"] == "enabled"
+        assert kwargs["thinking"]["budget_tokens"] == 32768
+        assert "output_config" not in kwargs or "effort" not in kwargs.get("output_config", {})
+
+    def test_combined_output_config_effort_and_format(self) -> None:
+        """When both reasoning_effort and response_format are set, output_config has both."""
+        adapter = self._make_adapter()
+
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        request = Request(
+            messages=[Message.user("test")],
+            model="claude-opus-4-6",
+            reasoning_effort=ReasoningEffort.HIGH,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "test",
+                    "schema": schema,
+                    "strict": True,
+                },
+            },
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        assert kwargs["thinking"] == {"type": "adaptive"}
+        assert "output_config" in kwargs
+        # Both effort and format should coexist in output_config
+        assert kwargs["output_config"]["effort"] == "high"
+        assert kwargs["output_config"]["format"]["type"] == "json_schema"
+        assert kwargs["output_config"]["format"]["schema"] == schema
+
+    def test_provider_thinking_override_still_wins(self) -> None:
+        """Explicit provider_options.anthropic.thinking should override reasoning_effort."""
+        adapter = self._make_adapter()
+
+        request = Request(
+            messages=[Message.user("test")],
+            model="claude-opus-4-6",
+            reasoning_effort=ReasoningEffort.HIGH,
+            provider_options={
+                "anthropic": {
+                    "thinking": {"type": "enabled", "budget_tokens": 50000},
+                },
+            },
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        # Provider-specific override should replace the adaptive thinking
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 50000}
+
+
+# ---------------------------------------------------------------------------
+# Catalog: new model entries
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogUpdates:
+    """Tests for updated model catalog entries."""
+
+    def test_codex_mini_latest_in_catalog(self) -> None:
+        """codex-mini-latest should be in the model catalog."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("codex-mini-latest")
+        assert info is not None
+        assert info.provider == "openai"
+        assert info.supports_vision is False
+        assert info.supports_reasoning is True
+
+    def test_gemini_2_5_pro_in_catalog(self) -> None:
+        """gemini-2.5-pro should be in the model catalog."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("gemini-2.5-pro")
+        assert info is not None
+        assert info.provider == "gemini"
+        assert info.context_window == 1_048_576
+
+    def test_gemini_2_5_flash_in_catalog(self) -> None:
+        """gemini-2.5-flash should be in the model catalog."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("gemini-2.5-flash")
+        assert info is not None
+        assert info.provider == "gemini"
+
+    def test_claude_opus_4_6_updated_output_tokens(self) -> None:
+        """claude-opus-4-6 should have updated max_output_tokens of 128k."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("claude-opus-4-6")
+        assert info is not None
+        assert info.max_output_tokens == 128_000
+
+    def test_claude_sonnet_4_5_updated_output_tokens(self) -> None:
+        """claude-sonnet-4-5 should have updated max_output_tokens of 64k."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("claude-sonnet-4-5")
+        assert info is not None
+        assert info.max_output_tokens == 64_000
+
+    def test_claude_sonnet_4_6_in_catalog(self) -> None:
+        """claude-sonnet-4-6 should be in the model catalog."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("claude-sonnet-4-6")
+        assert info is not None
+        assert info.provider == "anthropic"
+        assert info.max_output_tokens == 64_000
+
+    def test_claude_haiku_4_5_in_catalog(self) -> None:
+        """claude-haiku-4-5 should be in the model catalog."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("claude-haiku-4-5")
+        assert info is not None
+        assert info.provider == "anthropic"
+        assert info.input_cost_per_million == 1.0
+
+    def test_gpt_5_2_updated_context_window(self) -> None:
+        """gpt-5.2 should have context_window of 400k."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("gpt-5.2")
+        assert info is not None
+        assert info.context_window == 400_000
+
+    def test_gpt_5_2_codex_alias_changed(self) -> None:
+        """gpt-5.2-codex should use 'gpt-codex' alias (not 'codex')."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("gpt-codex")
+        assert info is not None
+        assert info.model_id == "gpt-5.2-codex"
+        # Old alias should not resolve to gpt-5.2-codex
+        old_info = get_model_info("codex")
+        assert old_info is None or old_info.model_id != "gpt-5.2-codex"
+
+    def test_o3_in_catalog(self) -> None:
+        """o3 should be in the model catalog."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("o3")
+        assert info is not None
+        assert info.provider == "openai"
+        assert info.supports_reasoning is True
+
+    def test_o4_mini_in_catalog(self) -> None:
+        """o4-mini should be in the model catalog."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("o4-mini")
+        assert info is not None
+        assert info.provider == "openai"
+
+    def test_gpt_4_1_no_reasoning(self) -> None:
+        """gpt-4.1 should not support reasoning."""
+        from attractor.llm.catalog import get_model_info
+
+        info = get_model_info("gpt-4.1")
+        assert info is not None
+        assert info.supports_reasoning is False
+        assert info.supports_vision is True

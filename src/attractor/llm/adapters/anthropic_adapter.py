@@ -86,6 +86,17 @@ class AnthropicAdapter:
         """
         return "anthropic"
 
+    @staticmethod
+    def _supports_adaptive_thinking(model: str) -> bool:
+        """Check if a model supports adaptive thinking mode.
+
+        Adaptive thinking (``thinking.type: "adaptive"`` with
+        ``output_config.effort``) is supported on Claude 4.6 models
+        (Opus 4.6, Sonnet 4.6). Older models require the legacy
+        ``thinking.type: "enabled"`` with ``budget_tokens``.
+        """
+        return "4-6" in model
+
     def detect_model(self, model: str) -> bool:
         """Check whether *model* belongs to this provider.
 
@@ -305,11 +316,18 @@ class AnthropicAdapter:
             kwargs["stop_sequences"] = request.stop_sequences
 
         if request.reasoning_effort:
-            budget = _THINKING_BUDGET.get(request.reasoning_effort, 8192)
-            kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": budget,
-            }
+            if self._supports_adaptive_thinking(request.model):
+                # Claude 4.6+ — use adaptive thinking with effort level
+                kwargs["thinking"] = {"type": "adaptive"}
+                output_config = kwargs.setdefault("output_config", {})
+                output_config["effort"] = request.reasoning_effort.value
+            else:
+                # Older models — legacy enabled thinking with budget
+                budget = _THINKING_BUDGET.get(request.reasoning_effort, 8192)
+                kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
 
         # Read provider_options
         if request.provider_options:
@@ -340,11 +358,10 @@ class AnthropicAdapter:
         if request.response_format:
             json_schema_block = request.response_format.get("json_schema", {})
             schema = json_schema_block.get("schema", {})
-            kwargs["output_config"] = {
-                "format": {
-                    "type": "json_schema",
-                    "schema": schema,
-                }
+            output_config = kwargs.setdefault("output_config", {})
+            output_config["format"] = {
+                "type": "json_schema",
+                "schema": schema,
             }
 
         # Auto-inject cache_control for prompt caching
