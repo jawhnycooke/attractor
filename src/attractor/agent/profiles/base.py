@@ -58,6 +58,15 @@ class ProviderProfile(Protocol):
         """Whether the provider supports parallel tool call execution."""
         ...
 
+    @property
+    def default_timeout_ms(self) -> int:
+        """Default shell command timeout in milliseconds.
+
+        Anthropic uses 120_000 (120s) per Claude Code conventions.
+        Other providers default to 10_000 (10s).
+        """
+        ...
+
     def provider_options(self) -> dict | None:
         """Return provider-specific configuration passed alongside requests.
 

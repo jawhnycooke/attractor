@@ -93,6 +93,11 @@ class OpenAIProfile:
         """Return True — OpenAI supports parallel tool call execution."""
         return True
 
+    @property
+    def default_timeout_ms(self) -> int:
+        """Return 10s default shell timeout."""
+        return 10_000
+
     def provider_options(self) -> dict | None:
         """Return OpenAI-specific options including reasoning config.
 

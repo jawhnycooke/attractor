@@ -9,6 +9,7 @@ from attractor.agent.tools.core_tools import (
     edit_file,
     glob_tool,
     grep_tool,
+    list_dir_tool,
     read_file,
     shell,
     write_file,
@@ -155,6 +156,62 @@ class TestGlob:
     async def test_glob_no_match(self, env, tmp_path) -> None:
         result = await glob_tool({"pattern": "*.rs"}, env)
         assert "No files matched" in result.output
+
+
+class TestListDir:
+    @pytest.mark.asyncio
+    async def test_list_dir_basic(self, env, tmp_path) -> None:
+        (tmp_path / "file_a.txt").write_text("a")
+        (tmp_path / "file_b.py").write_text("b")
+        (tmp_path / "subdir").mkdir()
+
+        result = await list_dir_tool({"path": str(tmp_path)}, env)
+        assert not result.is_error
+        assert "file_a.txt" in result.output
+        assert "file_b.py" in result.output
+        assert "subdir/" in result.output
+
+    @pytest.mark.asyncio
+    async def test_list_dir_shows_sizes(self, env, tmp_path) -> None:
+        (tmp_path / "sized.txt").write_text("hello world")
+        result = await list_dir_tool({"path": str(tmp_path)}, env)
+        assert not result.is_error
+        assert "bytes" in result.output
+
+    @pytest.mark.asyncio
+    async def test_list_dir_empty(self, env, tmp_path) -> None:
+        empty = tmp_path / "empty_dir"
+        empty.mkdir()
+        result = await list_dir_tool({"path": str(empty)}, env)
+        assert not result.is_error
+        assert "empty directory" in result.output
+
+    @pytest.mark.asyncio
+    async def test_list_dir_with_depth(self, env, tmp_path) -> None:
+        (tmp_path / "dir1").mkdir()
+        (tmp_path / "dir1" / "nested.txt").write_text("nested")
+        result = await list_dir_tool({"path": str(tmp_path), "depth": 2}, env)
+        assert not result.is_error
+        assert "nested.txt" in result.output
+
+    @pytest.mark.asyncio
+    async def test_list_dir_nonexistent(self, env) -> None:
+        result = await list_dir_tool({"path": "/nonexistent/path/xyz"}, env)
+        assert result.is_error
+        assert "Error" in result.output
+
+    @pytest.mark.asyncio
+    async def test_list_dir_default_depth(self, env, tmp_path) -> None:
+        """Default depth=1 should not recurse into subdirectories."""
+        (tmp_path / "top.txt").write_text("top")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "deep.txt").write_text("deep")
+        result = await list_dir_tool({"path": str(tmp_path)}, env)
+        assert not result.is_error
+        assert "top.txt" in result.output
+        assert "sub/" in result.output
+        # deep.txt is at depth 2, should not appear with default depth=1
+        assert "deep.txt" not in result.output
 
 
 class TestToolRegistryUnregister:

@@ -96,6 +96,11 @@ class AnthropicProfile:
         """Return True — Claude supports parallel tool call execution."""
         return True
 
+    @property
+    def default_timeout_ms(self) -> int:
+        """Return 120s timeout per Claude Code conventions (§3.5)."""
+        return 120_000
+
     def provider_options(self) -> dict | None:
         """Return Anthropic-specific options including beta headers.
 

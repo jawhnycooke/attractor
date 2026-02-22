@@ -598,3 +598,134 @@ class TestSessionStateSpecCompliance:
         end_events = [e for e in events if e.type == AgentEventType.SESSION_END]
         assert len(end_events) == 1
         assert end_events[0].data["state"] == "idle"
+
+
+# ---------------------------------------------------------------------------
+# GAP 1: Gemini list_dir tool integration
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiListDir:
+    """Verify that GeminiProfile's list_dir tool dispatches correctly."""
+
+    @pytest.mark.asyncio
+    async def test_gemini_list_dir_invocation(self, env, tmp_path) -> None:
+        """Gemini profile should successfully dispatch list_dir tool calls."""
+        from attractor.agent.profiles.gemini_profile import GeminiProfile
+
+        (tmp_path / "example.py").write_text("print('hello')")
+
+        client = MockLLMClient(
+            [
+                _tool_call_response("list_dir", {"path": str(tmp_path)}),
+                _text_response("Directory listed."),
+            ]
+        )
+        config = SessionConfig(model_id="gemini-2.0-flash")
+        session = Session(GeminiProfile(), env, config, client)
+
+        events = []
+        async for event in session.submit("List the directory"):
+            events.append(event)
+
+        types = [e.type for e in events]
+        assert AgentEventType.TOOL_CALL_START in types
+        assert AgentEventType.TOOL_CALL_END in types
+        assert AgentEventType.ASSISTANT_TEXT_END in types
+
+        # Verify tool output contains the file name
+        tool_end = next(
+            e for e in events if e.type == AgentEventType.TOOL_CALL_END
+        )
+        assert "example.py" in tool_end.data.get("output", "")
+        assert not tool_end.data.get("is_error", True)
+
+    @pytest.mark.asyncio
+    async def test_gemini_profile_has_list_dir(self) -> None:
+        """GeminiProfile should include list_dir in its tool definitions."""
+        from attractor.agent.profiles.gemini_profile import GeminiProfile
+
+        profile = GeminiProfile()
+        tool_names = {td.name for td in profile.tool_definitions}
+        assert "list_dir" in tool_names
+
+
+# ---------------------------------------------------------------------------
+# GAP 2: Profile-specific shell timeout
+# ---------------------------------------------------------------------------
+
+
+class TestProfileTimeout:
+    """Verify profile-specific default_timeout_ms is propagated."""
+
+    def test_anthropic_profile_timeout_120s(self) -> None:
+        profile = AnthropicProfile()
+        assert profile.default_timeout_ms == 120_000
+
+    def test_openai_profile_timeout_10s(self) -> None:
+        from attractor.agent.profiles.openai_profile import OpenAIProfile
+
+        profile = OpenAIProfile()
+        assert profile.default_timeout_ms == 10_000
+
+    def test_gemini_profile_timeout_10s(self) -> None:
+        from attractor.agent.profiles.gemini_profile import GeminiProfile
+
+        profile = GeminiProfile()
+        assert profile.default_timeout_ms == 10_000
+
+    @pytest.mark.asyncio
+    async def test_anthropic_timeout_used_in_session(self, env) -> None:
+        """Session with AnthropicProfile should use 120s default shell timeout."""
+        captured_requests: list[Request] = []
+
+        class CapturingClient(MockLLMClient):
+            async def complete(self, request: Request) -> Response:
+                captured_requests.append(request)
+                return await super().complete(request)
+
+        client = CapturingClient(
+            [
+                _tool_call_response("shell", {"command": "echo hi"}),
+                _text_response("Done."),
+            ]
+        )
+        # SessionConfig with default_command_timeout_ms=None uses profile default
+        config = SessionConfig(model_id="claude-sonnet-4-20250514")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        events = []
+        async for event in session.submit("Run echo"):
+            events.append(event)
+
+        # The shell tool call should have used 120_000 as timeout
+        tool_start = next(
+            e for e in events if e.type == AgentEventType.TOOL_CALL_START
+        )
+        # The loop sets the timeout in the arguments before dispatch;
+        # verify via TOOL_CALL_START arguments (set by loop.py:158-161)
+        assert tool_start.data["arguments"].get("timeout_ms") == 120_000
+
+    @pytest.mark.asyncio
+    async def test_session_config_overrides_profile_timeout(self, env) -> None:
+        """Explicit SessionConfig timeout should override profile default."""
+        client = MockLLMClient(
+            [
+                _tool_call_response("shell", {"command": "echo hi"}),
+                _text_response("Done."),
+            ]
+        )
+        config = SessionConfig(
+            model_id="claude-sonnet-4-20250514",
+            default_command_timeout_ms=30_000,
+        )
+        session = Session(AnthropicProfile(), env, config, client)
+
+        events = []
+        async for event in session.submit("Run echo"):
+            events.append(event)
+
+        tool_start = next(
+            e for e in events if e.type == AgentEventType.TOOL_CALL_START
+        )
+        assert tool_start.data["arguments"].get("timeout_ms") == 30_000

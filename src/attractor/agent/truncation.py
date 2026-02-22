@@ -34,6 +34,7 @@ class TruncationConfig:
             "shell": 30_000,
             "grep": 20_000,
             "glob": 20_000,
+            "list_dir": 20_000,
             "spawn_agent": 20_000,
             "edit_file": 10_000,
             "apply_patch": 10_000,
@@ -48,6 +49,7 @@ class TruncationConfig:
             "shell": "head_tail",
             "grep": "tail",
             "glob": "tail",
+            "list_dir": "tail",
             "edit_file": "tail",
             "apply_patch": "tail",
             "write_file": "tail",
@@ -61,6 +63,7 @@ class TruncationConfig:
             "shell": 256,
             "grep": 200,
             "glob": 500,
+            "list_dir": 500,
         }
     )
 

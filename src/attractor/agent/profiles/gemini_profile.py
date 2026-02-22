@@ -10,31 +10,13 @@ from attractor.agent.tools.core_tools import (
     EDIT_FILE_DEF,
     GLOB_DEF,
     GREP_DEF,
+    LIST_DIR_DEF,
     READ_FILE_DEF,
     SHELL_DEF,
     WRITE_FILE_DEF,
 )
 from attractor.agent.tools.subagent import SPAWN_AGENT_DEF
 from attractor.llm.models import ToolDefinition
-
-_LIST_DIR_DEF = ToolDefinition(
-    name="list_dir",
-    description="List directory contents with file sizes.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Directory path to list.",
-            },
-            "depth": {
-                "type": "integer",
-                "description": "How many levels deep to list (default 1).",
-            },
-        },
-        "required": ["path"],
-    },
-)
 
 _SYSTEM_PROMPT = """\
 You are an AI coding assistant. You help users write, debug, and understand \
@@ -84,7 +66,7 @@ class GeminiProfile:
             SHELL_DEF,
             GREP_DEF,
             GLOB_DEF,
-            _LIST_DIR_DEF,
+            LIST_DIR_DEF,
             SPAWN_AGENT_DEF,
         ]
 
@@ -112,6 +94,11 @@ class GeminiProfile:
     def supports_parallel_tool_calls(self) -> bool:
         """Return True — Gemini supports parallel tool call execution."""
         return True
+
+    @property
+    def default_timeout_ms(self) -> int:
+        """Return 10s default shell timeout."""
+        return 10_000
 
     def provider_options(self) -> dict | None:
         """Return Gemini-specific options including safety settings.

@@ -367,3 +367,56 @@ GLOB_DEF = ToolDefinition(
         "required": ["pattern"],
     },
 )
+
+
+# ---------------------------------------------------------------------------
+# list_dir
+# ---------------------------------------------------------------------------
+
+
+async def list_dir_tool(
+    arguments: dict[str, Any],
+    environment: ExecutionEnvironment,
+) -> ToolResult:
+    """List directory contents with file sizes."""
+    path: str = arguments["path"]
+    depth = arguments.get("depth", 1)
+
+    try:
+        entries = await environment.list_directory(path, depth=depth)
+    except Exception as exc:
+        msg = f"Error listing {path}: {exc}"
+        return ToolResult(output=msg, is_error=True, full_output=msg)
+
+    if not entries:
+        output = f"{path}: (empty directory)"
+    else:
+        lines: list[str] = []
+        for entry in entries:
+            if entry.is_dir:
+                lines.append(f"  {entry.name}/")
+            else:
+                lines.append(f"  {entry.name} ({entry.size} bytes)")
+        output = "\n".join(lines)
+
+    return ToolResult(output=output, full_output=output)
+
+
+LIST_DIR_DEF = ToolDefinition(
+    name="list_dir",
+    description="List directory contents with file sizes.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Directory path to list.",
+            },
+            "depth": {
+                "type": "integer",
+                "description": "How many levels deep to list (default 1).",
+            },
+        },
+        "required": ["path"],
+    },
+)

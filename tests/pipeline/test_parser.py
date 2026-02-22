@@ -469,6 +469,59 @@ digraph g {
         assert pipeline.nodes["b"].handler_type == "codergen"
 
 
+class TestDotComments:
+    """GAP 3: Verify DOT comment stripping."""
+
+    def test_single_line_comment(self) -> None:
+        dot = """\
+digraph g {
+    // This is a comment
+    a [shape=Mdiamond]
+    b [shape=Msquare]
+    a -> b
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert "a" in pipeline.nodes
+        assert "b" in pipeline.nodes
+        assert len(pipeline.edges) == 1
+
+    def test_block_comment(self) -> None:
+        dot = """\
+digraph g {
+    /* This is a block comment
+       spanning multiple lines */
+    a [shape=Mdiamond]
+    b [shape=Msquare]
+    a -> b
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert "a" in pipeline.nodes
+        assert "b" in pipeline.nodes
+
+    def test_mixed_comments(self) -> None:
+        """Both // and /* */ comments in the same file."""
+        dot = """\
+digraph g {
+    // Start node
+    start [shape=Mdiamond prompt="Begin"]
+    /* Processing node
+       handles the main logic */
+    work [shape=box prompt="Do work"]
+    done [shape=Msquare]  // Terminal
+    start -> work
+    work -> done
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert pipeline.start_node == "start"
+        assert len(pipeline.nodes) == 3
+        assert len(pipeline.edges) == 2
+        assert pipeline.nodes["start"].prompt == "Begin"
+        assert pipeline.nodes["work"].prompt == "Do work"
+
+
 class TestRejectUndirectedAndStrict:
     """P1: Reject undirected graphs and strict modifier."""
 

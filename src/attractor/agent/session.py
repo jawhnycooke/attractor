@@ -21,12 +21,14 @@ from attractor.agent.tools.core_tools import (
     EDIT_FILE_DEF,
     GLOB_DEF,
     GREP_DEF,
+    LIST_DIR_DEF,
     READ_FILE_DEF,
     SHELL_DEF,
     WRITE_FILE_DEF,
     edit_file,
     glob_tool,
     grep_tool,
+    list_dir_tool,
     read_file,
     shell,
     write_file,
@@ -85,7 +87,7 @@ class SessionConfig:
 
     max_turns: int = 0  # 0 = unlimited
     max_tool_rounds_per_input: int = 0
-    default_command_timeout_ms: int = 10_000
+    default_command_timeout_ms: int | None = None
     max_command_timeout_ms: int = 600_000
     reasoning_effort: ReasoningEffort | None = None
     enable_loop_detection: bool = True
@@ -216,6 +218,7 @@ class Session:
             "shell": (shell, SHELL_DEF),
             "grep": (grep_tool, GREP_DEF),
             "glob": (glob_tool, GLOB_DEF),
+            "list_dir": (list_dir_tool, LIST_DIR_DEF),
             "apply_patch": (apply_patch, APPLY_PATCH_DEF),
             "spawn_agent": (spawn_agent, SPAWN_AGENT_DEF),
             "send_input": (send_input, SEND_INPUT_DEF),
@@ -252,13 +255,20 @@ class Session:
             self._event(AgentEventType.SESSION_START, {"state": self._state.value})
         )
 
+        # Use profile timeout unless the session config overrides
+        effective_timeout = (
+            self._config.default_command_timeout_ms
+            if self._config.default_command_timeout_ms is not None
+            else self._profile.default_timeout_ms
+        )
+
         loop_config = LoopConfig(
             max_turns=self._config.max_turns or None,
             max_tool_rounds=self._config.max_tool_rounds_per_input or None,
             enable_loop_detection=self._config.enable_loop_detection,
             loop_detection_window=self._config.loop_detection_window,
             reasoning_effort=self._reasoning_effort,
-            default_command_timeout_ms=self._config.default_command_timeout_ms,
+            default_command_timeout_ms=effective_timeout,
             max_command_timeout_ms=self._config.max_command_timeout_ms,
             truncation_config=self._config.truncation_config,
             model_id=self._config.model_id,
