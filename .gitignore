@@ -12,3 +12,5 @@ htmlcov/
 *.coverage
 .claude/scripts/*.log
 .claude/scripts/*.pid
+.env.local
+.DS_Store
