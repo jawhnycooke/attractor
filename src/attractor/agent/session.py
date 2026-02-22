@@ -307,8 +307,8 @@ class Session:
                     self._state = SessionState.IDLE
                 else:
                     # Natural completion with no follow-ups queued:
-                    # signal that the model is awaiting user input.
-                    self._state = SessionState.AWAITING_INPUT
+                    # return to IDLE per spec (PROCESSING -> IDLE).
+                    self._state = SessionState.IDLE
 
                 emitter.emit(
                     self._event(

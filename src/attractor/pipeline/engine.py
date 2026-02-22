@@ -14,6 +14,7 @@ import re
 import time
 from pathlib import Path
 
+from attractor.pipeline.artifact_store import LocalArtifactStore
 from attractor.pipeline.conditions import evaluate_condition
 from attractor.pipeline.events import PipelineEvent, PipelineEventEmitter, PipelineEventType
 from attractor.pipeline.goals import GoalGate
@@ -29,9 +30,20 @@ from attractor.pipeline.models import (
     PipelineContext,
     PipelineEdge,
     PipelineNode,
+    RetryPolicy,
 )
 from attractor.pipeline.state import save_checkpoint
 from attractor.pipeline.stylesheet import ModelStylesheet, apply_stylesheet
+from attractor.pipeline.transforms import TransformRegistry
+
+# Valid fidelity modes per spec §5.4
+VALID_FIDELITY_MODES = frozenset({
+    "full", "truncate", "compact",
+    "summary:low", "summary:medium", "summary:high",
+})
+
+# Max value length in bytes before truncation in "truncate" mode
+_TRUNCATE_MAX_VALUE_LEN = 500
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +93,9 @@ class PipelineEngine:
         max_steps: int = 1000,
         event_emitter: PipelineEventEmitter | None = None,
         logs_root: str | Path | None = None,
+        default_retry_policy: RetryPolicy | None = None,
+        transform_registry: TransformRegistry | None = None,
+        artifact_store: LocalArtifactStore | None = None,
     ) -> None:
         self._registry = registry
         self._stylesheet = stylesheet or ModelStylesheet()
@@ -89,6 +104,9 @@ class PipelineEngine:
         self._max_steps = max_steps
         self._event_emitter = event_emitter
         self._logs_root: Path | None = Path(logs_root) if logs_root else None
+        self._default_retry_policy = default_retry_policy
+        self._transform_registry = transform_registry
+        self._artifact_store = artifact_store
 
     async def _emit(self, event: PipelineEvent) -> None:
         """Emit a pipeline event if an emitter is configured."""
@@ -114,8 +132,17 @@ class PipelineEngine:
         Raises:
             EngineError: On unrecoverable errors (missing handler, etc.)
         """
+        # Apply transforms between parse and validate (spec §9.1)
+        if self._transform_registry:
+            pipeline = self._transform_registry.apply_all(pipeline)
+
         # Build a registry with pipeline awareness if none provided
         registry = self._registry or create_default_registry(pipeline=pipeline)
+
+        # Create artifact store per pipeline run (spec §5.5)
+        artifact_store = self._artifact_store or LocalArtifactStore(
+            base_dir=self._logs_root,
+        )
 
         if checkpoint:
             ctx = checkpoint.context
@@ -132,6 +159,9 @@ class PipelineEngine:
             current_node = pipeline.start_node
             completed = []
             node_outcomes = {}
+
+        prev_node: str | None = None
+        start_time = time.time()
 
         if not current_node or current_node not in pipeline.nodes:
             raise EngineError(
@@ -157,9 +187,14 @@ class PipelineEngine:
             if self._stylesheet:
                 node.attributes = apply_stylesheet(self._stylesheet, node)
 
-            # #14: Apply fidelity mode if set on the node
-            if node.fidelity:
-                self._apply_fidelity(ctx, node.fidelity)
+            # Resolve and apply fidelity mode (spec §5.4)
+            incoming_edge = self._find_incoming_edge(
+                current_node, pipeline, prev_node
+            )
+            resolved_fidelity = self._resolve_fidelity(
+                incoming_edge, node, pipeline
+            )
+            self._apply_fidelity(ctx, resolved_fidelity)
 
             # E3: Check goal gates BEFORE executing terminal node handler
             if node.is_terminal:
@@ -182,11 +217,18 @@ class PipelineEngine:
                         if retry_target:
                             current_node = retry_target
                             continue
-                        # E11: No retry target — raise error
-                        raise EngineError(
+                        # E11: No retry target — emit PIPELINE_FAILED and raise
+                        error_msg = (
                             f"Goal gate '{unsatisfied.name}' unsatisfied "
                             f"and no retry target found"
                         )
+                        duration = time.time() - start_time
+                        await self._emit(PipelineEvent(
+                            type=PipelineEventType.PIPELINE_FAILED,
+                            pipeline_name=pipeline.name,
+                            data={"error": error_msg, "duration": duration},
+                        ))
+                        raise EngineError(error_msg)
 
                 # Legacy GoalGate check
                 if self._goal_gate and not self._goal_gate.check(completed, ctx):
@@ -209,19 +251,31 @@ class PipelineEngine:
             # Dispatch to handler
             handler = registry.get(node.handler_type)
             if handler is None:
-                raise EngineError(
+                error_msg = (
                     f"No handler registered for type '{node.handler_type}' "
                     f"(node '{node.name}')"
                 )
+                duration = time.time() - start_time
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.PIPELINE_FAILED,
+                    pipeline_name=pipeline.name,
+                    data={"error": error_msg, "duration": duration},
+                ))
+                raise EngineError(error_msg)
 
-            # E4: Inherit max_retries from pipeline when node has 0/unset
-            effective_max_retries = node.max_retries
-            if effective_max_retries == 0:
-                effective_max_retries = pipeline.metadata.get(
-                    "default_max_retry", 0
-                )
-
-            max_attempts = effective_max_retries + 1
+            # Determine max_attempts: retry_policy → engine default → max_retries
+            if node.retry_policy:
+                max_attempts = node.retry_policy.max_attempts
+            elif self._default_retry_policy and node.max_retries == 0:
+                max_attempts = self._default_retry_policy.max_attempts
+            else:
+                # E4: Inherit max_retries from pipeline when node has 0/unset
+                effective_max_retries = node.max_retries
+                if effective_max_retries == 0:
+                    effective_max_retries = pipeline.metadata.get(
+                        "default_max_retry", 0
+                    )
+                max_attempts = effective_max_retries + 1
             result: NodeResult | None = None
 
             for attempt in range(max_attempts):
@@ -398,12 +452,22 @@ class PipelineEngine:
                     routed = True
 
                 if routed:
-                    self._save_checkpoint(
+                    await self._save_checkpoint_and_emit(
                         pipeline.name, current_node, ctx, completed
                     )
                     continue
 
-                # E7/E13: No route found — raise error
+                # E7/E13: No route found — emit PIPELINE_FAILED and raise
+                duration = time.time() - start_time
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.PIPELINE_FAILED,
+                    pipeline_name=pipeline.name,
+                    data={
+                        "error": f"Node '{node.name}' failed with no failure route: "
+                                 f"{result.failure_reason}",
+                        "duration": duration,
+                    },
+                ))
                 raise EngineError(
                     f"Node '{node.name}' failed with no failure route: "
                     f"{result.failure_reason}"
@@ -421,13 +485,13 @@ class PipelineEngine:
                     completed = []
                     node_outcomes = {}
                     current_node = next_node
-                    self._save_checkpoint(
+                    await self._save_checkpoint_and_emit(
                         pipeline.name, current_node, ctx, completed
                     )
                     continue
 
             # Checkpoint with the *next* node so resume starts there
-            self._save_checkpoint(
+            await self._save_checkpoint_and_emit(
                 pipeline.name,
                 next_node if next_node else current_node,
                 ctx,
@@ -448,10 +512,16 @@ class PipelineEngine:
                 break
 
             if next_node not in pipeline.nodes:
-                raise EngineError(
-                    f"Next node '{next_node}' does not exist in pipeline"
-                )
+                error_msg = f"Next node '{next_node}' does not exist in pipeline"
+                duration = time.time() - start_time
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.PIPELINE_FAILED,
+                    pipeline_name=pipeline.name,
+                    data={"error": error_msg, "duration": duration},
+                ))
+                raise EngineError(error_msg)
 
+            prev_node = current_node
             current_node = next_node
         else:
             logger.warning(
@@ -482,19 +552,123 @@ class PipelineEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _apply_fidelity(ctx: PipelineContext, fidelity: str) -> None:
-        """Record the fidelity mode in context.
+    def _resolve_fidelity(
+        incoming_edge: PipelineEdge | None,
+        target_node: PipelineNode,
+        pipeline: Pipeline,
+    ) -> str:
+        """Resolve fidelity mode using 4-level precedence (spec §5.4).
 
-        Sets ``_fidelity_mode`` in the pipeline context. Actual
-        truncation/summarization is future work — for now just
-        track and log the mode.
+        Precedence (highest to lowest):
+        1. Edge ``fidelity`` attribute (on the incoming edge)
+        2. Target node ``fidelity`` attribute
+        3. Graph ``default_fidelity`` attribute
+        4. Default: ``compact``
+
+        Args:
+            incoming_edge: The edge leading to *target_node*, or ``None``
+                for the start node.
+            target_node: The node about to execute.
+            pipeline: The pipeline definition.
+
+        Returns:
+            The resolved fidelity mode string.
+        """
+        # 1. Edge fidelity (highest precedence)
+        if incoming_edge and incoming_edge.fidelity:
+            return incoming_edge.fidelity
+
+        # 2. Node fidelity
+        if target_node.fidelity:
+            return target_node.fidelity
+
+        # 3. Graph default_fidelity
+        if pipeline.default_fidelity:
+            return pipeline.default_fidelity
+
+        # 4. Fallback
+        return "compact"
+
+    @staticmethod
+    def _apply_fidelity(ctx: PipelineContext, fidelity: str) -> None:
+        """Apply the resolved fidelity mode to the pipeline context.
+
+        Records the mode in ``_fidelity_mode`` and transforms context
+        data according to the mode:
+
+        - ``full``: No transformation; all context data preserved.
+        - ``truncate``: Trim string values exceeding the truncation limit.
+        - ``compact``: Remove large values, keep only small scalars.
+        - ``summary:*``: Mark for summarization (placeholder — actual
+          LLM summarization requires a client reference).
 
         Args:
             ctx: The pipeline context to update.
-            fidelity: The fidelity mode string (e.g., "full", "compact").
+            fidelity: The resolved fidelity mode string.
         """
         ctx.set("_fidelity_mode", fidelity)
         logger.debug("Fidelity mode set to '%s'", fidelity)
+
+        if fidelity == "full":
+            # Preserve everything
+            return
+
+        if fidelity == "truncate":
+            data = ctx.to_dict()
+            for key, value in data.items():
+                if key.startswith("_"):
+                    continue  # Skip internal keys
+                if isinstance(value, str) and len(value) > _TRUNCATE_MAX_VALUE_LEN:
+                    ctx.set(
+                        key,
+                        value[:_TRUNCATE_MAX_VALUE_LEN] + "... [truncated]",
+                    )
+            return
+
+        if fidelity == "compact":
+            data = ctx.to_dict()
+            for key, value in data.items():
+                if key.startswith("_"):
+                    continue
+                if isinstance(value, str) and len(value) > _TRUNCATE_MAX_VALUE_LEN:
+                    ctx.set(key, f"[compact: {len(value)} chars omitted]")
+                elif isinstance(value, (list, dict)):
+                    serialized = str(value)
+                    if len(serialized) > _TRUNCATE_MAX_VALUE_LEN:
+                        ctx.set(key, f"[compact: {type(value).__name__} omitted]")
+            return
+
+        if fidelity.startswith("summary:"):
+            # Mark context for summarization — actual LLM call is
+            # outside the engine's scope.  Store the detail level so
+            # downstream consumers can act on it.
+            detail = fidelity.split(":", 1)[1]
+            ctx.set("_summary_detail", detail)
+            ctx.set("_needs_summarization", True)
+            return
+
+    @staticmethod
+    def _find_incoming_edge(
+        node_name: str,
+        pipeline: Pipeline,
+        prev_node: str | None,
+    ) -> PipelineEdge | None:
+        """Find the incoming edge from *prev_node* to *node_name*.
+
+        Args:
+            node_name: The target node.
+            pipeline: The pipeline definition.
+            prev_node: The previous node, or ``None`` for the start.
+
+        Returns:
+            The matching edge, or ``None``.
+        """
+        if prev_node is None:
+            return None
+        for edge in pipeline.edges:
+            if edge.source == prev_node and edge.target == node_name:
+                return edge
+        return None
 
     @staticmethod
     def _check_goal_gates(
@@ -637,7 +811,15 @@ class PipelineEngine:
         return sorted(edges, key=lambda e: (-e.weight, e.target))[0]
 
     def _retry_delay(self, attempt: int, node: PipelineNode) -> float:
-        """Calculate retry delay with exponential backoff and jitter."""
+        """Calculate retry delay using RetryPolicy or default backoff.
+
+        Resolution order: node.retry_policy → engine default_retry_policy
+        → hardcoded exponential backoff (200ms initial, 2x factor, 60s max).
+        """
+        policy = node.retry_policy or self._default_retry_policy
+        if policy:
+            return policy.backoff.calculate_delay(attempt)
+        # Legacy fallback — matches default BackoffConfig values
         base = 0.2  # 200ms initial
         factor = 2.0
         delay = base * (factor ** (attempt - 1))
@@ -676,3 +858,20 @@ class PipelineEngine:
         )
         path = save_checkpoint(cp, self._checkpoint_dir)
         logger.debug("Checkpoint saved to %s", path)
+
+    async def _save_checkpoint_and_emit(
+        self,
+        pipeline_name: str,
+        current_node: str,
+        ctx: PipelineContext,
+        completed: list[str],
+    ) -> None:
+        """Save checkpoint and emit a CHECKPOINT_SAVED event."""
+        self._save_checkpoint(pipeline_name, current_node, ctx, completed)
+        if self._checkpoint_dir is not None:
+            await self._emit(PipelineEvent(
+                type=PipelineEventType.CHECKPOINT_SAVED,
+                node_name=current_node,
+                pipeline_name=pipeline_name,
+                data={"node_id": current_node},
+            ))

@@ -102,33 +102,45 @@ class GeminiAdapter:
     # Request mapping
     # -----------------------------------------------------------------
 
-    def _map_contents(self, request: Request) -> list[dict[str, Any]]:
-        contents: list[dict[str, Any]] = []
+    def _build_tool_call_id_map(self, messages: list[Message]) -> dict[str, str]:
+        """Build a mapping of tool_call_id → tool_name from messages.
 
-        if request.system_prompt:
-            contents.append(
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": f"[System Instructions]\n{request.system_prompt}"}
-                    ],
-                }
-            )
-            contents.append(
-                {
-                    "role": "model",
-                    "parts": [{"text": "Understood."}],
-                }
-            )
+        Gemini's ``functionResponse`` requires the function name, not the
+        tool call ID.  This scans assistant messages for ``ToolCallContent``
+        parts and records the mapping so that ``_map_message`` can look up
+        the correct function name for each ``ToolResultContent``.
+        """
+        mapping: dict[str, str] = {}
+        for msg in messages:
+            for part in msg.content:
+                if isinstance(part, ToolCallContent):
+                    mapping[part.tool_call_id] = part.tool_name
+        return mapping
+
+    def _map_contents(
+        self, request: Request
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Convert request messages to Gemini contents format.
+
+        Returns:
+            A tuple of (contents list, system_instruction or None).
+        """
+        contents: list[dict[str, Any]] = []
+        tool_id_map = self._build_tool_call_id_map(request.messages)
 
         for msg in request.messages:
-            mapped = self._map_message(msg)
+            mapped = self._map_message(msg, tool_id_map)
             if mapped is not None:
                 contents.append(mapped)
 
-        return contents
+        system_instruction = request.system_prompt or None
+        return contents, system_instruction
 
-    def _map_message(self, msg: Message) -> dict[str, Any] | None:
+    def _map_message(
+        self,
+        msg: Message,
+        tool_id_map: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
         if msg.role == Role.SYSTEM:
             return None
 
@@ -157,10 +169,16 @@ class GeminiAdapter:
                     }
                 )
             elif isinstance(part, ToolResultContent):
+                # Gemini functionResponse uses the function NAME,
+                # not the tool call ID (spec §7.5).
+                func_name = (
+                    (tool_id_map or {}).get(part.tool_call_id)
+                    or part.tool_call_id
+                )
                 parts.append(
                     {
                         "function_response": {
-                            "name": part.tool_call_id,
+                            "name": func_name,
                             "response": {"result": part.content},
                         },
                     }
@@ -185,11 +203,14 @@ class GeminiAdapter:
         return [{"function_declarations": declarations}]
 
     def _build_kwargs(self, request: Request) -> dict[str, Any]:
+        contents, system_instruction = self._map_contents(request)
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "contents": self._map_contents(request),
+            "contents": contents,
         }
         config: dict[str, Any] = {}
+        if system_instruction:
+            config["system_instruction"] = system_instruction
         if request.temperature is not None:
             config["temperature"] = request.temperature
         if request.max_tokens is not None:

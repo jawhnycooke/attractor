@@ -142,8 +142,8 @@ class TestSessionLifecycle:
         async for _ in session.submit("test"):
             pass
 
-        # After natural completion with no follow-ups, session awaits input
-        assert session.state == SessionState.AWAITING_INPUT
+        # After natural completion with no follow-ups, session returns to IDLE
+        assert session.state == SessionState.IDLE
 
         await session.shutdown()
         assert session.state == SessionState.CLOSED
@@ -219,13 +219,13 @@ class TestSessionLifecycle:
         assert session.state == SessionState.AWAITING_INPUT
 
         # Submitting input from AWAITING_INPUT should transition to PROCESSING
-        # and then to AWAITING_INPUT again after natural completion
+        # and then to IDLE after natural completion
         observed_states: list[SessionState] = []
         async for _ in session.submit("user answer"):
             observed_states.append(session.state)
 
         assert SessionState.PROCESSING in observed_states
-        assert session.state == SessionState.AWAITING_INPUT
+        assert session.state == SessionState.IDLE
 
     @pytest.mark.asyncio
     async def test_processing_state_during_execution(self, env) -> None:
@@ -242,8 +242,8 @@ class TestSessionLifecycle:
         # During execution we should have seen PROCESSING at some point
         # (the SESSION_START event fires right after state = PROCESSING)
         assert SessionState.PROCESSING in observed_states
-        # After natural completion, state is AWAITING_INPUT
-        assert session.state == SessionState.AWAITING_INPUT
+        # After natural completion, state is IDLE
+        assert session.state == SessionState.IDLE
 
     @pytest.mark.asyncio
     async def test_set_reasoning_effort(self, env) -> None:
@@ -314,8 +314,8 @@ class TestSessionId:
 
 class TestAwaitingInput:
     @pytest.mark.asyncio
-    async def test_natural_completion_transitions_to_awaiting_input(self, env) -> None:
-        """After a text-only response with no follow-ups, state should be AWAITING_INPUT."""
+    async def test_natural_completion_transitions_to_idle(self, env) -> None:
+        """After a text-only response with no follow-ups, state should be IDLE."""
         client = MockLLMClient([_text_response("What would you like me to do?")])
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
@@ -323,34 +323,34 @@ class TestAwaitingInput:
         async for _ in session.submit("Help me"):
             pass
 
-        assert session.state == SessionState.AWAITING_INPUT
+        assert session.state == SessionState.IDLE
 
     @pytest.mark.asyncio
-    async def test_awaiting_input_to_processing_on_submit(self, env) -> None:
-        """Submitting from AWAITING_INPUT should go through PROCESSING."""
+    async def test_idle_to_processing_on_submit(self, env) -> None:
+        """Submitting from IDLE should go through PROCESSING."""
         client = MockLLMClient(
             [_text_response("What file?"), _text_response("Done.")]
         )
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
 
-        # First submit → ends in AWAITING_INPUT
+        # First submit → ends in IDLE
         async for _ in session.submit("Help"):
             pass
-        assert session.state == SessionState.AWAITING_INPUT
+        assert session.state == SessionState.IDLE
 
-        # Second submit from AWAITING_INPUT
+        # Second submit from IDLE
         observed_states: list[SessionState] = []
         async for _ in session.submit("auth.py"):
             observed_states.append(session.state)
 
         assert SessionState.PROCESSING in observed_states
-        # Ends in AWAITING_INPUT again (natural completion, no follow-ups)
-        assert session.state == SessionState.AWAITING_INPUT
+        # Ends in IDLE again (natural completion, no follow-ups)
+        assert session.state == SessionState.IDLE
 
     @pytest.mark.asyncio
-    async def test_session_end_event_contains_awaiting_input_state(self, env) -> None:
-        """SESSION_END event data should reflect the AWAITING_INPUT state."""
+    async def test_session_end_event_contains_idle_state(self, env) -> None:
+        """SESSION_END event data should reflect the IDLE state after completion."""
         client = MockLLMClient([_text_response("ok")])
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
@@ -361,7 +361,7 @@ class TestAwaitingInput:
 
         end_events = [e for e in events if e.type == AgentEventType.SESSION_END]
         assert len(end_events) == 1
-        assert end_events[0].data["state"] == SessionState.AWAITING_INPUT.value
+        assert end_events[0].data["state"] == SessionState.IDLE.value
 
 
 class TestAbort:
@@ -377,15 +377,15 @@ class TestAbort:
         assert session.state == SessionState.CLOSED
 
     @pytest.mark.asyncio
-    async def test_abort_when_awaiting_input_sets_closed(self, env) -> None:
-        """Calling abort() from AWAITING_INPUT transitions to CLOSED."""
+    async def test_abort_when_idle_after_completion_sets_closed(self, env) -> None:
+        """Calling abort() from IDLE (after completion) transitions to CLOSED."""
         client = MockLLMClient([_text_response("ok")])
         config = SessionConfig(model_id="test-model")
         session = Session(AnthropicProfile(), env, config, client)
 
         async for _ in session.submit("test"):
             pass
-        assert session.state == SessionState.AWAITING_INPUT
+        assert session.state == SessionState.IDLE
 
         session.abort()
         assert session.state == SessionState.CLOSED
@@ -473,3 +473,121 @@ class TestAbort:
         # The follow-up's text should NOT have been processed
         text_ends = [e for e in events if e.type == AgentEventType.ASSISTANT_TEXT_END]
         assert len(text_ends) == 1
+
+
+# ---------------------------------------------------------------------------
+# Gap A-C01: Session state transitions per spec (PROCESSING → IDLE)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionStateSpecCompliance:
+    """Verify session states match the spec: IDLE → PROCESSING → IDLE."""
+
+    @pytest.mark.asyncio
+    async def test_idle_after_text_only_response(self, env) -> None:
+        """Natural completion (text-only, no follow-ups) returns to IDLE."""
+        client = MockLLMClient([_text_response("All done.")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        assert session.state == SessionState.IDLE
+
+        async for _ in session.submit("Do something"):
+            pass
+
+        assert session.state == SessionState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_idle_after_tool_call_then_text(self, env, tmp_path) -> None:
+        """After tool calls followed by text completion, state returns to IDLE."""
+        (tmp_path / "f.txt").write_text("data\n")
+        client = MockLLMClient(
+            [
+                _tool_call_response("read_file", {"path": "f.txt"}),
+                _text_response("Read the file."),
+            ]
+        )
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        async for _ in session.submit("Read f.txt"):
+            pass
+
+        assert session.state == SessionState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_idle_after_turn_limit(self, env) -> None:
+        """Turn limit causes PROCESSING → IDLE transition."""
+        responses = [
+            _tool_call_response("shell", {"command": "echo x"}) for _ in range(10)
+        ]
+        client = MockLLMClient(responses)
+        config = SessionConfig(model_id="test-model", max_turns=2)
+        session = Session(AnthropicProfile(), env, config, client)
+
+        async for _ in session.submit("Loop"):
+            pass
+
+        assert session.state == SessionState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_full_lifecycle_idle_processing_idle(self, env) -> None:
+        """Full lifecycle: IDLE → PROCESSING (during submit) → IDLE (after)."""
+        client = MockLLMClient([_text_response("ok")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        assert session.state == SessionState.IDLE
+
+        saw_processing = False
+        async for _ in session.submit("test"):
+            if session.state == SessionState.PROCESSING:
+                saw_processing = True
+
+        assert saw_processing, "Should have observed PROCESSING during submit"
+        assert session.state == SessionState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_multiple_submits_return_to_idle(self, env) -> None:
+        """Multiple sequential submits each return to IDLE."""
+        client = MockLLMClient(
+            [_text_response("first"), _text_response("second"), _text_response("third")]
+        )
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        for prompt in ["one", "two", "three"]:
+            async for _ in session.submit(prompt):
+                pass
+            assert session.state == SessionState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_awaiting_input_state_still_allows_submit(self, env) -> None:
+        """AWAITING_INPUT (if set manually) still allows submit()."""
+        client = MockLLMClient([_text_response("ok")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        # Manually set AWAITING_INPUT (simulating a model question scenario)
+        session._state = SessionState.AWAITING_INPUT
+
+        async for _ in session.submit("answer"):
+            pass
+
+        # After completion, should be IDLE (not AWAITING_INPUT)
+        assert session.state == SessionState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_session_end_event_state_is_idle(self, env) -> None:
+        """SESSION_END event should contain 'idle' state after natural completion."""
+        client = MockLLMClient([_text_response("done")])
+        config = SessionConfig(model_id="test-model")
+        session = Session(AnthropicProfile(), env, config, client)
+
+        events: list[AgentEvent] = []
+        async for event in session.submit("test"):
+            events.append(event)
+
+        end_events = [e for e in events if e.type == AgentEventType.SESSION_END]
+        assert len(end_events) == 1
+        assert end_events[0].data["state"] == "idle"

@@ -117,32 +117,35 @@ def _simulate_agent_import_error(error_cls: type[Exception] = ImportError, messa
 class TestCodergenHandler:
     @pytest.mark.asyncio
     async def test_codergen_simulation_mode_on_import_error(self) -> None:
-        """P-C01: ImportError fallback enters simulation mode (SUCCESS)."""
+        """P-C01/P-C02: backend=None enters simulation mode (SUCCESS)."""
         handler = CodergenHandler()
         node = _make_node(handler_type="codergen", prompt="do stuff", model="gpt-4o")
         ctx = PipelineContext()
 
-        with _simulate_agent_import_error():
-            result = await handler.execute(node, ctx)
+        result = await handler.execute(node, ctx)
 
         assert result.success is True
         assert result.status == OutcomeStatus.SUCCESS
-        assert "Simulated response for stage: test_node" in result.output
+        assert "[Simulated] Response for stage: test_node" in result.output
         assert "simulation mode" in (result.notes or "")
         assert result.context_updates["last_response"] == result.output
 
     @pytest.mark.asyncio
     async def test_handler_exception_is_logged(self, caplog) -> None:
         """Regression for A4: exceptions should be logged via logger.exception."""
-        handler = CodergenHandler()
+
+        class FailingBackend:
+            async def run(self, node, prompt, context):
+                raise RuntimeError("unexpected failure")
+
+        handler = CodergenHandler(backend=FailingBackend())
         node = _make_node(handler_type="codergen", prompt="fail", model="gpt-4o")
         ctx = PipelineContext()
 
-        with _simulate_agent_import_error(RuntimeError, "unexpected failure"):
-            with caplog.at_level(
-                logging.ERROR, logger="attractor.pipeline.handlers"
-            ):
-                result = await handler.execute(node, ctx)
+        with caplog.at_level(
+            logging.ERROR, logger="attractor.pipeline.handlers"
+        ):
+            result = await handler.execute(node, ctx)
 
         assert result.success is False
         assert result.status == OutcomeStatus.FAIL
@@ -203,8 +206,7 @@ class TestCodergenHandler:
         )
         ctx = PipelineContext()
 
-        with _simulate_agent_import_error():
-            result = await handler.execute(node, ctx, logs_root=tmp_path)
+        result = await handler.execute(node, ctx, logs_root=tmp_path)
 
         assert result.status == OutcomeStatus.SUCCESS
 
@@ -214,7 +216,7 @@ class TestCodergenHandler:
         assert (stage_dir / "prompt.md").exists()
         assert (stage_dir / "prompt.md").read_text() == "do stuff"
         assert (stage_dir / "response.md").exists()
-        assert "Simulated response" in (stage_dir / "response.md").read_text()
+        assert "[Simulated]" in (stage_dir / "response.md").read_text()
         assert (stage_dir / "status.json").exists()
         status = json.loads((stage_dir / "status.json").read_text())
         assert status["status"] == "success"
@@ -222,28 +224,18 @@ class TestCodergenHandler:
     @pytest.mark.asyncio
     async def test_codergen_sets_last_response_context_key(self) -> None:
         """H5: Should set 'last_response' not 'last_codergen_output'."""
-        from attractor.agent.events import AgentEvent, AgentEventType
 
-        handler = CodergenHandler()
+        class EchoBackend:
+            async def run(self, node, prompt, context):
+                return "agent output"
+
+        handler = CodergenHandler(backend=EchoBackend())
         node = _make_node(
             handler_type="codergen", prompt="do stuff", model="gpt-4o"
         )
         ctx = PipelineContext()
 
-        # Mock the agent session to yield a text delta event, exercising
-        # the handler's actual success path.
-        async def mock_submit(prompt):
-            yield AgentEvent(
-                type=AgentEventType.ASSISTANT_TEXT_DELTA,
-                data={"text": "agent output"},
-            )
-
-        mock_session = AsyncMock()
-        mock_session.submit = mock_submit
-
-        with patch("attractor.agent.session.Session", return_value=mock_session), \
-             patch("attractor.llm.client.LLMClient"):
-            result = await handler.execute(node, ctx)
+        result = await handler.execute(node, ctx)
 
         assert result.status == OutcomeStatus.SUCCESS
         assert "last_response" in result.context_updates
@@ -528,15 +520,15 @@ class TestWaitHumanHandler:
         assert result.context_updates["selected_edge_id"] == "next"
         interviewer.ask.assert_called_once()
 
-        # Verify the correct args were passed to interviewer.ask()
+        # P-C10: Verify a Question object was passed to interviewer.ask()
         call_args = interviewer.ask.call_args
-        prompt_arg = call_args[0][0]  # first positional arg is the prompt
-        options_arg = call_args[1].get("options", [])  # options is a kwarg
-        # Prompt should contain the node's prompt text
-        assert "Choose?" in str(prompt_arg)
-        # Options should include the edge labels
-        assert "approve" in options_arg
-        assert "reject" in options_arg
+        question_arg = call_args[0][0]  # first positional arg is the Question
+        # Question should contain the node's prompt text
+        assert "Choose?" in str(question_arg)
+        # Question options should include the edge labels
+        option_labels = [o.label for o in question_arg.options]
+        assert "approve" in option_labels
+        assert "reject" in option_labels
 
     @pytest.mark.asyncio
     async def test_wait_human_uses_graph_param_over_stored_pipeline(self) -> None:
@@ -569,7 +561,7 @@ class TestWaitHumanHandler:
 
     @pytest.mark.asyncio
     async def test_accelerator_keys_passed_to_interviewer(self) -> None:
-        """H7: Accelerator keys should be parsed and passed to interviewer.ask."""
+        """H7: Accelerator keys should be parsed and passed via Question options."""
         interviewer = AsyncMock()
         interviewer.inform = AsyncMock()
         # Return the exact label for the first edge so selection works
@@ -596,16 +588,16 @@ class TestWaitHumanHandler:
         assert result.success is True
         assert result.suggested_next_ids == ["deploy"]
 
-        # Verify accelerator keys were passed
+        # P-C10: Verify Question options contain accelerator keys
         call_args = interviewer.ask.call_args
-        accelerators = call_args[1].get("accelerators", [])
-        # Edges sorted by (weight desc, target asc), so cancel < deploy
-        assert set(accelerators) == {"Y", "N"}
-        assert len(accelerators) == 2
+        question_arg = call_args[0][0]  # Question object
+        option_keys = {o.key for o in question_arg.options}
+        assert option_keys == {"Y", "N"}
+        assert len(question_arg.options) == 2
         # Options should include the full labels
-        options = call_args[1].get("options", [])
-        assert "[Y] Yes, deploy" in options
-        assert "[N] No, cancel" in options
+        option_labels = {o.label for o in question_arg.options}
+        assert "[Y] Yes, deploy" in option_labels
+        assert "[N] No, cancel" in option_labels
 
     @pytest.mark.asyncio
     async def test_timeout_with_default_choice(self) -> None:
@@ -1405,3 +1397,490 @@ class TestCreateDefaultRegistry:
         handler = registry.get("unknown_type")
         assert handler is not None
         assert isinstance(handler, CodergenHandler)
+
+
+# ---------------------------------------------------------------------------
+# P-C02: Simulation mode for CodergenHandler (spec §4.5)
+# ---------------------------------------------------------------------------
+
+
+class TestCodergenSimulationMode:
+    """Tests for P-C02: When backend is None, handler returns simulated response."""
+
+    @pytest.mark.asyncio
+    async def test_simulation_mode_when_backend_is_none(self) -> None:
+        """P-C02: backend=None should directly enter simulation mode."""
+        handler = CodergenHandler(backend=None)
+        node = _make_node(
+            handler_type="codergen", prompt="do stuff", model="gpt-4o"
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.output == "[Simulated] Response for stage: test_node"
+        assert result.context_updates["last_response"] == result.output
+        assert "simulation mode" in (result.notes or "")
+
+    @pytest.mark.asyncio
+    async def test_simulation_text_format_matches_spec(self) -> None:
+        """P-C02: Simulation text must be '[Simulated] Response for stage: {node.id}'."""
+        handler = CodergenHandler(backend=None)
+        node = _make_node(
+            name="review_step", handler_type="codergen", prompt="review"
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.output == "[Simulated] Response for stage: review_step"
+        assert result.output.startswith("[Simulated]")
+
+    @pytest.mark.asyncio
+    async def test_simulation_mode_writes_logs(self, tmp_path) -> None:
+        """P-C02: Simulation mode writes prompt.md, response.md, status.json."""
+        handler = CodergenHandler(backend=None)
+        node = _make_node(
+            handler_type="codergen", prompt="build feature", model="gpt-4o"
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx, logs_root=tmp_path)
+
+        assert result.success is True
+        stage_dir = tmp_path / "test_node"
+        assert stage_dir.exists()
+        assert (stage_dir / "prompt.md").read_text() == "build feature"
+        assert (stage_dir / "response.md").read_text() == (
+            "[Simulated] Response for stage: test_node"
+        )
+        status = json.loads((stage_dir / "status.json").read_text())
+        assert status["status"] == "success"
+        assert status["node"] == "test_node"
+        assert status["notes"] == "simulation mode"
+
+    @pytest.mark.asyncio
+    async def test_simulation_mode_no_logs_without_logs_root(self) -> None:
+        """P-C02: No log files when logs_root is not provided."""
+        handler = CodergenHandler(backend=None)
+        node = _make_node(handler_type="codergen", prompt="test")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert result.output.startswith("[Simulated]")
+
+    @pytest.mark.asyncio
+    async def test_simulation_mode_expands_goal(self) -> None:
+        """P-C02: $goal expansion should happen before simulation."""
+        handler = CodergenHandler(backend=None)
+        node = _make_node(
+            handler_type="codergen", prompt="Work on $goal"
+        )
+        ctx = PipelineContext()
+        pipeline = Pipeline(
+            name="test",
+            goal="fix all bugs",
+            metadata={"goal": "fix all bugs"},
+        )
+
+        result = await handler.execute(node, ctx, graph=pipeline)
+
+        assert result.success is True
+        # Simulation response doesn't contain the expanded prompt,
+        # but the prompt expansion still happens for logging
+        assert result.output == "[Simulated] Response for stage: test_node"
+
+    @pytest.mark.asyncio
+    async def test_simulation_mode_expands_prompt_to_log(self, tmp_path) -> None:
+        """P-C02: Prompt expansion writes to log even in simulation mode."""
+        handler = CodergenHandler(backend=None)
+        node = _make_node(
+            handler_type="codergen", prompt="Work on $goal"
+        )
+        ctx = PipelineContext()
+        pipeline = Pipeline(
+            name="test",
+            goal="fix all bugs",
+            metadata={"goal": "fix all bugs"},
+        )
+
+        await handler.execute(node, ctx, graph=pipeline, logs_root=tmp_path)
+
+        prompt_file = tmp_path / "test_node" / "prompt.md"
+        assert prompt_file.exists()
+        assert prompt_file.read_text() == "Work on fix all bugs"
+
+    @pytest.mark.asyncio
+    async def test_explicit_backend_skips_simulation(self) -> None:
+        """P-C02: Explicit backend should NOT enter simulation mode."""
+
+        class EchoBackend:
+            async def run(self, node, prompt, context):
+                return f"real: {prompt}"
+
+        handler = CodergenHandler(backend=EchoBackend())
+        node = _make_node(
+            handler_type="codergen", prompt="do work", model="gpt-4o"
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert result.output == "real: do work"
+        assert "[Simulated]" not in result.output
+
+    @pytest.mark.asyncio
+    async def test_simulation_mode_context_interpolation(self, tmp_path) -> None:
+        """P-C02: Context variables should be interpolated before simulation."""
+        handler = CodergenHandler(backend=None)
+        node = _make_node(
+            handler_type="codergen", prompt="Fix {issue_id}"
+        )
+        ctx = PipelineContext.from_dict({"issue_id": "BUG-123"})
+
+        await handler.execute(node, ctx, logs_root=tmp_path)
+
+        prompt_file = tmp_path / "test_node" / "prompt.md"
+        assert prompt_file.read_text() == "Fix BUG-123"
+
+
+# ---------------------------------------------------------------------------
+# P-C10: WaitHumanHandler Question/Answer interface (spec §4.6, §6.2, §6.3)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitHumanQuestionAnswer:
+    """Tests for P-C10: WaitHumanHandler uses structured Question/Answer types."""
+
+    @pytest.mark.asyncio
+    async def test_ask_receives_question_object(self) -> None:
+        """P-C10: interviewer.ask() receives a Question, not raw strings."""
+        from attractor.pipeline.interviewer import (
+            Answer,
+            AnswerValue,
+            Option,
+            Question,
+            QuestionType,
+            QueueInterviewer,
+        )
+
+        interviewer = QueueInterviewer()
+        # Queue an Answer that selects the first option
+        interviewer.responses.put_nowait(
+            Answer(value="a", selected_option=Option(key="a", label="approve"))
+        )
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="approve"),
+                PipelineEdge(source="gate", target="retry", label="reject"),
+            ],
+        )
+
+        handler = WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Choose?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert result.suggested_next_ids == ["next"]
+        assert result.context_updates["human_choice"] == "approve"
+        assert result.context_updates["selected_edge_id"] == "next"
+
+    @pytest.mark.asyncio
+    async def test_question_has_multiple_choice_type(self) -> None:
+        """P-C10: Question should have type=MULTIPLE_CHOICE."""
+        from attractor.pipeline.interviewer import (
+            Answer,
+            Option,
+            Question,
+            QuestionType,
+        )
+
+        captured_questions: list[Question] = []
+
+        class CapturingInterviewer:
+            async def ask(self, question: Question) -> Answer:
+                captured_questions.append(question)
+                return Answer(
+                    value="a",
+                    selected_option=Option(key="a", label="approve"),
+                )
+
+            async def inform(self, message: str, stage: str = "") -> None:
+                pass
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="approve"),
+                PipelineEdge(source="gate", target="retry", label="reject"),
+            ],
+        )
+
+        handler = WaitHumanHandler(
+            interviewer=CapturingInterviewer(), pipeline=pipeline
+        )
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Choose?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert len(captured_questions) == 1
+        q = captured_questions[0]
+        assert q.type == QuestionType.MULTIPLE_CHOICE
+        assert q.text == "Choose?"
+        assert q.stage == "gate"
+        assert len(q.options) == 2
+        assert q.options[0].label == "approve"
+        assert q.options[1].label == "reject"
+
+    @pytest.mark.asyncio
+    async def test_question_options_have_accelerator_keys(self) -> None:
+        """P-C10: Option.key should be the parsed accelerator key."""
+        from attractor.pipeline.interviewer import (
+            Answer,
+            Option,
+            Question,
+            QuestionType,
+        )
+
+        captured_questions: list[Question] = []
+
+        class CapturingInterviewer:
+            async def ask(self, question: Question) -> Answer:
+                captured_questions.append(question)
+                return Answer(
+                    value="Y",
+                    selected_option=Option(key="Y", label="[Y] Yes, deploy"),
+                )
+
+            async def inform(self, message: str, stage: str = "") -> None:
+                pass
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(
+                    source="gate", target="deploy", label="[Y] Yes, deploy"
+                ),
+                PipelineEdge(
+                    source="gate", target="cancel", label="[N] No, cancel"
+                ),
+            ],
+        )
+
+        handler = WaitHumanHandler(
+            interviewer=CapturingInterviewer(), pipeline=pipeline
+        )
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Deploy?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        q = captured_questions[0]
+        keys = {opt.key for opt in q.options}
+        assert keys == {"Y", "N"}
+        labels = {opt.label for opt in q.options}
+        assert "[Y] Yes, deploy" in labels
+        assert "[N] No, cancel" in labels
+
+    @pytest.mark.asyncio
+    async def test_answer_selected_option_matches_edge(self) -> None:
+        """P-C10: When Answer has selected_option, edge is matched by label."""
+        from attractor.pipeline.interviewer import Answer, Option
+
+        class OptionInterviewer:
+            async def ask(self, question):
+                return Answer(
+                    value="r",
+                    selected_option=Option(key="r", label="reject"),
+                )
+
+            async def inform(self, message: str, stage: str = "") -> None:
+                pass
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="approve"),
+                PipelineEdge(source="gate", target="retry", label="reject"),
+            ],
+        )
+
+        handler = WaitHumanHandler(
+            interviewer=OptionInterviewer(), pipeline=pipeline
+        )
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Choose?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert result.suggested_next_ids == ["retry"]
+        assert result.context_updates["human_choice"] == "reject"
+        assert result.context_updates["selected_edge_id"] == "retry"
+
+    @pytest.mark.asyncio
+    async def test_answer_skipped_returns_fail(self) -> None:
+        """P-C10: Answer with AnswerValue.SKIPPED returns FAIL."""
+        from attractor.pipeline.interviewer import Answer, AnswerValue
+
+        class SkipInterviewer:
+            async def ask(self, question):
+                return Answer(value=AnswerValue.SKIPPED)
+
+            async def inform(self, message: str, stage: str = "") -> None:
+                pass
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="go"),
+            ],
+        )
+
+        handler = WaitHumanHandler(
+            interviewer=SkipInterviewer(), pipeline=pipeline
+        )
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Go?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is False
+        assert result.status == OutcomeStatus.FAIL
+        assert "skipped" in (result.failure_reason or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_answer_no_match_falls_back_to_first_edge(self) -> None:
+        """P-C10: Unmatched answer falls back to first edge."""
+        from attractor.pipeline.interviewer import Answer
+
+        class NoMatchInterviewer:
+            async def ask(self, question):
+                return Answer(value="unknown_option")
+
+            async def inform(self, message: str, stage: str = "") -> None:
+                pass
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="default_next", label="first"),
+                PipelineEdge(source="gate", target="other", label="second"),
+            ],
+        )
+
+        handler = WaitHumanHandler(
+            interviewer=NoMatchInterviewer(), pipeline=pipeline
+        )
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Choose?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert result.suggested_next_ids == ["default_next"]
+
+    @pytest.mark.asyncio
+    async def test_question_stage_set_to_node_name(self) -> None:
+        """P-C10: Question.stage should be set to the node name."""
+        from attractor.pipeline.interviewer import Answer, Option, Question
+
+        captured_questions: list[Question] = []
+
+        class StageCapture:
+            async def ask(self, question: Question) -> Answer:
+                captured_questions.append(question)
+                return Answer(
+                    value="ok",
+                    selected_option=Option(key="o", label="ok"),
+                )
+
+            async def inform(self, message: str, stage: str = "") -> None:
+                pass
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={
+                "my_gate_node": PipelineNode(
+                    name="my_gate_node", handler_type="wait.human"
+                )
+            },
+            edges=[
+                PipelineEdge(
+                    source="my_gate_node", target="next", label="ok"
+                ),
+            ],
+        )
+
+        handler = WaitHumanHandler(
+            interviewer=StageCapture(), pipeline=pipeline
+        )
+        node = _make_node(
+            name="my_gate_node", handler_type="wait.human", prompt="Ready?"
+        )
+        ctx = PipelineContext()
+
+        await handler.execute(node, ctx)
+
+        assert len(captured_questions) == 1
+        assert captured_questions[0].stage == "my_gate_node"
+
+    @pytest.mark.asyncio
+    async def test_queue_interviewer_integration(self) -> None:
+        """P-C10: Full integration with QueueInterviewer from interviewer.py."""
+        from attractor.pipeline.interviewer import (
+            Answer,
+            AnswerValue,
+            Option,
+            QueueInterviewer,
+        )
+
+        interviewer = QueueInterviewer()
+        # Pre-queue an answer selecting the second option
+        interviewer.responses.put_nowait(
+            Answer(
+                value="r",
+                selected_option=Option(key="r", label="reject"),
+            )
+        )
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="approve_node", label="approve"),
+                PipelineEdge(source="gate", target="reject_node", label="reject"),
+            ],
+        )
+
+        handler = WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Review?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert result.suggested_next_ids == ["reject_node"]
+        assert result.context_updates["human_choice"] == "reject"
+        assert result.context_updates["selected_edge_id"] == "reject_node"
+        # Verify inform was called
+        assert len(interviewer.messages) == 1
+        assert "gate" in interviewer.messages[0]

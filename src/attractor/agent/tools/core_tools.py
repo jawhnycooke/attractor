@@ -123,11 +123,13 @@ async def edit_file(
 ) -> ToolResult:
     """Search-and-replace edit within a file.
 
-    Fails if old_string is not found or is not unique in the file.
+    When replace_all is false (default), fails if old_string is not found
+    or is not unique. When replace_all is true, replaces every occurrence.
     """
     path: str = arguments["path"]
     old_string: str = arguments["old_string"]
     new_string: str = arguments["new_string"]
+    replace_all: bool = arguments.get("replace_all", False)
 
     if not await environment.file_exists(path):
         msg = f"Error: file not found: {path}"
@@ -154,29 +156,38 @@ async def edit_file(
     if count == 0:
         msg = f"Error: old_string not found in {path}"
         return ToolResult(output=msg, is_error=True, full_output=msg)
-    if count > 1:
-        msg = (
-            f"Error: old_string found {count} times in {path}. "
-            f"Provide more context to make it unique."
-        )
-        return ToolResult(output=msg, is_error=True, full_output=msg)
 
-    new_content = content.replace(old_string, new_string, 1)
+    if replace_all:
+        new_content = content.replace(old_string, new_string)
+        replacement_count = count
+    else:
+        if count > 1:
+            msg = (
+                f"Error: old_string found {count} times in {path}. "
+                f"Provide more context to make it unique."
+            )
+            return ToolResult(output=msg, is_error=True, full_output=msg)
+        new_content = content.replace(old_string, new_string, 1)
+        replacement_count = 1
+
     try:
         await environment.write_file(path, new_content)
     except Exception as exc:
         msg = f"Error writing {path}: {exc}"
         return ToolResult(output=msg, is_error=True, full_output=msg)
 
-    msg = f"Successfully edited {path}"
+    if replace_all and replacement_count > 1:
+        msg = f"Successfully edited {path} ({replacement_count} replacements)"
+    else:
+        msg = f"Successfully edited {path}"
     return ToolResult(output=msg, full_output=msg)
 
 
 EDIT_FILE_DEF = ToolDefinition(
     name="edit_file",
     description=(
-        "Make a search-and-replace edit in a file. The old_string must "
-        "appear exactly once in the file. Provide enough context to be unique."
+        "Make a search-and-replace edit in a file. By default old_string must "
+        "appear exactly once; set replace_all=true to replace every occurrence."
     ),
     parameters={
         "type": "object",
@@ -187,11 +198,15 @@ EDIT_FILE_DEF = ToolDefinition(
             },
             "old_string": {
                 "type": "string",
-                "description": "The exact text to find (must be unique).",
+                "description": "The exact text to find (must be unique unless replace_all is true).",
             },
             "new_string": {
                 "type": "string",
                 "description": "The replacement text.",
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "Replace all occurrences of old_string (default false).",
             },
         },
         "required": ["path", "old_string", "new_string"],

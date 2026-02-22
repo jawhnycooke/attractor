@@ -5,6 +5,7 @@ from attractor.pipeline.stylesheet import (
     ModelStylesheet,
     StyleRule,
     apply_stylesheet,
+    parse_stylesheet,
 )
 
 
@@ -252,3 +253,314 @@ class TestNodeFieldSetting:
         apply_stylesheet(stylesheet, node, pipeline=pipeline)
         assert node.llm_model == "gpt-3.5"
         assert node.llm_provider == "openai"
+
+
+class TestShapeSelectorMatching:
+    """P-P08: Shape selectors match nodes by their DOT shape attribute."""
+
+    def test_shape_rule_matches_node_with_matching_shape(self) -> None:
+        rule = StyleRule(
+            selector_type="shape",
+            selector_value="box",
+            specificity=1,
+            llm_model="gpt-4o",
+        )
+        node = PipelineNode(name="impl", handler_type="codergen", shape="box")
+        assert rule.matches(node) is True
+
+    def test_shape_rule_does_not_match_different_shape(self) -> None:
+        rule = StyleRule(
+            selector_type="shape",
+            selector_value="box",
+            specificity=1,
+            llm_model="gpt-4o",
+        )
+        node = PipelineNode(name="start", handler_type="start", shape="Mdiamond")
+        assert rule.matches(node) is False
+
+    def test_shape_rule_matches_mdiamond(self) -> None:
+        rule = StyleRule(
+            selector_type="shape",
+            selector_value="Mdiamond",
+            specificity=1,
+            llm_model="gpt-4o",
+        )
+        node = PipelineNode(name="start", handler_type="start", shape="Mdiamond")
+        assert rule.matches(node) is True
+
+    def test_shape_rule_matches_msquare(self) -> None:
+        rule = StyleRule(
+            selector_type="shape",
+            selector_value="Msquare",
+            specificity=1,
+            llm_model="gpt-4o",
+        )
+        node = PipelineNode(name="exit", handler_type="exit", shape="Msquare")
+        assert rule.matches(node) is True
+
+    def test_shape_rule_matches_hexagon(self) -> None:
+        rule = StyleRule(
+            selector_type="shape",
+            selector_value="hexagon",
+            specificity=1,
+            llm_model="gpt-4o",
+        )
+        node = PipelineNode(name="gate", handler_type="wait.human", shape="hexagon")
+        assert rule.matches(node) is True
+
+    def test_shape_selector_applies_defaults_via_stylesheet(self) -> None:
+        stylesheet = ModelStylesheet(
+            rules=[
+                StyleRule(
+                    selector_type="shape",
+                    selector_value="box",
+                    specificity=1,
+                    llm_model="gpt-4o",
+                    llm_provider="openai",
+                ),
+            ]
+        )
+        node = PipelineNode(name="impl", handler_type="codergen", shape="box")
+        resolved = apply_stylesheet(stylesheet, node)
+        assert resolved["llm_model"] == "gpt-4o"
+        assert resolved["llm_provider"] == "openai"
+
+    def test_shape_selector_does_not_apply_to_non_matching_shape(self) -> None:
+        stylesheet = ModelStylesheet(
+            rules=[
+                StyleRule(
+                    selector_type="shape",
+                    selector_value="hexagon",
+                    specificity=1,
+                    llm_model="gpt-4o",
+                ),
+            ]
+        )
+        node = PipelineNode(name="impl", handler_type="codergen", shape="box")
+        resolved = apply_stylesheet(stylesheet, node)
+        assert "llm_model" not in resolved
+
+
+class TestShapeSelectorSpecificity:
+    """P-P08: Specificity order is universal(0) < shape(1) < class(2) < ID(3)."""
+
+    def test_shape_overrides_universal(self) -> None:
+        stylesheet = ModelStylesheet(
+            rules=[
+                StyleRule(
+                    selector_type="universal",
+                    selector_value="*",
+                    specificity=0,
+                    llm_model="universal-model",
+                ),
+                StyleRule(
+                    selector_type="shape",
+                    selector_value="box",
+                    specificity=1,
+                    llm_model="shape-model",
+                ),
+            ]
+        )
+        node = PipelineNode(name="impl", handler_type="codergen", shape="box")
+        resolved = apply_stylesheet(stylesheet, node)
+        assert resolved["llm_model"] == "shape-model"
+
+    def test_class_overrides_shape(self) -> None:
+        stylesheet = ModelStylesheet(
+            rules=[
+                StyleRule(
+                    selector_type="shape",
+                    selector_value="box",
+                    specificity=1,
+                    llm_model="shape-model",
+                ),
+                StyleRule(
+                    selector_type="class",
+                    selector_value="fast",
+                    specificity=2,
+                    llm_model="class-model",
+                ),
+            ]
+        )
+        node = PipelineNode(
+            name="impl", handler_type="codergen", shape="box", classes=["fast"]
+        )
+        resolved = apply_stylesheet(stylesheet, node)
+        assert resolved["llm_model"] == "class-model"
+
+    def test_id_overrides_class(self) -> None:
+        stylesheet = ModelStylesheet(
+            rules=[
+                StyleRule(
+                    selector_type="class",
+                    selector_value="fast",
+                    specificity=2,
+                    llm_model="class-model",
+                ),
+                StyleRule(
+                    selector_type="id",
+                    selector_value="impl",
+                    specificity=3,
+                    llm_model="id-model",
+                ),
+            ]
+        )
+        node = PipelineNode(
+            name="impl", handler_type="codergen", shape="box", classes=["fast"]
+        )
+        resolved = apply_stylesheet(stylesheet, node)
+        assert resolved["llm_model"] == "id-model"
+
+    def test_full_specificity_cascade(self) -> None:
+        """All four selector types in one stylesheet — ID wins."""
+        stylesheet = ModelStylesheet(
+            rules=[
+                StyleRule(
+                    selector_type="universal",
+                    specificity=0,
+                    llm_model="universal-model",
+                    llm_provider="universal-provider",
+                    reasoning_effort="low",
+                ),
+                StyleRule(
+                    selector_type="shape",
+                    selector_value="box",
+                    specificity=1,
+                    llm_model="shape-model",
+                    llm_provider="shape-provider",
+                ),
+                StyleRule(
+                    selector_type="class",
+                    selector_value="code",
+                    specificity=2,
+                    llm_model="class-model",
+                ),
+                StyleRule(
+                    selector_type="id",
+                    selector_value="review",
+                    specificity=3,
+                    llm_model="id-model",
+                ),
+            ]
+        )
+        node = PipelineNode(
+            name="review", handler_type="codergen", shape="box", classes=["code"]
+        )
+        resolved = apply_stylesheet(stylesheet, node)
+        # ID overrides class overrides shape overrides universal
+        assert resolved["llm_model"] == "id-model"
+        # llm_provider: shape overrides universal (class and ID didn't set it)
+        assert resolved["llm_provider"] == "shape-provider"
+        # reasoning_effort: only universal set it
+        assert resolved["reasoning_effort"] == "low"
+
+    def test_specificity_wins_regardless_of_rule_order(self) -> None:
+        """Higher-specificity rules win even if declared before lower ones."""
+        stylesheet = ModelStylesheet(
+            rules=[
+                StyleRule(
+                    selector_type="id",
+                    selector_value="my_node",
+                    specificity=3,
+                    llm_model="id-model",
+                ),
+                StyleRule(
+                    selector_type="shape",
+                    selector_value="box",
+                    specificity=1,
+                    llm_model="shape-model",
+                ),
+                StyleRule(
+                    selector_type="universal",
+                    specificity=0,
+                    llm_model="universal-model",
+                ),
+            ]
+        )
+        node = PipelineNode(name="my_node", handler_type="codergen", shape="box")
+        resolved = apply_stylesheet(stylesheet, node)
+        assert resolved["llm_model"] == "id-model"
+
+
+class TestParseStylesheetShapeSelectors:
+    """P-P08: parse_stylesheet recognizes bare-word selectors as shape selectors."""
+
+    def test_parse_shape_selector(self) -> None:
+        css = 'box { llm_model: gpt-4o; }'
+        stylesheet = parse_stylesheet(css)
+        assert len(stylesheet.rules) == 1
+        rule = stylesheet.rules[0]
+        assert rule.selector_type == "shape"
+        assert rule.selector_value == "box"
+        assert rule.specificity == 1
+        assert rule.llm_model == "gpt-4o"
+
+    def test_parse_mdiamond_shape_selector(self) -> None:
+        css = 'Mdiamond { llm_model: claude-opus-4-6; }'
+        stylesheet = parse_stylesheet(css)
+        assert len(stylesheet.rules) == 1
+        rule = stylesheet.rules[0]
+        assert rule.selector_type == "shape"
+        assert rule.selector_value == "Mdiamond"
+        assert rule.specificity == 1
+
+    def test_parse_mixed_selectors_with_shape(self) -> None:
+        css = """
+            * { llm_model: default-model; }
+            box { llm_model: box-model; }
+            .fast { llm_model: fast-model; }
+            #review { llm_model: review-model; }
+        """
+        stylesheet = parse_stylesheet(css)
+        assert len(stylesheet.rules) == 4
+
+        # Verify selector types and specificity
+        types = [(r.selector_type, r.specificity) for r in stylesheet.rules]
+        assert types == [
+            ("universal", 0),
+            ("shape", 1),
+            ("class", 2),
+            ("id", 3),
+        ]
+
+    def test_parsed_shape_selector_matches_node(self) -> None:
+        css = 'box { llm_model: gpt-4o; llm_provider: openai; }'
+        stylesheet = parse_stylesheet(css)
+        node = PipelineNode(name="impl", handler_type="codergen", shape="box")
+        resolved = apply_stylesheet(stylesheet, node)
+        assert resolved["llm_model"] == "gpt-4o"
+        assert resolved["llm_provider"] == "openai"
+
+    def test_parsed_shape_does_not_match_wrong_shape(self) -> None:
+        css = 'hexagon { llm_model: gpt-4o; }'
+        stylesheet = parse_stylesheet(css)
+        node = PipelineNode(name="impl", handler_type="codergen", shape="box")
+        resolved = apply_stylesheet(stylesheet, node)
+        assert "llm_model" not in resolved
+
+    def test_parsed_specificity_cascade_with_shape(self) -> None:
+        """Full cascade via parse_stylesheet: universal < shape < class < ID."""
+        css = """
+            * { llm_model: universal; reasoning_effort: low; }
+            box { llm_model: from-shape; llm_provider: shape-prov; }
+            .code { llm_model: from-class; }
+            #impl { llm_model: from-id; }
+        """
+        stylesheet = parse_stylesheet(css)
+        node = PipelineNode(
+            name="impl", handler_type="codergen", shape="box", classes=["code"]
+        )
+        resolved = apply_stylesheet(stylesheet, node)
+        assert resolved["llm_model"] == "from-id"
+        assert resolved["llm_provider"] == "shape-prov"
+        assert resolved["reasoning_effort"] == "low"
+
+    def test_parse_shape_selector_with_multiple_properties(self) -> None:
+        css = 'diamond { llm_model: gpt-4o; llm_provider: openai; reasoning_effort: high; }'
+        stylesheet = parse_stylesheet(css)
+        assert len(stylesheet.rules) == 1
+        rule = stylesheet.rules[0]
+        assert rule.selector_type == "shape"
+        assert rule.llm_model == "gpt-4o"
+        assert rule.llm_provider == "openai"
+        assert rule.reasoning_effort == "high"

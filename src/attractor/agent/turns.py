@@ -76,4 +76,20 @@ class SteeringTurn:
     timestamp: float = field(default_factory=time.time)
 
 
-Turn = UserTurn | AssistantTurn | ToolResultsTurn | SteeringTurn
+@dataclass
+class SystemTurn:
+    """An internal system event turn.
+
+    Used for steering messages, config changes, and other internal events
+    that are not direct user input or LLM responses.
+
+    Attributes:
+        content: The system event content text.
+        timestamp: Epoch time when the turn was recorded.
+    """
+
+    content: str
+    timestamp: float = field(default_factory=time.time)
+
+
+Turn = UserTurn | AssistantTurn | ToolResultsTurn | SteeringTurn | SystemTurn

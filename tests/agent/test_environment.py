@@ -197,6 +197,54 @@ class TestFilterEnv:
         assert "ANTHROPIC_API_KEY" not in filtered
 
 
+# ---------------------------------------------------------------------------
+# A-C05: ExecResult.duration_ms
+# ---------------------------------------------------------------------------
+
+
+class TestExecResultDurationMs:
+    """Tests for the duration_ms field on ExecResult."""
+
+    def test_exec_result_has_duration_ms_field(self) -> None:
+        from attractor.agent.environment import ExecResult
+
+        result = ExecResult()
+        assert hasattr(result, "duration_ms")
+        assert isinstance(result.duration_ms, int)
+
+    def test_exec_result_duration_ms_defaults_to_zero(self) -> None:
+        from attractor.agent.environment import ExecResult
+
+        result = ExecResult(stdout="out", stderr="", exit_code=0, timed_out=False)
+        assert result.duration_ms == 0
+
+    def test_exec_result_duration_ms_accepts_value(self) -> None:
+        from attractor.agent.environment import ExecResult
+
+        result = ExecResult(duration_ms=150)
+        assert result.duration_ms == 150
+
+    @pytest.mark.asyncio
+    async def test_exec_command_populates_duration_ms(self, env) -> None:
+        result = await env.exec_command("echo hello")
+        assert isinstance(result.duration_ms, int)
+        assert result.duration_ms > 0
+
+    @pytest.mark.asyncio
+    async def test_exec_command_duration_ms_approximately_correct(self, env) -> None:
+        result = await env.exec_command("sleep 0.1")
+        # Should be at least 80ms (allowing tolerance) and less than 5000ms
+        assert result.duration_ms >= 80
+        assert result.duration_ms < 5000
+
+    @pytest.mark.asyncio
+    async def test_exec_command_duration_ms_on_timeout(self, env) -> None:
+        result = await env.exec_command("sleep 10", timeout_ms=200)
+        assert result.timed_out
+        assert isinstance(result.duration_ms, int)
+        assert result.duration_ms > 0
+
+
 class TestPlatform:
     def test_platform_returns_known_value(self) -> None:
         env = LocalExecutionEnvironment()

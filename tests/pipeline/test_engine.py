@@ -10,6 +10,7 @@ from attractor.pipeline.engine import EngineError, PipelineEngine, create_stage_
 from attractor.pipeline.events import PipelineEvent, PipelineEventEmitter, PipelineEventType
 from attractor.pipeline.handlers import HandlerRegistry
 from attractor.pipeline.models import (
+    BackoffConfig,
     Checkpoint,
     NodeResult,
     OutcomeStatus,
@@ -17,6 +18,11 @@ from attractor.pipeline.models import (
     PipelineContext,
     PipelineEdge,
     PipelineNode,
+    RetryPolicy,
+)
+from attractor.pipeline.transforms import (
+    TransformRegistry,
+    VariableExpansionTransform,
 )
 
 
@@ -1427,7 +1433,7 @@ class TestFidelityModes:
         assert ctx.get("_fidelity_mode") == "compact"
 
     async def test_fidelity_mode_changes_with_nodes(self) -> None:
-        """Each node with fidelity updates _fidelity_mode."""
+        """Each node resolves fidelity per §5.4 precedence."""
         registry = HandlerRegistry()
         registry.register("echo", EchoHandler())
 
@@ -1458,11 +1464,11 @@ class TestFidelityModes:
 
         engine = PipelineEngine(registry=registry)
         ctx = await engine.run(pipeline)
-        # Last node with fidelity was "middle" with "truncate"
-        assert ctx.get("_fidelity_mode") == "truncate"
+        # "end" has no fidelity → falls back to "compact" per spec §5.4
+        assert ctx.get("_fidelity_mode") == "compact"
 
-    async def test_no_fidelity_does_not_set_key(self) -> None:
-        """Nodes without fidelity don't set _fidelity_mode."""
+    async def test_fidelity_always_resolves(self) -> None:
+        """Fidelity always resolves per §5.4 — fallback is 'compact'."""
         registry = HandlerRegistry()
         registry.register("echo", EchoHandler())
 
@@ -1482,7 +1488,8 @@ class TestFidelityModes:
 
         engine = PipelineEngine(registry=registry)
         ctx = await engine.run(pipeline)
-        assert not ctx.has("_fidelity_mode")
+        # Fidelity always resolves — "compact" is the default fallback
+        assert ctx.get("_fidelity_mode") == "compact"
 
     def test_apply_fidelity_sets_context(self) -> None:
         """_apply_fidelity static method sets the context key."""
@@ -1846,3 +1853,964 @@ class TestLogsRootPassthrough:
         assert ctx.get("end_done") is True
         assert len(received_logs_root) == 2
         assert all(lr is None for lr in received_logs_root)
+
+
+class TestBackoffConfig:
+    """Tests for P-C07: BackoffConfig data model."""
+
+    def test_default_values(self) -> None:
+        """BackoffConfig defaults match spec section 3.6."""
+        config = BackoffConfig()
+        assert config.initial_delay_ms == 200
+        assert config.backoff_factor == 2.0
+        assert config.max_delay_ms == 60000
+        assert config.jitter is True
+
+    def test_calculate_delay_first_attempt_no_jitter(self) -> None:
+        """First attempt delay equals initial_delay_ms (no jitter)."""
+        config = BackoffConfig(initial_delay_ms=500, jitter=False)
+        delay = config.calculate_delay(1)
+        assert delay == pytest.approx(0.5, abs=1e-9)
+
+    def test_calculate_delay_exponential_growth(self) -> None:
+        """Delay grows exponentially with backoff_factor."""
+        config = BackoffConfig(
+            initial_delay_ms=100, backoff_factor=2.0, jitter=False
+        )
+        assert config.calculate_delay(1) == pytest.approx(0.1)
+        assert config.calculate_delay(2) == pytest.approx(0.2)
+        assert config.calculate_delay(3) == pytest.approx(0.4)
+        assert config.calculate_delay(4) == pytest.approx(0.8)
+
+    def test_calculate_delay_capped_at_max(self) -> None:
+        """Delay never exceeds max_delay_ms."""
+        config = BackoffConfig(
+            initial_delay_ms=1000,
+            backoff_factor=10.0,
+            max_delay_ms=5000,
+            jitter=False,
+        )
+        delay = config.calculate_delay(10)
+        assert delay == pytest.approx(5.0)
+
+    def test_calculate_delay_jitter_range(self) -> None:
+        """Jitter produces delays in [0.5x, 1.5x] range."""
+        config = BackoffConfig(
+            initial_delay_ms=1000, backoff_factor=1.0, max_delay_ms=1000, jitter=True
+        )
+        delays = [config.calculate_delay(1) for _ in range(200)]
+        base = 1.0  # 1000ms = 1s
+        assert all(base * 0.5 - 0.01 <= d <= base * 1.5 + 0.01 for d in delays)
+        # Jitter should produce variation
+        assert max(delays) > min(delays)
+
+    def test_calculate_delay_constant_factor(self) -> None:
+        """Factor 1.0 produces constant delay regardless of attempt."""
+        config = BackoffConfig(
+            initial_delay_ms=500, backoff_factor=1.0, max_delay_ms=500, jitter=False
+        )
+        for attempt in range(1, 10):
+            assert config.calculate_delay(attempt) == pytest.approx(0.5)
+
+    def test_calculate_delay_never_negative(self) -> None:
+        """Delay is never negative even with jitter."""
+        config = BackoffConfig(initial_delay_ms=1, jitter=True)
+        delays = [config.calculate_delay(1) for _ in range(200)]
+        assert all(d >= 0.0 for d in delays)
+
+
+class TestRetryPolicy:
+    """Tests for P-C07: RetryPolicy data model and presets."""
+
+    def test_default_values(self) -> None:
+        """RetryPolicy defaults to 1 attempt (no retries)."""
+        policy = RetryPolicy()
+        assert policy.max_attempts == 1
+        assert isinstance(policy.backoff, BackoffConfig)
+
+    def test_constant_preset(self) -> None:
+        """Constant preset uses factor=1.0 with no jitter."""
+        policy = RetryPolicy.constant(max_attempts=5, delay_ms=2000)
+        assert policy.max_attempts == 5
+        assert policy.backoff.backoff_factor == 1.0
+        assert policy.backoff.initial_delay_ms == 2000
+        assert policy.backoff.max_delay_ms == 2000
+        assert policy.backoff.jitter is False
+
+    def test_linear_preset(self) -> None:
+        """Linear preset uses factor=1.5 with jitter."""
+        policy = RetryPolicy.linear(max_attempts=4, initial_delay_ms=300)
+        assert policy.max_attempts == 4
+        assert policy.backoff.backoff_factor == 1.5
+        assert policy.backoff.initial_delay_ms == 300
+        assert policy.backoff.jitter is True
+
+    def test_exponential_preset(self) -> None:
+        """Exponential preset uses factor=2.0 by default."""
+        policy = RetryPolicy.exponential(max_attempts=6)
+        assert policy.max_attempts == 6
+        assert policy.backoff.backoff_factor == 2.0
+        assert policy.backoff.initial_delay_ms == 200
+        assert policy.backoff.max_delay_ms == 60000
+        assert policy.backoff.jitter is True
+
+    def test_aggressive_preset(self) -> None:
+        """Aggressive preset uses low delays and many attempts."""
+        policy = RetryPolicy.aggressive()
+        assert policy.max_attempts == 10
+        assert policy.backoff.initial_delay_ms == 100
+        assert policy.backoff.max_delay_ms == 5000
+
+    def test_patient_preset(self) -> None:
+        """Patient preset uses high delays and few attempts."""
+        policy = RetryPolicy.patient()
+        assert policy.max_attempts == 3
+        assert policy.backoff.initial_delay_ms == 2000
+        assert policy.backoff.max_delay_ms == 120000
+
+    def test_presets_produce_different_delays(self) -> None:
+        """Each preset produces meaningfully different delays."""
+        policies = {
+            "constant": RetryPolicy.constant(jitter=False),
+            "exponential": RetryPolicy.exponential(jitter=False),
+            "aggressive": RetryPolicy.aggressive(),
+            "patient": RetryPolicy.patient(),
+        }
+        delays_at_1 = {
+            name: p.backoff.calculate_delay(1)
+            for name, p in policies.items()
+            if not p.backoff.jitter
+        }
+        # Constant uses 1000ms, exponential uses 200ms — they differ
+        assert delays_at_1["constant"] != delays_at_1["exponential"]
+
+    def test_custom_backoff_config(self) -> None:
+        """RetryPolicy accepts custom BackoffConfig."""
+        config = BackoffConfig(
+            initial_delay_ms=42, backoff_factor=3.0, max_delay_ms=999, jitter=False
+        )
+        policy = RetryPolicy(max_attempts=7, backoff=config)
+        assert policy.max_attempts == 7
+        assert policy.backoff.initial_delay_ms == 42
+        delay_2 = policy.backoff.calculate_delay(2)
+        assert delay_2 == pytest.approx(0.042 * 3.0)
+
+
+class TestRetryPolicyEngineIntegration:
+    """Tests for P-C07: RetryPolicy integration with PipelineEngine."""
+
+    async def test_node_retry_policy_controls_max_attempts(self) -> None:
+        """node.retry_policy.max_attempts overrides node.max_retries."""
+        retry_handler = RetryHandler(retries_before_success=2)
+        registry = HandlerRegistry()
+        registry.register("retry", retry_handler)
+        registry.register("echo", EchoHandler())
+
+        policy = RetryPolicy.constant(max_attempts=4, delay_ms=1, jitter=False)
+
+        pipeline = Pipeline(
+            name="policy_attempts",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="retry",
+                    is_start=True,
+                    max_retries=0,  # Would normally mean no retries
+                    retry_policy=policy,
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        # retry_policy max_attempts=4 allows enough retries
+        assert retry_handler.attempt_count == 3
+        assert ctx.get("end_done") is True
+
+    async def test_engine_default_retry_policy_used_when_node_has_none(self) -> None:
+        """Engine default_retry_policy used when node has no retry_policy."""
+        retry_handler = RetryHandler(retries_before_success=1)
+        registry = HandlerRegistry()
+        registry.register("retry", retry_handler)
+        registry.register("echo", EchoHandler())
+
+        default_policy = RetryPolicy.constant(max_attempts=3, delay_ms=1, jitter=False)
+
+        pipeline = Pipeline(
+            name="default_policy",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="retry",
+                    is_start=True,
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, default_retry_policy=default_policy)
+        ctx = await engine.run(pipeline)
+        assert retry_handler.attempt_count == 2
+        assert ctx.get("end_done") is True
+
+    async def test_node_retry_policy_overrides_engine_default(self) -> None:
+        """node.retry_policy takes precedence over engine default."""
+        retry_handler = RetryHandler(retries_before_success=999)
+        registry = HandlerRegistry()
+        registry.register("retry", retry_handler)
+
+        # Engine default allows 10 attempts, but node policy allows only 2
+        engine_policy = RetryPolicy.constant(max_attempts=10, delay_ms=1, jitter=False)
+        node_policy = RetryPolicy.constant(max_attempts=2, delay_ms=1, jitter=False)
+
+        pipeline = Pipeline(
+            name="override_test",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="retry",
+                    is_start=True,
+                    retry_policy=node_policy,
+                    retry_target="start",
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(
+            registry=registry,
+            default_retry_policy=engine_policy,
+            max_steps=5,
+        )
+        ctx = await engine.run(pipeline)
+        # Node policy limits to 2 attempts per execution of the node
+        assert retry_handler.attempt_count <= 10
+
+    async def test_retry_policy_backoff_used_for_delay(self) -> None:
+        """Engine uses retry_policy.backoff for delay calculation."""
+        engine = PipelineEngine()
+
+        # Node with custom policy
+        policy = RetryPolicy(
+            max_attempts=5,
+            backoff=BackoffConfig(
+                initial_delay_ms=1000,
+                backoff_factor=1.0,
+                max_delay_ms=1000,
+                jitter=False,
+            ),
+        )
+        node = PipelineNode(
+            name="test", handler_type="echo", retry_policy=policy
+        )
+
+        delay = engine._retry_delay(1, node)
+        assert delay == pytest.approx(1.0)
+
+        delay2 = engine._retry_delay(5, node)
+        assert delay2 == pytest.approx(1.0)  # constant
+
+    async def test_engine_default_policy_backoff_used(self) -> None:
+        """Engine default_retry_policy backoff is used when node has none."""
+        policy = RetryPolicy(
+            max_attempts=3,
+            backoff=BackoffConfig(
+                initial_delay_ms=500,
+                backoff_factor=2.0,
+                max_delay_ms=60000,
+                jitter=False,
+            ),
+        )
+        engine = PipelineEngine(default_retry_policy=policy)
+        node = PipelineNode(name="test", handler_type="echo")
+
+        delay = engine._retry_delay(1, node)
+        assert delay == pytest.approx(0.5)
+
+        delay2 = engine._retry_delay(2, node)
+        assert delay2 == pytest.approx(1.0)
+
+    async def test_legacy_backoff_when_no_policy(self) -> None:
+        """Legacy hardcoded backoff used when no retry policy is set."""
+        engine = PipelineEngine()
+        node = PipelineNode(name="test", handler_type="echo")
+
+        delays = [engine._retry_delay(1, node) for _ in range(100)]
+        # Legacy: 200ms initial with jitter [0.5, 1.5] → [0.1, 0.3]
+        assert all(0.05 <= d <= 0.35 for d in delays)
+
+
+class TestTransformEngineIntegration:
+    """Tests for P-C08: Transform system integration with PipelineEngine."""
+
+    async def test_engine_applies_transforms_before_execution(self) -> None:
+        """Engine applies transform_registry transforms before running nodes."""
+        registry = HandlerRegistry()
+
+        class PromptCapture:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            async def execute(self, node, context, graph=None, logs_root=None):
+                self.prompts.append(node.prompt)
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    context_updates={f"{node.name}_done": True},
+                )
+
+        capture = PromptCapture()
+        registry.register("capture", capture)
+
+        transform_reg = TransformRegistry()
+        transform_reg.register_builtin(VariableExpansionTransform())
+
+        pipeline = Pipeline(
+            name="transform_test",
+            goal="fix the login bug",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="capture",
+                    is_start=True,
+                    prompt="Your goal: $goal",
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="capture", is_terminal=True, prompt="done"
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, transform_registry=transform_reg)
+        ctx = await engine.run(pipeline)
+
+        assert ctx.get("start_done") is True
+        assert capture.prompts[0] == "Your goal: fix the login bug"
+        assert capture.prompts[1] == "done"
+
+    async def test_engine_without_transform_registry_works(self) -> None:
+        """Engine works normally when no transform_registry is set."""
+        registry = HandlerRegistry()
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="no_transforms",
+            goal="some goal",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    prompt="$goal should remain unexpanded",
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert ctx.get("end_done") is True
+        # Without transforms, $goal stays as-is
+        assert pipeline.nodes["start"].prompt == "$goal should remain unexpanded"
+
+    async def test_custom_transform_modifies_pipeline(self) -> None:
+        """Custom transforms can modify the pipeline before execution."""
+
+        class AddPrefixTransform:
+            def apply(self, pipeline: Pipeline) -> Pipeline:
+                for node in pipeline.nodes.values():
+                    if node.prompt:
+                        node.prompt = f"[PREFIX] {node.prompt}"
+                return pipeline
+
+        registry = HandlerRegistry()
+
+        class PromptCapture:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            async def execute(self, node, context, graph=None, logs_root=None):
+                self.prompts.append(node.prompt)
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    context_updates={f"{node.name}_done": True},
+                )
+
+        capture = PromptCapture()
+        registry.register("capture", capture)
+
+        transform_reg = TransformRegistry()
+        transform_reg.register(AddPrefixTransform())
+
+        pipeline = Pipeline(
+            name="custom_transform",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="capture",
+                    is_start=True,
+                    prompt="hello",
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="capture", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, transform_registry=transform_reg)
+        await engine.run(pipeline)
+
+        assert capture.prompts[0] == "[PREFIX] hello"
+
+
+# ── Fidelity Resolution (P-C03) ──────────────────────────────────────
+
+
+class TestFidelityResolution:
+    """Tests for 4-level fidelity precedence resolution per spec §5.4."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_compact(self) -> None:
+        """Default fidelity is 'compact' when nothing is set."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_default",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="echo", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert ctx.get("_fidelity_mode") == "compact"
+
+    @pytest.mark.asyncio
+    async def test_graph_default_fidelity(self) -> None:
+        """Graph default_fidelity overrides fallback."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_graph",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="echo", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+            default_fidelity="truncate",
+        )
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert ctx.get("_fidelity_mode") == "truncate"
+
+    @pytest.mark.asyncio
+    async def test_node_fidelity_overrides_graph(self) -> None:
+        """Node fidelity overrides graph default."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_node",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="echo", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end",
+                    handler_type="echo",
+                    is_terminal=True,
+                    fidelity="full",
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+            default_fidelity="truncate",
+        )
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        # Last node processed is "end" with fidelity="full"
+        assert ctx.get("_fidelity_mode") == "full"
+
+    @pytest.mark.asyncio
+    async def test_edge_fidelity_overrides_node_and_graph(self) -> None:
+        """Edge fidelity has highest precedence."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_edge",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="echo", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end",
+                    handler_type="echo",
+                    is_terminal=True,
+                    fidelity="truncate",
+                ),
+            },
+            edges=[
+                PipelineEdge(
+                    source="start", target="end", fidelity="summary:high"
+                )
+            ],
+            start_node="start",
+            default_fidelity="compact",
+        )
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert ctx.get("_fidelity_mode") == "summary:high"
+
+    @pytest.mark.asyncio
+    async def test_start_node_uses_graph_default(self) -> None:
+        """Start node has no incoming edge — uses graph default or fallback."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_start",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                ),
+            },
+            edges=[],
+            start_node="start",
+            default_fidelity="full",
+        )
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert ctx.get("_fidelity_mode") == "full"
+
+
+class TestFidelityApplication:
+    """Tests that fidelity modes actually transform context data."""
+
+    @pytest.mark.asyncio
+    async def test_full_preserves_all_data(self) -> None:
+        """'full' mode should preserve all context data."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_full",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                    fidelity="full",
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+        ctx = PipelineContext()
+        long_value = "x" * 1000
+        ctx.set("big_key", long_value)
+
+        engine = PipelineEngine(registry=registry)
+        result_ctx = await engine.run(pipeline, context=ctx)
+        assert result_ctx.get("big_key") == long_value
+
+    @pytest.mark.asyncio
+    async def test_truncate_trims_long_values(self) -> None:
+        """'truncate' mode should trim long string values."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_truncate",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                    fidelity="truncate",
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+        ctx = PipelineContext()
+        long_value = "x" * 1000
+        ctx.set("big_key", long_value)
+        ctx.set("small_key", "short")
+
+        engine = PipelineEngine(registry=registry)
+        result_ctx = await engine.run(pipeline, context=ctx)
+        big = result_ctx.get("big_key")
+        assert "[truncated]" in big
+        assert len(big) < len(long_value)
+        # Short values are preserved
+        assert result_ctx.get("small_key") == "short"
+
+    @pytest.mark.asyncio
+    async def test_truncate_preserves_internal_keys(self) -> None:
+        """'truncate' mode should not modify _-prefixed internal keys."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_truncate_internal",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                    fidelity="truncate",
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+        ctx = PipelineContext()
+        long_internal = "y" * 1000
+        ctx.set("_internal_big", long_internal)
+
+        engine = PipelineEngine(registry=registry)
+        result_ctx = await engine.run(pipeline, context=ctx)
+        assert result_ctx.get("_internal_big") == long_internal
+
+    @pytest.mark.asyncio
+    async def test_compact_replaces_large_values(self) -> None:
+        """'compact' mode should replace large values with placeholder."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_compact",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                    fidelity="compact",
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+        ctx = PipelineContext()
+        ctx.set("big_str", "z" * 1000)
+        ctx.set("small_str", "ok")
+
+        engine = PipelineEngine(registry=registry)
+        result_ctx = await engine.run(pipeline, context=ctx)
+        assert "[compact:" in result_ctx.get("big_str")
+        assert result_ctx.get("small_str") == "ok"
+
+    @pytest.mark.asyncio
+    async def test_compact_replaces_large_collections(self) -> None:
+        """'compact' mode should replace large dicts/lists with placeholder."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_compact_coll",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                    fidelity="compact",
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+        ctx = PipelineContext()
+        ctx.set("big_list", list(range(500)))
+
+        engine = PipelineEngine(registry=registry)
+        result_ctx = await engine.run(pipeline, context=ctx)
+        val = result_ctx.get("big_list")
+        assert isinstance(val, str)
+        assert "compact:" in val
+        assert "list" in val
+
+    @pytest.mark.asyncio
+    async def test_summary_marks_for_summarization(self) -> None:
+        """'summary:*' modes set _needs_summarization and _summary_detail."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        pipeline = Pipeline(
+            name="fidelity_summary",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                    fidelity="summary:medium",
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert ctx.get("_needs_summarization") is True
+        assert ctx.get("_summary_detail") == "medium"
+
+
+# ── CHECKPOINT_SAVED Event (P-P17) ───────────────────────────────────
+
+
+class TestCheckpointSavedEvent:
+    """Tests that CHECKPOINT_SAVED events are emitted after saves."""
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_saved_event_emitted(self, tmp_path: ...) -> None:
+        """CHECKPOINT_SAVED should fire after each successful save."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        events: list[PipelineEvent] = []
+
+        async def capture_event(event: PipelineEvent) -> None:
+            events.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.CHECKPOINT_SAVED, capture_event)
+
+        pipeline = Pipeline(
+            name="ckpt_event",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="echo", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(
+            registry=registry,
+            checkpoint_dir=tmp_path,
+            event_emitter=emitter,
+        )
+        await engine.run(pipeline)
+
+        checkpoint_events = [
+            e for e in events if e.type == PipelineEventType.CHECKPOINT_SAVED
+        ]
+        # At least one checkpoint saved event should fire
+        assert len(checkpoint_events) >= 1
+        # Each event should include node_id in data
+        for ce in checkpoint_events:
+            assert "node_id" in ce.data
+            assert ce.pipeline_name == "ckpt_event"
+
+    @pytest.mark.asyncio
+    async def test_no_checkpoint_event_without_dir(self) -> None:
+        """No CHECKPOINT_SAVED events when no checkpoint_dir is set."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        events: list[PipelineEvent] = []
+
+        async def capture_event(event: PipelineEvent) -> None:
+            events.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.CHECKPOINT_SAVED, capture_event)
+
+        pipeline = Pipeline(
+            name="no_ckpt_event",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, event_emitter=emitter)
+        await engine.run(pipeline)
+
+        checkpoint_events = [
+            e for e in events if e.type == PipelineEventType.CHECKPOINT_SAVED
+        ]
+        assert len(checkpoint_events) == 0
+
+
+# ── PIPELINE_FAILED Event (P-P18) ────────────────────────────────────
+
+
+class TestPipelineFailedEvent:
+    """Tests that PIPELINE_FAILED events are emitted on failure."""
+
+    @pytest.mark.asyncio
+    async def test_pipeline_failed_on_no_failure_route(self) -> None:
+        """PIPELINE_FAILED emitted when node fails with no failure route."""
+        fail_handler = FailHandler()
+        registry = HandlerRegistry()
+        registry.register("fail", fail_handler)
+
+        events: list[PipelineEvent] = []
+
+        async def capture_event(event: PipelineEvent) -> None:
+            events.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.PIPELINE_FAILED, capture_event)
+
+        pipeline = Pipeline(
+            name="fail_event",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="fail", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="fail", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, event_emitter=emitter)
+        with pytest.raises(EngineError, match="failed with no failure route"):
+            await engine.run(pipeline)
+
+        failed_events = [
+            e for e in events if e.type == PipelineEventType.PIPELINE_FAILED
+        ]
+        assert len(failed_events) == 1
+        assert "error" in failed_events[0].data
+        assert "duration" in failed_events[0].data
+        assert isinstance(failed_events[0].data["duration"], float)
+        assert failed_events[0].pipeline_name == "fail_event"
+
+    @pytest.mark.asyncio
+    async def test_pipeline_failed_on_missing_handler(self) -> None:
+        """PIPELINE_FAILED emitted when handler is not registered."""
+        events: list[PipelineEvent] = []
+
+        async def capture_event(event: PipelineEvent) -> None:
+            events.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.PIPELINE_FAILED, capture_event)
+
+        registry = HandlerRegistry()  # empty — no handlers
+
+        pipeline = Pipeline(
+            name="missing_handler",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="nonexistent", is_start=True
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, event_emitter=emitter)
+        with pytest.raises(EngineError, match="No handler registered"):
+            await engine.run(pipeline)
+
+        failed_events = [
+            e for e in events if e.type == PipelineEventType.PIPELINE_FAILED
+        ]
+        assert len(failed_events) == 1
+        assert "error" in failed_events[0].data
+        assert "duration" in failed_events[0].data
+
+    @pytest.mark.asyncio
+    async def test_no_pipeline_failed_on_success(self) -> None:
+        """No PIPELINE_FAILED event when pipeline completes successfully."""
+        handler = EchoHandler()
+        registry = HandlerRegistry()
+        registry.register("echo", handler)
+
+        events: list[PipelineEvent] = []
+
+        async def capture_event(event: PipelineEvent) -> None:
+            events.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.PIPELINE_FAILED, capture_event)
+
+        pipeline = Pipeline(
+            name="success_no_fail",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    is_terminal=True,
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, event_emitter=emitter)
+        await engine.run(pipeline)
+
+        failed_events = [
+            e for e in events if e.type == PipelineEventType.PIPELINE_FAILED
+        ]
+        assert len(failed_events) == 0

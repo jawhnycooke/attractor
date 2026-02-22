@@ -20,6 +20,13 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from attractor.pipeline.conditions import evaluate_condition
+from attractor.pipeline.interviewer import (
+    Answer,
+    AnswerValue,
+    Option,
+    Question,
+    QuestionType,
+)
 from attractor.pipeline.models import (
     NodeResult,
     OutcomeStatus,
@@ -392,25 +399,20 @@ class CodergenHandler:
         # Resolve backend
         backend = self._backend
         if backend is None:
-            try:
-                backend = AgentBackend()
-            except ImportError:
-                logger.warning(
-                    "attractor.agent not available — falling back to simulation mode"
+            # P-C02: Simulation mode per spec §4.5 — no backend provided
+            result_text = f"[Simulated] Response for stage: {node.name}"
+            if stage_dir is not None:
+                (stage_dir / "response.md").write_text(result_text)
+                (stage_dir / "status.json").write_text(
+                    json.dumps({"status": "success", "node": node.name,
+                                "notes": "simulation mode"})
                 )
-                result_text = f"Simulated response for stage: {node.name}"
-                if stage_dir is not None:
-                    (stage_dir / "response.md").write_text(result_text)
-                    (stage_dir / "status.json").write_text(
-                        json.dumps({"status": "success", "node": node.name,
-                                    "notes": "simulation mode"})
-                    )
-                return NodeResult(
-                    status=OutcomeStatus.SUCCESS,
-                    output=result_text,
-                    context_updates={"last_response": result_text},
-                    notes="simulation mode — agent module not available",
-                )
+            return NodeResult(
+                status=OutcomeStatus.SUCCESS,
+                output=result_text,
+                context_updates={"last_response": result_text},
+                notes="simulation mode",
+            )
 
         try:
             result_text = await backend.run(node, prompt, context)
@@ -427,23 +429,6 @@ class CodergenHandler:
                 status=OutcomeStatus.SUCCESS,
                 output=result_text,
                 context_updates={"last_response": result_text},
-            )
-        except ImportError:
-            logger.warning(
-                "attractor.agent not available — falling back to simulation mode"
-            )
-            result_text = f"Simulated response for stage: {node.name}"
-            if stage_dir is not None:
-                (stage_dir / "response.md").write_text(result_text)
-                (stage_dir / "status.json").write_text(
-                    json.dumps({"status": "success", "node": node.name,
-                                "notes": "simulation mode"})
-                )
-            return NodeResult(
-                status=OutcomeStatus.SUCCESS,
-                output=result_text,
-                context_updates={"last_response": result_text},
-                notes="simulation mode — agent module not available",
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
@@ -544,50 +529,77 @@ class WaitHumanHandler:
                     _parse_accelerator_key(label) for label in edge_labels
                 ]
 
+                # P-C10: Construct Question with MULTIPLE_CHOICE per spec §6.2
+                options = [
+                    Option(key=accel, label=label)
+                    for accel, label in zip(accelerator_keys, edge_labels)
+                ]
+                question = Question(
+                    text=prompt,
+                    type=QuestionType.MULTIPLE_CHOICE,
+                    options=options,
+                    stage=node.name,
+                    timeout_seconds=timeout,
+                )
+
                 await interviewer.inform(f"Node '{node.name}': {prompt}")
 
-                if hasattr(interviewer, "ask"):
-                    # H8: Wrap with timeout if configured
-                    try:
-                        ask_coro = interviewer.ask(
-                            prompt,
-                            options=edge_labels,
-                            accelerators=accelerator_keys,
+                # P-C10: Call interviewer.ask(question) per spec §6.1
+                try:
+                    ask_coro = interviewer.ask(question)
+                    if timeout is not None:
+                        raw_answer = await asyncio.wait_for(
+                            ask_coro, timeout=timeout
                         )
-                        if timeout is not None:
-                            answer = await asyncio.wait_for(
-                                ask_coro, timeout=timeout
-                            )
-                        else:
-                            answer = await ask_coro
-                    except asyncio.TimeoutError:
-                        return self._handle_timeout(node, edges)
+                    else:
+                        raw_answer = await ask_coro
+                except asyncio.TimeoutError:
+                    return self._handle_timeout(node, edges)
 
-                    # H8: Handle SKIPPED
-                    if answer == "SKIPPED":
-                        return NodeResult(
-                            status=OutcomeStatus.FAIL,
-                            failure_reason="human skipped interaction",
-                        )
+                # Normalize to Answer for backward compat with mocked interviewers
+                if isinstance(raw_answer, Answer):
+                    answer = raw_answer
+                else:
+                    answer = Answer(value=str(raw_answer))
 
-                    # Find the matching edge
-                    selected_edge = None
+                # H8: Handle SKIPPED
+                if answer.value in (AnswerValue.SKIPPED, "SKIPPED"):
+                    return NodeResult(
+                        status=OutcomeStatus.FAIL,
+                        failure_reason="human skipped interaction",
+                    )
+
+                # Find the matching edge via selected_option or value
+                selected_edge = None
+                if answer.selected_option is not None:
                     for e in edges:
                         label = e.label or e.target
-                        if label == answer:
+                        if label == answer.selected_option.label:
                             selected_edge = e
                             break
-                    if selected_edge is None:
-                        selected_edge = edges[0]
+                if selected_edge is None:
+                    answer_val = str(answer.value)
+                    for e in edges:
+                        label = e.label or e.target
+                        if label == answer_val:
+                            selected_edge = e
+                            break
+                if selected_edge is None:
+                    selected_edge = edges[0]
 
-                    return NodeResult(
-                        status=OutcomeStatus.SUCCESS,
-                        suggested_next_ids=[selected_edge.target],
-                        context_updates={
-                            "human_choice": answer,
-                            "selected_edge_id": selected_edge.target,
-                        },
-                    )
+                choice_value = (
+                    answer.selected_option.label
+                    if answer.selected_option
+                    else str(answer.value)
+                )
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    suggested_next_ids=[selected_edge.target],
+                    context_updates={
+                        "human_choice": choice_value,
+                        "selected_edge_id": selected_edge.target,
+                    },
+                )
 
         await interviewer.inform(f"Node '{node.name}': {prompt}")
 

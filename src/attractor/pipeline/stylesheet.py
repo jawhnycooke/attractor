@@ -36,7 +36,7 @@ class StyleRule:
     """
 
     # CSS-style selector fields
-    selector_type: str = "universal"  # "universal", "class", "id"
+    selector_type: str = "universal"  # "universal", "shape", "class", "id"
     selector_value: str = "*"
     specificity: int = 0
 
@@ -66,6 +66,9 @@ class StyleRule:
                 return False
         elif self.selector_type == "class":
             if self.selector_value not in node.classes:
+                return False
+        elif self.selector_type == "shape":
+            if node.shape != self.selector_value:
                 return False
         # selector_type == "universal" matches everything
 
@@ -165,8 +168,12 @@ def parse_stylesheet(css: str) -> ModelStylesheet:
 
     Supported selectors:
         - ``*`` — universal (matches all nodes)
-        - ``#name`` — ID selector (matches node by name)
+        - ``shape_name`` — shape selector (matches nodes by DOT shape)
         - ``.class`` — class selector (matches nodes with that class)
+        - ``#name`` — ID selector (matches node by name)
+
+    Specificity order (lowest to highest):
+        universal (0) < shape (1) < class (2) < ID (3)
 
     Args:
         css: CSS-like stylesheet text.
@@ -175,7 +182,9 @@ def parse_stylesheet(css: str) -> ModelStylesheet:
         A :class:`ModelStylesheet` populated with parsed rules.
     """
     rules: list[StyleRule] = []
-    rule_pattern = re.compile(r"([*#.][^\{]*?)\s*\{([^}]*)\}", re.DOTALL)
+    rule_pattern = re.compile(
+        r"([*#.][^\{]*?|[a-zA-Z_]\w*)\s*\{([^}]*)\}", re.DOTALL
+    )
 
     for match in rule_pattern.finditer(css):
         selector_str = match.group(1).strip()
@@ -189,13 +198,16 @@ def parse_stylesheet(css: str) -> ModelStylesheet:
         elif selector_str.startswith("#"):
             selector_type = "id"
             selector_value = selector_str[1:]
-            specificity = 2
+            specificity = 3
         elif selector_str.startswith("."):
             selector_type = "class"
             selector_value = selector_str[1:]
-            specificity = 1
+            specificity = 2
         else:
-            continue  # Skip unknown selectors
+            # Bare identifier → shape selector
+            selector_type = "shape"
+            selector_value = selector_str
+            specificity = 1
 
         # Parse declarations
         props: dict[str, str] = {}

@@ -52,6 +52,7 @@ class LLMClient:
         self._middleware: list[Middleware] = middleware or []
         self._retry_policy = retry_policy or RetryPolicy()
         self._on_retry = on_retry
+        self._closed: bool = False
 
     @classmethod
     def from_env(
@@ -132,6 +133,64 @@ class LLMClient:
             f"Available adapters: {[a.provider_name() for a in self._adapters]}"
         )
 
+    def _resolve_adapter(self, request: Request) -> Any:
+        """Resolve the adapter for a request.
+
+        If the request has an explicit ``provider`` field, routes directly
+        to the adapter with a matching ``provider_name()``. Otherwise
+        falls back to model-string detection via ``detect_provider()``.
+
+        Args:
+            request: The LLM request to route.
+
+        Returns:
+            The matched provider adapter.
+
+        Raises:
+            ValueError: If the specified provider is not registered or
+                no adapter matches the model string.
+        """
+        if request.provider:
+            for adapter in self._adapters:
+                if adapter.provider_name() == request.provider:
+                    return adapter
+            raise ValueError(
+                f"Provider '{request.provider}' is not registered. "
+                f"Available providers: {[a.provider_name() for a in self._adapters]}"
+            )
+        return self.detect_provider(request.model)
+
+    # -----------------------------------------------------------------
+    # Lifecycle
+    # -----------------------------------------------------------------
+
+    def _check_closed(self) -> None:
+        """Raise RuntimeError if the client has been closed."""
+        if self._closed:
+            raise RuntimeError("LLMClient is closed")
+
+    async def close(self) -> None:
+        """Release resources held by this client and its adapters.
+
+        Calls ``close()`` on each registered adapter that exposes the
+        method.  After this call, all subsequent operations on this
+        client will raise ``RuntimeError``.  Calling ``close()``
+        multiple times is safe (idempotent).
+        """
+        if self._closed:
+            return
+        self._closed = True
+        for adapter in self._adapters:
+            if hasattr(adapter, "close"):
+                try:
+                    await adapter.close()
+                except Exception:
+                    logger.warning(
+                        "Error closing adapter %s",
+                        getattr(adapter, "provider_name", lambda: "unknown")(),
+                        exc_info=True,
+                    )
+
     # -----------------------------------------------------------------
     # Middleware pipeline
     # -----------------------------------------------------------------
@@ -145,6 +204,15 @@ class LLMClient:
         for mw in reversed(self._middleware):
             response = await mw.after_response(response)
         return response
+
+    def _apply_wrap_stream(
+        self, stream: AsyncIterator[StreamEvent]
+    ) -> AsyncIterator[StreamEvent]:
+        """Wrap a stream through middleware that implements ``wrap_stream``."""
+        for mw in self._middleware:
+            if hasattr(mw, "wrap_stream"):
+                stream = mw.wrap_stream(stream)
+        return stream
 
     # -----------------------------------------------------------------
     # Retry logic
@@ -258,17 +326,26 @@ class LLMClient:
 
     async def complete(self, request: Request) -> Response:
         """Send a completion request, applying middleware and retries."""
-        adapter = self.detect_provider(request.model)
+        self._check_closed()
+        adapter = self._resolve_adapter(request)
         request = await self._apply_before(request)
         response = await self._complete_with_retry(adapter, request)
         response = await self._apply_after(response)
         return response
 
     async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
-        """Send a streaming request, applying before-middleware only."""
-        adapter = self.detect_provider(request.model)
+        """Send a streaming request, applying middleware.
+
+        Runs ``before_request`` on the request before streaming begins.
+        If any middleware implements ``wrap_stream``, the event iterator
+        is wrapped through those middleware in registration order.
+        """
+        self._check_closed()
+        adapter = self._resolve_adapter(request)
         request = await self._apply_before(request)
-        async for event in adapter.stream(request):
+        event_stream = adapter.stream(request)
+        event_stream = self._apply_wrap_stream(event_stream)
+        async for event in event_stream:
             yield event
 
     # -----------------------------------------------------------------

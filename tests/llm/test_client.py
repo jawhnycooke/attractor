@@ -1479,3 +1479,455 @@ class TestToolValidation:
         assert isinstance(part, ToolResultContent)
         assert part.is_error is True
         assert "Missing required field" in part.content
+
+
+# ---------------------------------------------------------------------------
+# Provider-based routing (L-C02)
+# ---------------------------------------------------------------------------
+
+
+class TestProviderBasedRouting:
+    """Tests for explicit provider-based routing via Request.provider field."""
+
+    def test_provider_routes_to_matching_adapter(self) -> None:
+        """Request with provider='anthropic' should route to that adapter."""
+        openai_adapter = MockAdapter(name="openai", prefixes=("gpt-",))
+        anthropic_adapter = MockAdapter(name="anthropic", prefixes=("claude-",))
+        client = LLMClient(adapters=[openai_adapter, anthropic_adapter])
+
+        request = Request(
+            messages=[Message.user("hi")],
+            model="some-model",
+            provider="anthropic",
+        )
+        resolved = client._resolve_adapter(request)
+        assert resolved is anthropic_adapter
+        assert resolved.provider_name() == "anthropic"
+
+    def test_provider_bypasses_model_detection(self) -> None:
+        """Provider field should override model-string detection.
+
+        Even though the model string 'gpt-4o' would match the openai adapter
+        via detect_model(), an explicit provider='anthropic' should route to
+        the anthropic adapter instead.
+        """
+        openai_adapter = MockAdapter(name="openai", prefixes=("gpt-",))
+        anthropic_adapter = MockAdapter(name="anthropic", prefixes=("claude-",))
+        client = LLMClient(adapters=[openai_adapter, anthropic_adapter])
+
+        request = Request(
+            messages=[Message.user("hi")],
+            model="gpt-4o",
+            provider="anthropic",
+        )
+        resolved = client._resolve_adapter(request)
+        assert resolved is anthropic_adapter
+
+    def test_fallback_to_model_detection_when_provider_is_none(self) -> None:
+        """When provider is None, routing should fall back to detect_model()."""
+        openai_adapter = MockAdapter(name="openai", prefixes=("gpt-",))
+        anthropic_adapter = MockAdapter(name="anthropic", prefixes=("claude-",))
+        client = LLMClient(adapters=[openai_adapter, anthropic_adapter])
+
+        request = Request(
+            messages=[Message.user("hi")],
+            model="claude-3-opus",
+            provider=None,
+        )
+        resolved = client._resolve_adapter(request)
+        assert resolved is anthropic_adapter
+
+    def test_unknown_provider_raises_value_error(self) -> None:
+        """Specifying a provider that isn't registered should raise ValueError."""
+        adapter = MockAdapter(name="openai", prefixes=("gpt-",))
+        client = LLMClient(adapters=[adapter])
+
+        request = Request(
+            messages=[Message.user("hi")],
+            model="gpt-4o",
+            provider="nonexistent",
+        )
+        with pytest.raises(ValueError, match="Provider 'nonexistent' is not registered"):
+            client._resolve_adapter(request)
+
+    def test_provider_field_is_optional_and_backward_compatible(self) -> None:
+        """Request without provider field should work identically to before."""
+        adapter = MockAdapter(name="mock", prefixes=("mock-",))
+        client = LLMClient(adapters=[adapter])
+
+        # Default constructor — provider defaults to None
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        assert request.provider is None
+        resolved = client._resolve_adapter(request)
+        assert resolved is adapter
+
+    @pytest.mark.asyncio
+    async def test_complete_uses_provider_routing(self) -> None:
+        """complete() should route via provider when set on the request."""
+        openai_adapter = MockAdapter(
+            name="openai",
+            prefixes=("gpt-",),
+            response=Response(
+                message=Message.assistant("openai reply"),
+                model="gpt-4o",
+                usage=TokenUsage(input_tokens=10, output_tokens=5),
+            ),
+        )
+        anthropic_adapter = MockAdapter(
+            name="anthropic",
+            prefixes=("claude-",),
+            response=Response(
+                message=Message.assistant("anthropic reply"),
+                model="claude-3",
+                usage=TokenUsage(input_tokens=10, output_tokens=5),
+            ),
+        )
+        client = LLMClient(adapters=[openai_adapter, anthropic_adapter])
+
+        request = Request(
+            messages=[Message.user("hi")],
+            model="my-custom-model",
+            provider="anthropic",
+        )
+        response = await client.complete(request)
+        assert response.message.text() == "anthropic reply"
+        assert len(anthropic_adapter.complete_calls) == 1
+        assert len(openai_adapter.complete_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_uses_provider_routing(self) -> None:
+        """stream() should route via provider when set on the request."""
+        adapter = MockAdapter(name="target", prefixes=())
+        other = MockAdapter(name="other", prefixes=("mock-",))
+        client = LLMClient(adapters=[other, adapter])
+
+        request = Request(
+            messages=[Message.user("hi")],
+            model="any-model",
+            provider="target",
+        )
+        events = []
+        async for event in client.stream(request):
+            events.append(event)
+
+        types = [e.type for e in events]
+        assert StreamEventType.TEXT_DELTA in types
+
+    def test_empty_string_provider_falls_back_to_model_detection(self) -> None:
+        """An empty string provider should be treated as absent (falsy)."""
+        adapter = MockAdapter(name="mock", prefixes=("mock-",))
+        client = LLMClient(adapters=[adapter])
+
+        request = Request(
+            messages=[Message.user("hi")],
+            model="mock-v1",
+            provider="",
+        )
+        resolved = client._resolve_adapter(request)
+        assert resolved is adapter
+
+
+# ---------------------------------------------------------------------------
+# L-C08: Streaming middleware support
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingMiddleware:
+    @pytest.mark.asyncio
+    async def test_before_request_runs_before_stream(self) -> None:
+        """before_request middleware should modify the request before streaming."""
+        call_log: list[str] = []
+
+        class TrackingMiddleware:
+            async def before_request(self, request: Request) -> Request:
+                call_log.append("before_request")
+                # Mutate to prove middleware ran
+                request.model = "mock-modified"
+                return request
+
+            async def after_response(self, response: Response) -> Response:
+                return response
+
+        class TrackingAdapter(MockAdapter):
+            async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+                call_log.append(f"stream:{request.model}")
+                yield StreamEvent(type=StreamEventType.STREAM_START)
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="ok")
+                yield StreamEvent(
+                    type=StreamEventType.FINISH,
+                    finish_reason=FinishReason.STOP,
+                    usage=TokenUsage(input_tokens=5, output_tokens=2),
+                )
+
+        adapter = TrackingAdapter(prefixes=("mock-",))
+        mw = TrackingMiddleware()
+        client = LLMClient(adapters=[adapter], middleware=[mw])
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        events = []
+        async for event in client.stream(request):
+            events.append(event)
+
+        # before_request ran before streaming
+        assert call_log[0] == "before_request"
+        assert call_log[1] == "stream:mock-modified"
+        # Stream actually produced events
+        assert any(e.type == StreamEventType.TEXT_DELTA for e in events)
+
+    @pytest.mark.asyncio
+    async def test_wrap_stream_middleware_observes_events(self) -> None:
+        """Middleware with wrap_stream should see every stream event."""
+        observed_types: list[StreamEventType] = []
+
+        class StreamObserver:
+            async def before_request(self, request: Request) -> Request:
+                return request
+
+            async def after_response(self, response: Response) -> Response:
+                return response
+
+            async def wrap_stream(
+                self, stream: AsyncIterator[StreamEvent]
+            ) -> AsyncIterator[StreamEvent]:
+                async for event in stream:
+                    observed_types.append(event.type)
+                    yield event
+
+        adapter = MockAdapter()
+        mw = StreamObserver()
+        client = LLMClient(adapters=[adapter], middleware=[mw])
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        events = []
+        async for event in client.stream(request):
+            events.append(event)
+
+        # wrap_stream saw all events
+        assert len(observed_types) == len(events)
+        assert StreamEventType.STREAM_START in observed_types
+        assert StreamEventType.TEXT_DELTA in observed_types
+        assert StreamEventType.FINISH in observed_types
+
+    @pytest.mark.asyncio
+    async def test_wrap_stream_can_transform_events(self) -> None:
+        """wrap_stream should be able to modify events passing through."""
+
+        class TextUppercaser:
+            async def before_request(self, request: Request) -> Request:
+                return request
+
+            async def after_response(self, response: Response) -> Response:
+                return response
+
+            async def wrap_stream(
+                self, stream: AsyncIterator[StreamEvent]
+            ) -> AsyncIterator[StreamEvent]:
+                async for event in stream:
+                    if event.type == StreamEventType.TEXT_DELTA and event.text:
+                        yield StreamEvent(
+                            type=event.type,
+                            text=event.text.upper(),
+                        )
+                    else:
+                        yield event
+
+        adapter = MockAdapter()
+        mw = TextUppercaser()
+        client = LLMClient(adapters=[adapter], middleware=[mw])
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        text_parts = []
+        async for event in client.stream(request):
+            if event.type == StreamEventType.TEXT_DELTA:
+                text_parts.append(event.text)
+
+        # Text deltas should be uppercased by the middleware
+        assert "MOCK " in text_parts
+        assert "STREAM" in text_parts
+
+    @pytest.mark.asyncio
+    async def test_middleware_without_wrap_stream_is_skipped(self) -> None:
+        """Middleware that doesn't implement wrap_stream should be ignored."""
+
+        class PlainMiddleware:
+            async def before_request(self, request: Request) -> Request:
+                return request
+
+            async def after_response(self, response: Response) -> Response:
+                return response
+
+        adapter = MockAdapter()
+        mw = PlainMiddleware()
+        client = LLMClient(adapters=[adapter], middleware=[mw])
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        events = []
+        async for event in client.stream(request):
+            events.append(event)
+
+        # Stream should work normally without wrap_stream
+        types = [e.type for e in events]
+        assert StreamEventType.TEXT_DELTA in types
+        assert StreamEventType.FINISH in types
+
+    @pytest.mark.asyncio
+    async def test_multiple_wrap_stream_middleware_chain(self) -> None:
+        """Multiple middleware with wrap_stream should chain in order."""
+        transform_log: list[str] = []
+
+        class PrefixMiddleware:
+            def __init__(self, tag: str) -> None:
+                self._tag = tag
+
+            async def before_request(self, request: Request) -> Request:
+                return request
+
+            async def after_response(self, response: Response) -> Response:
+                return response
+
+            async def wrap_stream(
+                self, stream: AsyncIterator[StreamEvent]
+            ) -> AsyncIterator[StreamEvent]:
+                async for event in stream:
+                    if event.type == StreamEventType.TEXT_DELTA:
+                        transform_log.append(self._tag)
+                    yield event
+
+        adapter = MockAdapter()
+        mw_a = PrefixMiddleware("A")
+        mw_b = PrefixMiddleware("B")
+        client = LLMClient(adapters=[adapter], middleware=[mw_a, mw_b])
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        async for _ in client.stream(request):
+            pass
+
+        # A wraps B wraps adapter. Events flow: adapter -> A -> B -> consumer
+        # So A sees events first, then B
+        # The MockAdapter yields 2 TEXT_DELTA events ("mock " and "stream")
+        assert len(transform_log) == 4  # 2 deltas x 2 middleware
+        # Order: A sees first delta, then B sees first delta, then A sees second, etc.
+        # Actually with chaining: adapter -> mw_a.wrap -> mw_b.wrap -> consumer
+        # mw_a wraps the raw stream, mw_b wraps mw_a's output
+        # So mw_a logs first for each event, then mw_b
+        # For each TEXT_DELTA: A logs, yields, B sees it, logs, yields
+        assert transform_log == ["A", "B", "A", "B"]
+
+
+# ---------------------------------------------------------------------------
+# L-C01: LLMClient.close()
+# ---------------------------------------------------------------------------
+
+
+class TestClientClose:
+    @pytest.mark.asyncio
+    async def test_close_marks_client_as_closed(self) -> None:
+        """close() should mark the client as closed."""
+        adapter = MockAdapter()
+        client = LLMClient(adapters=[adapter])
+        assert client._closed is False
+
+        await client.close()
+        assert client._closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_is_idempotent(self) -> None:
+        """Calling close() multiple times should not raise."""
+        adapter = MockAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        await client.close()
+        await client.close()  # second call should be a no-op
+        assert client._closed is True
+
+    @pytest.mark.asyncio
+    async def test_complete_after_close_raises(self) -> None:
+        """complete() should raise RuntimeError after close()."""
+        adapter = MockAdapter()
+        client = LLMClient(adapters=[adapter])
+        await client.close()
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        with pytest.raises(RuntimeError, match="LLMClient is closed"):
+            await client.complete(request)
+
+    @pytest.mark.asyncio
+    async def test_stream_after_close_raises(self) -> None:
+        """stream() should raise RuntimeError after close()."""
+        adapter = MockAdapter()
+        client = LLMClient(adapters=[adapter])
+        await client.close()
+
+        request = Request(messages=[Message.user("hi")], model="mock-v1")
+        with pytest.raises(RuntimeError, match="LLMClient is closed"):
+            async for _ in client.stream(request):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_generate_after_close_raises(self) -> None:
+        """generate() should raise RuntimeError after close()."""
+        adapter = MockAdapter()
+        client = LLMClient(adapters=[adapter])
+        await client.close()
+
+        with pytest.raises(RuntimeError, match="LLMClient is closed"):
+            await client.generate("hi", model="mock-v1")
+
+    @pytest.mark.asyncio
+    async def test_close_calls_adapter_close(self) -> None:
+        """close() should call close() on adapters that have it."""
+        close_called = False
+
+        class ClosableAdapter(MockAdapter):
+            async def close(self) -> None:
+                nonlocal close_called
+                close_called = True
+
+        adapter = ClosableAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        await client.close()
+        assert close_called is True
+
+    @pytest.mark.asyncio
+    async def test_close_handles_adapter_without_close(self) -> None:
+        """close() should skip adapters that don't have close()."""
+        adapter = MockAdapter()  # no close() method
+        client = LLMClient(adapters=[adapter])
+
+        # Should not raise
+        await client.close()
+        assert client._closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_handles_adapter_close_error(self) -> None:
+        """close() should continue even if an adapter's close() raises."""
+
+        class FailingCloseAdapter(MockAdapter):
+            async def close(self) -> None:
+                raise ConnectionError("close failed")
+
+        adapter = FailingCloseAdapter()
+        client = LLMClient(adapters=[adapter])
+
+        # Should not raise despite adapter error
+        await client.close()
+        assert client._closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_calls_close_on_multiple_adapters(self) -> None:
+        """close() should call close() on all adapters, not just the first."""
+        close_log: list[str] = []
+
+        class CloseTracker(MockAdapter):
+            async def close(self) -> None:
+                close_log.append(self._name)
+
+        adapter_a = CloseTracker(name="a", prefixes=("a-",))
+        adapter_b = CloseTracker(name="b", prefixes=("b-",))
+        client = LLMClient(adapters=[adapter_a, adapter_b])
+
+        await client.close()
+        assert "a" in close_log
+        assert "b" in close_log
+        assert len(close_log) == 2

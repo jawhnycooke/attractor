@@ -471,41 +471,41 @@ All items ✅ PASS
 
 ## Priority-Ordered Remediation
 
-### Tier 1 — Blocks Core Functionality
+### Tier 1 — Blocks Core Functionality ✅ ALL FIXED (2026-02-21, commit 7e492c8)
 
-| # | Gap ID | Subsystem | Description | Spec Section |
-|---|---|---|---|---|
-| 1 | L-C05 | LLM | Error translation in adapters — raw SDK exceptions leak | §7.6 (line 1608) |
-| 2 | P-C12 | Pipeline | Engine `logs_root` and `status.json` per node | §3.2 (line 331) |
-| 3 | P-C01 | Pipeline | `CodergenBackend` protocol — handler hardwires `agent.Session` | §4.5 (line 649) |
-| 4 | L-C04 | LLM | `ToolChoice` translation in adapters | §5.3 (line 1118) |
-| 5 | L-C03 | LLM | `generate()` return type → `GenerateResult` | §4.3 (line 843) |
+| # | Gap ID | Subsystem | Description | Spec Section | Status |
+|---|---|---|---|---|---|
+| 1 | L-C05 | LLM | Error translation in adapters — raw SDK exceptions leak | §7.6 (line 1608) | ✅ Fixed |
+| 2 | P-C12 | Pipeline | Engine `logs_root` and `status.json` per node | §3.2 (line 331) | ✅ Fixed |
+| 3 | P-C01 | Pipeline | `CodergenBackend` protocol — handler hardwires `agent.Session` | §4.5 (line 649) | ✅ Fixed |
+| 4 | L-C04 | LLM | `ToolChoice` translation in adapters | §5.3 (line 1118) | ✅ Fixed |
+| 5 | L-C03 | LLM | `generate()` return type → `GenerateResult` | §4.3 (line 843) | ✅ Fixed |
 
-### Tier 2 — Blocks Definition of Done
+### Tier 2 — Blocks Definition of Done ✅ ALL FIXED (2026-02-22, parallel agent team)
 
-| # | Gap ID | Subsystem | Description | Spec Section |
-|---|---|---|---|---|
-| 6 | P-C07 | Pipeline | `RetryPolicy`/`BackoffConfig` with preset policies | §3.6 (line 518) |
-| 7 | P-P08 | Pipeline | Stylesheet shape selectors | §8.3 (line 1466) |
-| 8 | P-C08 | Pipeline | Transform system | §9.1 (line 1528) |
-| 9 | P-C02 | Pipeline | Simulation mode for CodergenHandler | §4.5 (line 649) |
-| 10 | P-C10 | Pipeline | WaitHumanHandler Question/Answer interface | §4.6 (line 713) |
-| 11 | A-C01 | Agent | Session terminal state → IDLE not AWAITING_INPUT | §2.3 (line 183) |
-| 12 | A-C04 | Agent | `edit_file` `replace_all` parameter | §3.3 (line 527) |
-| 13 | L-C02 | LLM | Provider-based routing via `provider` field | §2.2 (line 116) |
+| # | Gap ID | Subsystem | Description | Spec Section | Status |
+|---|---|---|---|---|---|
+| 6 | P-C07 | Pipeline | `RetryPolicy`/`BackoffConfig` with preset policies | §3.6 (line 518) | ✅ Fixed — `BackoffConfig`/`RetryPolicy` dataclasses, 5 presets, engine integration |
+| 7 | P-P08 | Pipeline | Stylesheet shape selectors | §8.3 (line 1466) | ✅ Fixed — shape selectors, 4-level specificity (universal < shape < class < ID) |
+| 8 | P-C08 | Pipeline | Transform system | §9.1 (line 1528) | ✅ Fixed — `Transform` protocol, `VariableExpansionTransform`, `TransformRegistry` in new `transforms.py` |
+| 9 | P-C02 | Pipeline | Simulation mode for CodergenHandler | §4.5 (line 649) | ✅ Fixed — `backend=None` returns `[Simulated] Response for stage: {node.id}` |
+| 10 | P-C10 | Pipeline | WaitHumanHandler Question/Answer interface | §4.6 (line 713) | ✅ Fixed — uses `Question(type=MULTIPLE_CHOICE, options=[Option(key, label)])` |
+| 11 | A-C01 | Agent | Session terminal state → IDLE not AWAITING_INPUT | §2.3 (line 183) | ✅ Fixed — completion state changed from `AWAITING_INPUT` to `IDLE` |
+| 12 | A-C04 | Agent | `edit_file` `replace_all` parameter | §3.3 (line 527) | ✅ Fixed — `replace_all: bool` parameter added (default `False`) |
+| 13 | L-C02 | LLM | Provider-based routing via `provider` field | §2.2 (line 116) | ✅ Fixed — `_resolve_adapter()` checks `request.provider` first, falls back to model detection |
 
-### Tier 3 — Improves Completeness
+### Tier 3 — Improves Completeness ✅ ALL FIXED (2026-02-22, parallel agent team)
 
-| # | Gap ID | Subsystem | Description | Spec Section |
-|---|---|---|---|---|
-| 14 | P-C03 | Pipeline | Fidelity mode implementation | §5.4 (line 1139) |
-| 15 | P-C04 | Pipeline | ArtifactStore abstraction | §5.5 (line 1180) |
-| 16 | P-P17/P18 | Pipeline | Emit CHECKPOINT_SAVED, PIPELINE_FAILED events | §9.6 (line 1610) |
-| 17 | L-C06/C07 | LLM | Gemini adapter fixes (system_instruction, functionResponse) | §7.3 (line 1511) |
-| 18 | L-C08 | LLM | Streaming middleware | §2.3 (line 141) |
-| 19 | L-C01 | LLM | `LLMClient.close()` | §2.4 (line 183) |
-| 20 | A-C05 | Agent | `ExecResult.duration_ms` | §4.2 (line 751) |
-| 21 | A-C02 | Agent | `SystemTurn` type | §2.4 (line 204) |
+| # | Gap ID | Subsystem | Description | Spec Section | Status |
+|---|---|---|---|---|---|
+| 14 | P-C03 | Pipeline | Fidelity mode implementation | §5.4 (line 1139) | ✅ Fixed — 6 modes, 4-level precedence resolution, context transformation |
+| 15 | P-C04 | Pipeline | ArtifactStore abstraction | §5.5 (line 1180) | ✅ Fixed — `ArtifactStore` protocol, `LocalArtifactStore` with 100KB file-backing threshold |
+| 16 | P-P17/P18 | Pipeline | Emit CHECKPOINT_SAVED, PIPELINE_FAILED events | §9.6 (line 1610) | ✅ Fixed — events emitted at checkpoint saves and failure points |
+| 17 | L-C06/C07 | LLM | Gemini adapter fixes (system_instruction, functionResponse) | §7.3 (line 1511) | ✅ Fixed — `system_instruction` parameter, function name in `functionResponse` |
+| 18 | L-C08 | LLM | Streaming middleware | §2.3 (line 141) | ✅ Fixed — `StreamingMiddleware` protocol with `wrap_stream()`, `before_request` for stream() |
+| 19 | L-C01 | LLM | `LLMClient.close()` | §2.4 (line 183) | ✅ Fixed — async `close()`, idempotent, guards on post-close operations |
+| 20 | A-C05 | Agent | `ExecResult.duration_ms` | §4.2 (line 751) | ✅ Fixed — `duration_ms: int` field, populated via `time.monotonic()` |
+| 21 | A-C02 | Agent | `SystemTurn` type | §2.4 (line 204) | ✅ Fixed — `SystemTurn` dataclass with `content`/`timestamp`, added to `Turn` union |
 
 ### Tier 4 — Low Priority / Optional
 

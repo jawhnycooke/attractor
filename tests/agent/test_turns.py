@@ -12,6 +12,7 @@ from attractor.agent.tools.registry import ToolResult
 from attractor.agent.turns import (
     AssistantTurn,
     SteeringTurn,
+    SystemTurn,
     ToolResultsTurn,
     Turn,
     UserTurn,
@@ -281,3 +282,48 @@ class TestSessionTurns:
         ]
         assert len(tool_turns) == 1
         assert len(tool_turns[0].results) == 2
+
+
+# ---------------------------------------------------------------------------
+# A-C02: SystemTurn tests
+# ---------------------------------------------------------------------------
+
+
+class TestSystemTurn:
+    def test_system_turn_creation(self) -> None:
+        turn = SystemTurn(content="config changed")
+        assert turn.content == "config changed"
+        assert isinstance(turn.timestamp, float)
+
+    def test_system_turn_explicit_timestamp(self) -> None:
+        turn = SystemTurn(content="event", timestamp=2000.0)
+        assert turn.timestamp == 2000.0
+
+    def test_system_turn_timestamp_auto_set(self) -> None:
+        before = time.time()
+        turn = SystemTurn(content="auto")
+        after = time.time()
+        assert before <= turn.timestamp <= after
+
+    def test_system_turn_in_turn_union(self) -> None:
+        """SystemTurn should be part of the Turn union type."""
+        turn: Turn = SystemTurn(content="internal")
+        assert isinstance(turn, SystemTurn)
+
+    def test_system_turn_distinct_from_steering_turn(self) -> None:
+        """SystemTurn and SteeringTurn are separate types."""
+        system = SystemTurn(content="system event")
+        steering = SteeringTurn(content="steer")
+        assert type(system) is not type(steering)
+
+    def test_turn_type_alias_includes_system_turn(self) -> None:
+        """The Turn union type should include all 5 turn types."""
+        turns: list[Turn] = [
+            UserTurn(content="hi"),
+            AssistantTurn(content="hello"),
+            ToolResultsTurn(results=[]),
+            SteeringTurn(content="steer"),
+            SystemTurn(content="internal"),
+        ]
+        assert len(turns) == 5
+        assert isinstance(turns[4], SystemTurn)

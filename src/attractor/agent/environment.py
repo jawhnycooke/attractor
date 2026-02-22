@@ -13,6 +13,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -40,6 +41,7 @@ class ExecResult:
     stderr: str = ""
     exit_code: int = 0
     timed_out: bool = False
+    duration_ms: int = 0
 
 
 # Patterns for environment variable names that should be filtered out.
@@ -271,6 +273,7 @@ class LocalExecutionEnvironment:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+            start = time.monotonic()
             proc = subprocess.Popen(command, **kwargs)
             timed_out = False
             try:
@@ -292,12 +295,14 @@ class LocalExecutionEnvironment:
                     except ProcessLookupError:
                         pass
                     stdout_b, stderr_b = proc.communicate()
+            elapsed_ms = int((time.monotonic() - start) * 1000)
 
             return ExecResult(
                 stdout=stdout_b.decode("utf-8", errors="replace"),
                 stderr=stderr_b.decode("utf-8", errors="replace"),
                 exit_code=proc.returncode or 0,
                 timed_out=timed_out,
+                duration_ms=elapsed_ms,
             )
 
         return await asyncio.to_thread(_run)

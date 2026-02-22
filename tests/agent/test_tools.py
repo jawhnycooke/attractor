@@ -196,3 +196,121 @@ class TestToolRegistryUnregister:
         result = await registry.dispatch("read_file", {"path": "x.txt"}, env)
         assert result.is_error
         assert "unknown tool" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Gap A-C04: edit_file replace_all parameter
+# ---------------------------------------------------------------------------
+
+
+class TestEditFileReplaceAll:
+    @pytest.mark.asyncio
+    async def test_replace_all_false_is_default(self, env, tmp_path) -> None:
+        """Default behavior (replace_all absent) replaces single occurrence."""
+        (tmp_path / "single.txt").write_text("hello world\n")
+        result = await edit_file(
+            {"path": "single.txt", "old_string": "hello", "new_string": "goodbye"},
+            env,
+        )
+        assert not result.is_error
+        assert (tmp_path / "single.txt").read_text() == "goodbye world\n"
+
+    @pytest.mark.asyncio
+    async def test_replace_all_false_errors_on_multiple(self, env, tmp_path) -> None:
+        """replace_all=False errors when old_string appears multiple times."""
+        (tmp_path / "multi.txt").write_text("aaa\naaa\naaa\n")
+        result = await edit_file(
+            {
+                "path": "multi.txt",
+                "old_string": "aaa",
+                "new_string": "bbb",
+                "replace_all": False,
+            },
+            env,
+        )
+        assert result.is_error
+        assert "3 times" in result.output
+
+    @pytest.mark.asyncio
+    async def test_replace_all_true_replaces_all_occurrences(self, env, tmp_path) -> None:
+        """replace_all=True replaces every occurrence of old_string."""
+        (tmp_path / "multi.txt").write_text("aaa\naaa\naaa\n")
+        result = await edit_file(
+            {
+                "path": "multi.txt",
+                "old_string": "aaa",
+                "new_string": "bbb",
+                "replace_all": True,
+            },
+            env,
+        )
+        assert not result.is_error
+        content = (tmp_path / "multi.txt").read_text()
+        assert content == "bbb\nbbb\nbbb\n"
+        assert "aaa" not in content
+        assert "3 replacements" in result.output
+
+    @pytest.mark.asyncio
+    async def test_replace_all_true_single_occurrence(self, env, tmp_path) -> None:
+        """replace_all=True with single occurrence works without error."""
+        (tmp_path / "one.txt").write_text("find me here\n")
+        result = await edit_file(
+            {
+                "path": "one.txt",
+                "old_string": "find me",
+                "new_string": "found you",
+                "replace_all": True,
+            },
+            env,
+        )
+        assert not result.is_error
+        assert (tmp_path / "one.txt").read_text() == "found you here\n"
+        # Single replacement should not mention count
+        assert "replacements" not in result.output
+
+    @pytest.mark.asyncio
+    async def test_replace_all_not_found(self, env, tmp_path) -> None:
+        """replace_all=True still errors when old_string is absent."""
+        (tmp_path / "empty_match.txt").write_text("nothing to match\n")
+        result = await edit_file(
+            {
+                "path": "empty_match.txt",
+                "old_string": "missing",
+                "new_string": "replacement",
+                "replace_all": True,
+            },
+            env,
+        )
+        assert result.is_error
+        assert "not found" in result.output
+
+    @pytest.mark.asyncio
+    async def test_replace_all_file_not_found(self, env) -> None:
+        """replace_all=True on missing file returns error."""
+        result = await edit_file(
+            {
+                "path": "nonexistent.txt",
+                "old_string": "x",
+                "new_string": "y",
+                "replace_all": True,
+            },
+            env,
+        )
+        assert result.is_error
+        assert "not found" in result.output
+
+    @pytest.mark.asyncio
+    async def test_replace_all_adjacent_occurrences(self, env, tmp_path) -> None:
+        """replace_all handles adjacent/overlapping-like patterns correctly."""
+        (tmp_path / "adj.txt").write_text("ababab\n")
+        result = await edit_file(
+            {
+                "path": "adj.txt",
+                "old_string": "ab",
+                "new_string": "xy",
+                "replace_all": True,
+            },
+            env,
+        )
+        assert not result.is_error
+        assert (tmp_path / "adj.txt").read_text() == "xyxyxy\n"

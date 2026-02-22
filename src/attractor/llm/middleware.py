@@ -3,15 +3,21 @@
 Middleware can intercept and transform requests before they reach a provider
 and responses after they return, enabling cross-cutting concerns like
 logging, token tracking, and retry logic.
+
+Middleware also applies to streaming requests. Middleware that implements
+``wrap_stream`` can observe or transform individual stream events. The
+``before_request`` hook runs before the stream begins; ``wrap_stream``
+wraps the event iterator.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from attractor.llm.models import Request, Response, RetryPolicy, TokenUsage
+from attractor.llm.models import Request, Response, RetryPolicy, StreamEvent, TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,32 @@ class Middleware(Protocol):
 
         Returns:
             The (potentially modified) response to return upstream.
+        """
+        ...
+
+
+@runtime_checkable
+class StreamingMiddleware(Protocol):
+    """Optional protocol for middleware that wraps streaming event iterators.
+
+    Middleware classes can implement this alongside :class:`Middleware` to
+    observe or transform stream events as they pass through. The client
+    checks for ``wrap_stream`` via ``hasattr`` so existing middleware
+    that only implements ``before_request``/``after_response`` is
+    unaffected.
+    """
+
+    def wrap_stream(
+        self, stream: AsyncIterator[StreamEvent]
+    ) -> AsyncIterator[StreamEvent]:
+        """Wrap a streaming event iterator.
+
+        Args:
+            stream: The incoming async iterator of stream events.
+
+        Returns:
+            An async iterator that may observe, transform, or pass
+            through the stream events.
         """
         ...
 

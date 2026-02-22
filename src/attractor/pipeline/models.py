@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import enum
 import json
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -53,6 +54,132 @@ def coerce_value(raw: str) -> str | int | float | bool:
     except ValueError:
         pass
     return raw
+
+
+@dataclass
+class BackoffConfig:
+    """Configuration for retry delay calculation per spec section 3.6.
+
+    Attributes:
+        initial_delay_ms: First retry delay in milliseconds.
+        backoff_factor: Multiplier for subsequent delays.
+        max_delay_ms: Cap on delay in milliseconds.
+        jitter: Add random jitter to prevent thundering herd.
+    """
+
+    initial_delay_ms: int = 200
+    backoff_factor: float = 2.0
+    max_delay_ms: int = 60000
+    jitter: bool = True
+
+    def calculate_delay(self, attempt: int) -> float:
+        """Calculate delay in seconds for a given attempt number.
+
+        Args:
+            attempt: The attempt number (1-indexed, 1 = first retry).
+
+        Returns:
+            Delay in seconds, capped at max_delay_ms and optionally jittered.
+        """
+        delay_ms = self.initial_delay_ms * (self.backoff_factor ** (attempt - 1))
+        delay_ms = min(delay_ms, float(self.max_delay_ms))
+        delay_s = delay_ms / 1000.0
+        if self.jitter:
+            delay_s *= random.uniform(0.5, 1.5)
+        return max(0.0, delay_s)
+
+
+@dataclass
+class RetryPolicy:
+    """Retry policy with backoff configuration per spec section 3.6.
+
+    Attributes:
+        max_attempts: Maximum number of attempts (minimum 1; 1 means no retries).
+        backoff: Backoff configuration for delay calculation.
+    """
+
+    max_attempts: int = 1
+    backoff: BackoffConfig = field(default_factory=BackoffConfig)
+
+    @staticmethod
+    def constant(
+        max_attempts: int = 3,
+        delay_ms: int = 1000,
+        jitter: bool = False,
+    ) -> RetryPolicy:
+        """Create a policy with constant delay between retries."""
+        return RetryPolicy(
+            max_attempts=max_attempts,
+            backoff=BackoffConfig(
+                initial_delay_ms=delay_ms,
+                backoff_factor=1.0,
+                max_delay_ms=delay_ms,
+                jitter=jitter,
+            ),
+        )
+
+    @staticmethod
+    def linear(
+        max_attempts: int = 5,
+        initial_delay_ms: int = 500,
+        max_delay_ms: int = 30000,
+        jitter: bool = True,
+    ) -> RetryPolicy:
+        """Create a policy with gradually increasing delays (factor 1.5)."""
+        return RetryPolicy(
+            max_attempts=max_attempts,
+            backoff=BackoffConfig(
+                initial_delay_ms=initial_delay_ms,
+                backoff_factor=1.5,
+                max_delay_ms=max_delay_ms,
+                jitter=jitter,
+            ),
+        )
+
+    @staticmethod
+    def exponential(
+        max_attempts: int = 5,
+        initial_delay_ms: int = 200,
+        backoff_factor: float = 2.0,
+        max_delay_ms: int = 60000,
+        jitter: bool = True,
+    ) -> RetryPolicy:
+        """Create a policy with standard exponential backoff."""
+        return RetryPolicy(
+            max_attempts=max_attempts,
+            backoff=BackoffConfig(
+                initial_delay_ms=initial_delay_ms,
+                backoff_factor=backoff_factor,
+                max_delay_ms=max_delay_ms,
+                jitter=jitter,
+            ),
+        )
+
+    @staticmethod
+    def aggressive(max_attempts: int = 10) -> RetryPolicy:
+        """Create a policy with fast retries and low delays."""
+        return RetryPolicy(
+            max_attempts=max_attempts,
+            backoff=BackoffConfig(
+                initial_delay_ms=100,
+                backoff_factor=1.5,
+                max_delay_ms=5000,
+                jitter=True,
+            ),
+        )
+
+    @staticmethod
+    def patient(max_attempts: int = 3) -> RetryPolicy:
+        """Create a policy with slow retries and high delays."""
+        return RetryPolicy(
+            max_attempts=max_attempts,
+            backoff=BackoffConfig(
+                initial_delay_ms=2000,
+                backoff_factor=2.0,
+                max_delay_ms=120000,
+                jitter=True,
+            ),
+        )
 
 
 @dataclass
@@ -106,6 +233,7 @@ class PipelineNode:
     reasoning_effort: str = "high"
     auto_status: bool = False
     allow_partial: bool = False
+    retry_policy: RetryPolicy | None = None
 
 
 @dataclass

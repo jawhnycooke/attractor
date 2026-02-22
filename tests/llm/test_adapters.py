@@ -13,6 +13,9 @@ from attractor.llm.models import (
     Message,
     ReasoningEffort,
     Request,
+    Role,
+    ToolCallContent,
+    ToolResultContent,
 )
 
 
@@ -442,3 +445,229 @@ class TestGeminiReasoningTokens:
         response = adapter._map_response(raw, latency_ms=50.0)
         assert response.usage.input_tokens == 100
         assert response.usage.output_tokens == 50
+
+
+class TestGeminiSystemInstruction:
+    """L-C06: System prompt must use system_instruction, not fake messages."""
+
+    def test_system_prompt_passed_as_system_instruction(self) -> None:
+        """System prompt appears in config.system_instruction, not in contents."""
+        adapter = _make_gemini_adapter()
+        request = _simple_request(
+            model="gemini-2.0-flash",
+            system_prompt="You are a helpful coding assistant.",
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        # system_instruction is set in config
+        assert kwargs["config"]["system_instruction"] == "You are a helpful coding assistant."
+
+        # No fake user/model message pair in contents
+        contents = kwargs["contents"]
+        for entry in contents:
+            for part in entry.get("parts", []):
+                text = part.get("text", "")
+                assert "[System Instructions]" not in text
+                assert text != "Understood."
+
+    def test_no_system_prompt_omits_system_instruction(self) -> None:
+        """When no system prompt, system_instruction should not appear."""
+        adapter = _make_gemini_adapter()
+        request = _simple_request(model="gemini-2.0-flash")
+        kwargs = adapter._build_kwargs(request)
+
+        config = kwargs.get("config", {})
+        assert "system_instruction" not in config
+
+    def test_system_prompt_not_injected_as_messages(self) -> None:
+        """Contents should only contain the actual user message, no synthetic pair."""
+        adapter = _make_gemini_adapter()
+        request = _simple_request(
+            model="gemini-2.0-flash",
+            system_prompt="Be concise.",
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        contents = kwargs["contents"]
+        # Only the single user message "hello" from _simple_request
+        assert len(contents) == 1
+        assert contents[0]["role"] == "user"
+        assert contents[0]["parts"] == [{"text": "hello"}]
+
+
+class TestGeminiFunctionResponseName:
+    """L-C07: functionResponse must use function name, not call ID."""
+
+    def test_function_response_uses_function_name(self) -> None:
+        """ToolResultContent should map to functionResponse with function name."""
+        adapter = _make_gemini_adapter()
+
+        # Simulate a conversation with tool call and tool result
+        assistant_msg = Message(
+            role=Role.ASSISTANT,
+            content=[
+                ToolCallContent(
+                    tool_call_id="call_abc123",
+                    tool_name="read_file",
+                    arguments={"path": "/tmp/test.py"},
+                ),
+            ],
+        )
+        tool_msg = Message(
+            role=Role.USER,
+            content=[
+                ToolResultContent(
+                    tool_call_id="call_abc123",
+                    content="file contents here",
+                ),
+            ],
+        )
+        request = Request(
+            model="gemini-2.0-flash",
+            messages=[Message.user("hello"), assistant_msg, tool_msg],
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        # Find the functionResponse part
+        tool_result_content = None
+        for entry in kwargs["contents"]:
+            for part in entry.get("parts", []):
+                if "function_response" in part:
+                    tool_result_content = part["function_response"]
+                    break
+
+        assert tool_result_content is not None
+        # Must be the function NAME, not the call ID
+        assert tool_result_content["name"] == "read_file"
+        assert tool_result_content["name"] != "call_abc123"
+        assert tool_result_content["response"] == {"result": "file contents here"}
+
+    def test_multiple_tool_results_use_correct_names(self) -> None:
+        """Each tool result maps to its corresponding function name."""
+        adapter = _make_gemini_adapter()
+
+        assistant_msg = Message(
+            role=Role.ASSISTANT,
+            content=[
+                ToolCallContent(
+                    tool_call_id="call_001",
+                    tool_name="read_file",
+                    arguments={"path": "a.py"},
+                ),
+                ToolCallContent(
+                    tool_call_id="call_002",
+                    tool_name="exec_command",
+                    arguments={"command": "ls"},
+                ),
+            ],
+        )
+        tool_msg = Message(
+            role=Role.USER,
+            content=[
+                ToolResultContent(tool_call_id="call_001", content="file a"),
+                ToolResultContent(tool_call_id="call_002", content="dir listing"),
+            ],
+        )
+        request = Request(
+            model="gemini-2.0-flash",
+            messages=[Message.user("do stuff"), assistant_msg, tool_msg],
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        func_responses = []
+        for entry in kwargs["contents"]:
+            for part in entry.get("parts", []):
+                if "function_response" in part:
+                    func_responses.append(part["function_response"])
+
+        assert len(func_responses) == 2
+        assert func_responses[0]["name"] == "read_file"
+        assert func_responses[0]["response"] == {"result": "file a"}
+        assert func_responses[1]["name"] == "exec_command"
+        assert func_responses[1]["response"] == {"result": "dir listing"}
+
+    def test_unknown_call_id_falls_back_to_id(self) -> None:
+        """If no mapping exists, fall back to the call ID (graceful degradation)."""
+        adapter = _make_gemini_adapter()
+
+        # Tool result without a preceding tool call in messages
+        tool_msg = Message(
+            role=Role.USER,
+            content=[
+                ToolResultContent(
+                    tool_call_id="call_unknown",
+                    content="some result",
+                ),
+            ],
+        )
+        request = Request(
+            model="gemini-2.0-flash",
+            messages=[Message.user("hello"), tool_msg],
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        func_responses = []
+        for entry in kwargs["contents"]:
+            for part in entry.get("parts", []):
+                if "function_response" in part:
+                    func_responses.append(part["function_response"])
+
+        assert len(func_responses) == 1
+        assert func_responses[0]["name"] == "call_unknown"
+
+
+class TestGeminiRoundTrip:
+    """Round-trip: request with system prompt + tool results → correct Gemini format."""
+
+    def test_full_conversation_format(self) -> None:
+        """System prompt + user message + tool call/result produces correct structure."""
+        adapter = _make_gemini_adapter()
+
+        assistant_msg = Message(
+            role=Role.ASSISTANT,
+            content=[
+                ToolCallContent(
+                    tool_call_id="call_rt1",
+                    tool_name="grep",
+                    arguments={"pattern": "TODO", "path": "."},
+                ),
+            ],
+        )
+        tool_msg = Message(
+            role=Role.USER,
+            content=[
+                ToolResultContent(
+                    tool_call_id="call_rt1",
+                    content="src/main.py:42: # TODO fix this",
+                ),
+            ],
+        )
+        request = Request(
+            model="gemini-2.0-flash",
+            system_prompt="You are a code reviewer.",
+            messages=[Message.user("find TODOs"), assistant_msg, tool_msg],
+        )
+        kwargs = adapter._build_kwargs(request)
+
+        # System instruction in config, not in contents
+        assert kwargs["config"]["system_instruction"] == "You are a code reviewer."
+
+        # 3 messages in contents: user, assistant (function_call), user (function_response)
+        contents = kwargs["contents"]
+        assert len(contents) == 3
+
+        # First: user message
+        assert contents[0]["role"] == "user"
+        assert contents[0]["parts"] == [{"text": "find TODOs"}]
+
+        # Second: assistant with function_call
+        assert contents[1]["role"] == "model"
+        fc = contents[1]["parts"][0]["function_call"]
+        assert fc["name"] == "grep"
+        assert fc["args"] == {"pattern": "TODO", "path": "."}
+
+        # Third: user with functionResponse using function name
+        assert contents[2]["role"] == "user"
+        fr = contents[2]["parts"][0]["function_response"]
+        assert fr["name"] == "grep"
+        assert fr["response"] == {"result": "src/main.py:42: # TODO fix this"}
