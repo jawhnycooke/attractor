@@ -8,15 +8,17 @@ Attractor lets you define multi-step coding workflows as directed acyclic graphs
 
 ```dot
 digraph refactor {
-    analyze [handler="codergen" prompt="Analyze the codebase for dead code" start=true]
-    remove  [handler="codergen" prompt="Remove the dead code identified in {analysis}"]
-    verify  [handler="codergen" prompt="Run tests and verify nothing is broken"]
-    done    [terminal=true]
+    start   [shape=Mdiamond]
+    analyze [type="codergen" prompt="Analyze the codebase for dead code"]
+    remove  [type="codergen" prompt="Remove the dead code identified in {analysis}"]
+    verify  [type="codergen" prompt="Run tests and verify nothing is broken"]
+    done    [shape=Msquare]
 
+    start -> analyze
     analyze -> remove
     remove -> verify
-    verify -> done [condition="tests_passed == true"]
-    verify -> remove [condition="tests_passed == false" priority=2]
+    verify -> done [condition="tests_passed = true"]
+    verify -> remove [condition="tests_passed = false" weight=2]
 }
 ```
 
@@ -26,7 +28,7 @@ attractor run refactor.dot --model claude-sonnet-4-20250514 --verbose
 
 ## Key Features
 
-- **Pipeline-as-code** — Define workflows in GraphViz DOT with conditional branching, priority-based routing, and goal gates
+- **Pipeline-as-code** — Define workflows in GraphViz DOT with conditional branching, weight-based routing, and goal gates
 - **Autonomous agent** — Agentic loop with file read/write/edit, shell execution, grep, glob, and patch tools
 - **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), and Google (Gemini) through a unified interface
 - **Checkpoint & resume** — Automatic checkpointing after every node; resume failed pipelines from where they stopped

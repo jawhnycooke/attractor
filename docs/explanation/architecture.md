@@ -10,13 +10,13 @@
 
 Attractor is a non-interactive coding agent designed for use in software factories — automated environments where code is generated, tested, reviewed, and deployed without human intervention on every step. The name "attractor" comes from dynamical systems theory: a basin of attraction is a region toward which a system naturally evolves. Attractor pipelines are designed to pull a codebase toward a desired state through repeated, directed LLM-driven transformations.
 
-```mermaid
-graph TD
-    DOT["DOT File\n(workflow definition)"] --> Engine["PipelineEngine\norchestrates the workflow"]
-    Engine --> Handlers["NodeHandlers\nwhat each step does"]
-    Handlers --> Session["agent.Session\nautonomous LLM-driven execution"]
-    Session --> Client["LLMClient\nroutes to the right provider"]
-    Client --> Adapter["Provider Adapter\nAnthropic / OpenAI / Gemini"]
+```
+DOT File (workflow definition)
+  └─ PipelineEngine (orchestrates the workflow)
+       └─ NodeHandlers (what each step does)
+            └─ agent.Session (autonomous LLM-driven execution)
+                 └─ LLMClient (routes to the right provider)
+                      └─ Provider Adapter (Anthropic / OpenAI / Gemini)
 ```
 
 This is a composition of three concerns kept deliberately separate: the shape of the workflow (pipeline), the act of autonomous coding (agent), and the mechanics of talking to language models (LLM). Each layer knows about the layer below it and nothing about the layer above. This directionality keeps each layer independently testable and replaceable.
@@ -24,6 +24,7 @@ This is a composition of three concerns kept deliberately separate: the shape of
 ### Why This Matters
 
 Understanding the architecture lets you reason about where to intervene when things go wrong, where to add new capabilities, and what guarantees each layer provides. A pipeline failure has a different root cause and remedy than an agent loop failure or an LLM adapter error. The three-layer mental model is the fastest path to correct diagnosis.
+
 
 ---
 
@@ -58,7 +59,7 @@ The choice of GraphViz DOT format for workflow definition deserves explanation, 
 - **Python code** (as in Prefect or Airflow)
 - **Domain-specific languages**
 
-DOT was chosen for three reasons. First, DOT is declarative and visual: a DOT file describes a graph, and that graph can be rendered visually with standard tooling (`dot`, `xdot`, VS Code extensions). Workflow authors can see the shape of their pipeline before running it. Second, DOT has a rich ecosystem of parsers and validators. `pydot` and `networkx` give Python access to DOT files without building a parser from scratch. Third, DOT's attribute syntax is expressive enough to carry node configuration (`handler_type`, `prompt`, `model`) directly in the graph definition, avoiding the split configuration problem where workflow shape lives in one file and node configuration lives in another.
+DOT was chosen for three reasons. First, DOT is declarative and visual: a DOT file describes a graph, and that graph can be rendered visually with standard tooling (`dot`, `xdot`, VS Code extensions). Workflow authors can see the shape of their pipeline before running it. Second, DOT has a rich ecosystem of parsers and validators. `pydot` gives Python access to DOT files without building a parser from scratch. Third, DOT's attribute syntax is expressive enough to carry node configuration (`type`, `prompt`, `model`) directly in the graph definition, avoiding the split configuration problem where workflow shape lives in one file and node configuration lives in another.
 
 The tradeoff is that DOT is not a standard configuration format and is unfamiliar to most developers. Teams accustomed to YAML will find the syntax initially strange. The bet is that the visual rendering payoff outweighs the learning curve.
 
@@ -70,14 +71,11 @@ The tradeoff is that DOT is not a standard configuration format and is unfamilia
 
 Attractor separates its concerns into three layers with a strict dependency direction:
 
-```mermaid
-graph LR
-    Pipeline["pipeline/"] -->|"knows about"| Agent["agent/"]
-    Agent -->|"knows about"| LLM["llm/"]
-    LLM -->|"knows about"| SDKs["Provider SDKs"]
+```
+pipeline/  ──knows about──>  agent/  ──knows about──>  llm/  ──knows about──>  Provider SDKs
 
-    Pipeline -.-x|"does NOT know about"| LLM
-    Agent -.-x|"does NOT know about"| Pipeline
+pipeline/  does NOT know about  llm/
+agent/     does NOT know about  pipeline/
 ```
 
 **Mental Model**: Think of the layers like a restaurant. The `llm/` layer is the kitchen — it produces responses when given requests. The `agent/` layer is the waiter — it takes a customer's goal, places orders with the kitchen, collects results, and keeps the conversation going until the customer is satisfied. The `pipeline/` layer is the restaurant manager — it decides which tables (nodes) get served in which order, and ensures the customer journey (workflow) completes according to the reservation (DOT file).
@@ -92,19 +90,21 @@ Each layer has a clean interface:
 
 `PipelineContext` is the central data structure that makes multi-step workflows coherent. It is a simple key-value store that all nodes can read from and write to. This is an implementation of the Blackboard architectural pattern, common in AI planning systems.
 
-```mermaid
-graph TD
-    A["Node A executes\nwrites bug_description = 'null pointer in auth.py'"]
-    B1["Node B reads bug_description\ninterpolates it into its prompt"]
-    B2["Node B executes\nwrites fix_applied = true, exit_code = 0"]
-    C["Edge condition\nfix_applied == true\nroutes to Node C"]
+```
+Node A executes
+  → writes: bug_description = "null pointer in auth.py"
 
-    A --> B1 --> B2 --> C
+Node B reads bug_description
+  → interpolates it into its prompt via {bug_description}
+  → executes, then writes: fix_applied = true, exit_code = 0
+
+Edge condition on outgoing edge:
+  → "fix_applied = true" routes to Node C
 ```
 
-The blackboard is flat (no nesting) but uses naming conventions for organization. Internal engine keys are prefixed with `_` (`_last_error`, `_failed_node`, `_completed_nodes`). Handler-produced keys use plain names (`exit_code`, `approved`, `last_codergen_output`). Dotted keys like `branch_name.result` appear when `ParallelHandler` merges scoped sub-contexts back into the main context.
+The blackboard is flat but uses naming conventions for organization. Internal engine keys are prefixed with `_` (`_last_error`, `_failed_node`, `_completed_nodes`, `_goal_gate_unmet`). Handler-produced keys use plain names (`exit_code`, `approved`, `review_passed`). Prompt interpolation uses `{key}` syntax within handler prompt strings.
 
-**Why flat rather than hierarchical?** Because condition expressions are evaluated by a simple AST walker, not a full expression language. A flat namespace with dotted key support (`result.status`) covers the practical cases without requiring a query language. Hierarchy would complicate both the expression evaluator and the checkpoint serialization without commensurate benefit.
+**Why flat rather than hierarchical?** Because condition expressions are evaluated by a custom tokenizer/parser, not a full expression language. A flat namespace covers the practical cases without requiring a query language. Hierarchy would complicate both the expression evaluator and the checkpoint serialization without commensurate benefit.
 
 ---
 
@@ -129,39 +129,41 @@ graph TD
 
 The tradeoff is that independent pipeline branches (for example, "generate tests" and "generate documentation" simultaneously) must be explicit: either a `ParallelHandler` node fans out to concurrent sub-executions, or the workflow accepts sequential execution. For most software factory use cases, sequential execution is not a bottleneck because each node's LLM call dominates the runtime.
 
-### Edge Routing and Priority-Based Conditions
+### Edge Routing and Weight-Based Priority
 
-After each node completes, the engine evaluates outgoing edges to determine the next node. Edges are sorted by `priority` (ascending — lower number means higher priority), and the first edge whose condition evaluates to `True` wins. An unconditional edge (`condition=None`) serves as the fallback — the default route if no conditional edge matches.
+After each node completes, the engine evaluates outgoing edges to determine the next node. Edges are sorted by `weight` (descending — higher number means higher priority), and the first edge whose condition evaluates to `True` wins. An unconditional edge (`condition=None`) serves as the fallback — the default route if no conditional edge matches.
 
 ```mermaid
 graph LR
-    Review["review"] -->|"priority=1\ntests_passed == true"| Done["done"]
-    Review -->|"priority=2\ntests_passed == false"| Fix["fix"]
+    Review["review"] -->|"weight=2\ntests_passed = true"| Done["done"]
+    Review -->|"weight=1\ntests_passed = false"| Fix["fix"]
     Review -.->|"unconditional\nfallback"| Done
 ```
 
 A handler can bypass this mechanism entirely by returning a `NodeResult` with `next_node` set. This allows handlers that understand the workflow shape (like `ConditionalHandler`) to perform their own routing logic before the engine's edge evaluation runs.
 
-**Why priority numbers rather than order of declaration?** DOT files do not preserve edge declaration order reliably across all parsers. An explicit `priority` attribute makes the routing intent clear in the file itself and survives any parsing reordering.
+**Why explicit weight rather than order of declaration?** DOT files do not preserve edge declaration order reliably across all parsers. An explicit `weight` attribute makes the routing intent clear in the file itself and survives any parsing reordering.
 
-### AST-Based Condition Evaluation
+### Custom Condition Parser
 
-Edge conditions like `"exit_code == 0 and retries < 3"` must be evaluated against the pipeline context at runtime. Python's built-in `exec` and dynamic code execution functions could handle this — but at significant cost to security.
+Edge conditions like `"exit_code = 0 && retries = 3"` must be evaluated against the pipeline context at runtime. Python's built-in `exec` and dynamic code execution functions could handle this — but at significant cost to security.
 
 Dynamic code execution runs arbitrary code. In a software factory context, DOT pipeline files might come from external sources, version control, or generated tooling. Allowing arbitrary code execution in conditions would make the pipeline a code injection vector — any attacker who could modify a DOT file could execute arbitrary code in the pipeline process.
 
-The AST-based evaluator in `conditions.py` parses the expression into an abstract syntax tree and then walks only the specific node types it explicitly supports: comparisons (`==`, `!=`, `<`, `>`, `<=`, `>=`), boolean operations (`and`, `or`, `not`), identifiers (resolved to context values), and literals. Any other AST node type raises a `ConditionError`. The condition grammar is intentionally small and verifiable.
+The custom tokenizer/parser in `conditions.py` supports exactly three operators: `=` (equals), `!=` (not equals), and `&&` (logical AND). It explicitly rejects operators that developers might expect from Python — `==`, `<`, `>`, `<=`, `>=`, `and`, `or`, `not` — raising a `ConditionError` with a clear message directing users to the correct syntax. Variables are bare identifiers resolved from `PipelineContext`. No arbitrary code execution is possible.
 
 ```python
 # Supported: safe, predictable
-"exit_code == 0 and tests_passed == true"
-"review_score >= 7 or approved == true"
+"exit_code = 0 && tests_passed = true"
+"review_status != rejected"
 
-# Rejected by the evaluator: unsupported AST node type
-"__import__('os').system('rm -rf /')"
+# Rejected by the parser with a clear error message
+"exit_code == 0"       # ConditionError: use = not ==
+"a = true and b = true"  # ConditionError: use && not and
+"score > 7"            # ConditionError: > not supported
 ```
 
-The tradeoff is expressive power. Conditions cannot call functions, perform arithmetic, or use list operations. Complex routing logic must be pushed into the handler's `next_node` return value rather than expressed as an edge condition. This is an acceptable tradeoff for the safety guarantee.
+The tradeoff is expressive power. Conditions cannot call functions, perform arithmetic, use range comparisons, or express logical negation. Complex routing logic must be pushed into the handler's `next_node` return value rather than expressed as an edge condition. This is a deliberate security decision for a system where DOT files may originate from external sources.
 
 ### Checkpoint-Based Resumability
 
@@ -190,7 +192,7 @@ A `GoalGate` is an optional guard checked before the engine exits through a term
 ```python
 GoalGate(
     required_nodes=["run_tests", "security_scan"],
-    context_conditions=["tests_passed == true", "vulnerabilities == 0"],
+    context_conditions=["tests_passed = true", "vulnerabilities = 0"],
 )
 ```
 
@@ -208,8 +210,8 @@ With stylesheets, the DOT file describes the workflow's intent, and the styleshe
 
 ```mermaid
 graph LR
-    DOT["DOT file\ngenerate_fix\nhandler=codergen\nprompt='Fix the bug'"]
-    Sheet["Stylesheet rule\nhandler_type=codergen →\nmodel=claude-3-5-sonnet\ntemperature=0.2"]
+    DOT["DOT file\ngenerate_fix\ntype=codergen\nprompt='Fix the bug'"]
+    Sheet["Stylesheet rule\n.codergen →\nmodel=claude-3-5-sonnet\ntemperature=0.2"]
     Result["Resolved node\nmodel + temperature applied\nwithout DOT mentioning them"]
 
     DOT --> Result

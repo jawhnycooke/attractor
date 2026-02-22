@@ -2,38 +2,38 @@
 
 **Version**: 0.1.0
 **Python**: >= 3.11
-**License**: Apache-2.0
 
 Attractor is a non-interactive coding agent for software factories. It orchestrates LLM-driven workflows defined as GraphViz DOT pipelines, executing them through an autonomous agent with tool-use capabilities.
 
-**Architecture layers**:
-
-```mermaid
-graph TD
-    CLI["CLI (click)"] --> Pipeline["pipeline/\nParses DOT → validates → executes node graph"]
-    Pipeline --> Agent["agent/\nCodergenHandler invokes Session for LLM-driven coding"]
-    Agent --> LLM["llm/\nRoutes requests to provider adapters\n(Anthropic, OpenAI, Gemini)"]
+**Architecture**:
+```
+CLI (click)
+ └─ pipeline/ ── Parses DOT → validates → executes node graph
+      └─ agent/ ── CodergenHandler invokes Session for LLM-driven coding
+           └─ llm/ ── Routes requests to provider adapters (Anthropic, OpenAI, Gemini)
 ```
 
 ---
 
-## Table of Contents
+## Contents
 
 1. [CLI Reference](#1-cli-reference)
-2. [Pipeline API Reference](#2-pipeline-api-reference)
-3. [Agent API Reference](#3-agent-api-reference)
-4. [LLM Client API Reference](#4-llm-client-api-reference)
+2. [DOT File Format Reference](#2-dot-file-format-reference)
+3. [Condition Expression Reference](#3-condition-expression-reference)
+4. [Pipeline Module Reference](#4-pipeline-module-reference)
+5. [Agent Module Reference](#5-agent-module-reference)
+6. [LLM Client Reference](#6-llm-client-reference)
+7. [Tool Reference](#7-tool-reference)
+8. [Configuration Reference](#8-configuration-reference)
 
 ---
 
 ## 1. CLI Reference
 
-**Entry point**: `attractor` (installed via `pyproject.toml` `[project.scripts]`)
-
-**Synopsis**:
+### Synopsis
 
 ```bash
-attractor [--version] [--help] <subcommand> [OPTIONS] [ARGUMENTS]
+attractor [OPTIONS] COMMAND [ARGS]...
 ```
 
 ### Global Options
@@ -44,7 +44,7 @@ Show the installed version and exit.
 
 #### --help
 
-Show help text and exit.
+Show help and exit.
 
 ---
 
@@ -53,64 +53,54 @@ Show help text and exit.
 Execute a pipeline from a DOT file.
 
 **Synopsis**:
-
 ```bash
 attractor run [OPTIONS] PIPELINE_DOT
 ```
 
 **Arguments**:
 
-- `PIPELINE_DOT` (required): Path to a GraphViz DOT file. Must exist on the filesystem.
+- `PIPELINE_DOT` (required): Path to a GraphViz DOT file. Must exist.
 
 **Options**:
 
 #### --model MODEL
-
-- **Type**: string
-- **Required**: No
+- **Type**: String
+- **Description**: Default model string for `codergen` nodes. Applied via an implicit stylesheet rule. Node-level `model` attributes override this.
 - **Default**: None
-- **Description**: Default model identifier for `codergen` nodes (e.g. `gpt-4o`, `claude-opus-4-6`). Applied as a stylesheet rule matching all `codergen` handler_type nodes. Node-level `model` attributes override this value.
 
 #### --provider PROVIDER
-
-- **Type**: string
-- **Required**: No
+- **Type**: String
+- **Description**: LLM provider name override.
 - **Default**: None
-- **Description**: LLM provider name. Currently accepted for future use; model routing is automatic based on the model string prefix.
 
 #### --verbose, -v
-
-- **Type**: flag
+- **Type**: Flag
+- **Description**: Enable DEBUG-level logging. Without this flag, INFO-level logging is used.
 - **Default**: False
-- **Description**: Enable debug-level logging via `RichHandler`. Without this flag, logging is at INFO level.
 
 #### --checkpoint-dir PATH
-
-- **Type**: directory path (string)
+- **Type**: Directory path
+- **Description**: Directory where checkpoint JSON files are written after each completed node.
 - **Default**: `.attractor/checkpoints`
-- **Description**: Directory where checkpoint files are written after each completed node. Created automatically if it does not exist. Files are named `checkpoint_{timestamp_ms}.json`.
 
 **Behavior**:
+1. Parses and validates the DOT file. Exits with code 1 on validation errors.
+2. Prints warnings for non-fatal validation findings.
+3. Executes the pipeline from its start node.
+4. Prints the final context (non-internal keys) on completion.
 
-1. Parses `PIPELINE_DOT` via `parse_dot_file()`.
-2. Validates the pipeline via `validate_pipeline()`. Exits with code 1 if any ERROR-level findings exist. Prints WARNING-level findings.
-3. Builds a `ModelStylesheet` from CLI options.
-4. Constructs a `HandlerRegistry` with all built-in handlers.
-5. Runs `PipelineEngine.run(pipeline)` asynchronously.
-6. Prints the final `PipelineContext` as a Rich table (keys starting with `_` are hidden).
+**Example**:
+```bash
+attractor run pipeline.dot --model claude-opus-4-6 --verbose
+attractor run pipeline.dot --checkpoint-dir /tmp/checkpoints
+```
 
 **Exit codes**:
 
-| Code | Condition |
-|------|-----------|
+| Code | Meaning |
+|------|---------|
 | 0 | Pipeline completed successfully |
-| 1 | Parse error, validation error, or unrecoverable engine error |
-
-**Example**:
-
-```bash
-attractor run pipeline.dot --model gpt-4o --verbose --checkpoint-dir /tmp/checkpoints
-```
+| 1 | Parse error, validation error, or pipeline failure |
 
 ---
 
@@ -119,7 +109,6 @@ attractor run pipeline.dot --model gpt-4o --verbose --checkpoint-dir /tmp/checkp
 Validate a pipeline DOT file without executing it.
 
 **Synopsis**:
-
 ```bash
 attractor validate [OPTIONS] PIPELINE_DOT
 ```
@@ -131,30 +120,24 @@ attractor validate [OPTIONS] PIPELINE_DOT
 **Options**:
 
 #### --strict
-
-- **Type**: flag
+- **Type**: Flag
+- **Description**: Treat warnings as errors. With this flag, any finding (including warnings) causes exit code 1.
 - **Default**: False
-- **Description**: Treat WARNING-level findings as errors. With `--strict`, any finding (error or warning) causes exit code 1.
 
-**Behavior**:
+**Output**: A Rich table showing level, location (node name or edge), and message for each finding.
 
-1. Parses the DOT file.
-2. Runs all validation checks.
-3. Prints a Rich table with columns: Level, Location, Message.
-4. Exits 0 if valid (or warnings-only without `--strict`).
+**Example**:
+```bash
+attractor validate pipeline.dot
+attractor validate pipeline.dot --strict
+```
 
 **Exit codes**:
 
-| Code | Condition |
-|------|-----------|
-| 0 | No errors (warnings permitted without `--strict`) |
-| 1 | Parse error, ERROR findings, or WARNING findings with `--strict` |
-
-**Example**:
-
-```bash
-attractor validate pipeline.dot --strict
-```
+| Code | Meaning |
+|------|---------|
+| 0 | No errors (warnings allowed unless `--strict`) |
+| 1 | One or more errors found (or warnings with `--strict`) |
 
 ---
 
@@ -163,7 +146,6 @@ attractor validate pipeline.dot --strict
 Resume a pipeline from a checkpoint file.
 
 **Synopsis**:
-
 ```bash
 attractor resume [OPTIONS] CHECKPOINT_PATH
 ```
@@ -174,100 +156,245 @@ attractor resume [OPTIONS] CHECKPOINT_PATH
 
 **Options**:
 
-#### --verbose, -v
-
-- **Type**: flag
-- **Default**: False
-- **Description**: Enable debug-level logging.
-
 #### --pipeline-dot PATH
+- **Type**: File path (must exist)
+- **Description**: Path to the pipeline DOT file. Required — the checkpoint does not store the full pipeline definition.
+- **Default**: None (required)
 
-- **Type**: file path
-- **Required**: Yes (at runtime — the flag is optional in declaration but the command exits with code 1 if omitted)
-- **Default**: None
-- **Description**: Path to the DOT file for the pipeline being resumed. The checkpoint stores metadata about the original pipeline but does not embed the full DOT source.
-
-**Behavior**:
-
-1. Loads the checkpoint from `CHECKPOINT_PATH` via `Checkpoint.load_from_file()`.
-2. Parses the pipeline from `--pipeline-dot`.
-3. Runs `PipelineEngine.run(pipeline, checkpoint=cp)`, which resumes from `checkpoint.current_node`.
-
-**Exit codes**:
-
-| Code | Condition |
-|------|-----------|
-| 0 | Pipeline completed after resuming |
-| 1 | Checkpoint load error, parse error, or missing `--pipeline-dot` |
+#### --verbose, -v
+- **Type**: Flag
+- **Description**: Enable DEBUG-level logging.
+- **Default**: False
 
 **Example**:
-
 ```bash
-attractor resume .attractor/checkpoints/checkpoint_1700000000000.json \
-    --pipeline-dot pipeline.dot --verbose
+attractor resume .attractor/checkpoints/checkpoint_1706000000000.json \
+  --pipeline-dot pipeline.dot
 ```
 
----
-
-### Environment Variables
-
-| Variable | Provider | Required for |
-|----------|----------|--------------|
-| `ANTHROPIC_API_KEY` | Anthropic | `claude-*` models |
-| `OPENAI_API_KEY` | OpenAI | `gpt-*`, `o1`, `o3`, `o4` models |
-| `GOOGLE_API_KEY` | Google | `gemini-*` models |
-
-Variables are loaded from the process environment. A `.env` file is not automatically read — callers must source it before invoking `attractor` or use a tool such as `python-dotenv`.
+**Exit codes**: Same as `attractor run`.
 
 ---
 
-## 2. Pipeline API Reference
+## 2. DOT File Format Reference
 
-**Module prefix**: `attractor.pipeline`
+Attractor pipelines are defined as GraphViz `digraph` DOT files parsed via `pydot`.
+
+### Minimal Example
+
+```dot
+digraph my_pipeline {
+    start [shape=Mdiamond]
+    implement [type="codergen" prompt="Fix the login bug"]
+    review [type="codergen" prompt="Review the changes"]
+    done [shape=Msquare]
+
+    start -> implement
+    implement -> review
+    review -> done [condition="review_passed = true"]
+    review -> implement [condition="review_passed = false" weight=2]
+}
+```
+
+### Node Attributes
+
+Set as key=value pairs inside node brackets: `nodename [attr="value"]`.
+
+| Attribute | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `type` | string | Handler type dispatch key. Parsed to `PipelineNode.handler_type`. If absent, inferred from `shape`. | Inferred from shape |
+| `shape` | string | GraphViz shape. `Mdiamond` = start; `Msquare` = terminal/exit. | `box` |
+| `label` | string | Human-readable display label. Used as prompt fallback when `prompt` is absent. | `""` |
+| `prompt` | string | LLM prompt template. Supports `{key}` interpolation from `PipelineContext`. | `""` |
+| `model` | string | LLM model override for this node. | Stylesheet or CLI default |
+| `temperature` | float | LLM temperature override. | Provider default |
+| `max_tokens` | integer | Maximum output tokens for LLM calls on this node. | Provider default |
+| `max_retries` | integer | Maximum retry count for this node. 0 inherits pipeline default. | 0 |
+| `allow_partial` | boolean | When true, exhausted retries produce `PARTIAL_SUCCESS` instead of `FAIL`. | `false` |
+| `fidelity` | string | Context fidelity mode for this node. | Inherited |
+| `timeout` | float | Maximum execution time in seconds. | None |
+| `goal_gate` | boolean | Whether this node must complete before the pipeline can exit. | `false` |
+| `retry_target` | string | Node to jump to when this node fails. | None |
+| `fallback_retry_target` | string | Secondary retry target. | None |
+| `thread_id` | string | Thread grouping identifier. | None |
+| `reasoning_effort` | string | `low`, `medium`, or `high`. | `high` |
+| `auto_status` | boolean | Whether the engine synthesizes a status note if the handler provides none. | `false` |
+| `class` | string | CSS-like class names for stylesheet matching (space-separated). | `""` |
+
+**CRITICAL**: The DOT attribute is `type` (not `handler` or `handler_type`). The parser maps `type` to the internal `PipelineNode.handler_type` field.
+
+**Built-in handler types**:
+
+| `type` value | Description |
+|-------------|-------------|
+| `start` | Entry point. No-op. Detected via `shape=Mdiamond` or case-insensitive name `start`. |
+| `exit` | Terminal exit. No-op. Detected via `shape=Msquare` or case-insensitive name `exit`/`end`. |
+| `codergen` | Invokes the Attractor coding agent for LLM-driven code generation. |
+| `wait.human` | Presents a prompt to a human interviewer; gates on their selection. |
+| `conditional` | No-op routing node. Succeeds immediately; edge evaluation handles routing. |
+| `parallel` | Fan-out handler. Executes outgoing edge targets as concurrent branches. |
+| `parallel.fan_in` | Consolidates results from a prior `parallel` node. |
+| `tool` | Executes a shell command. Requires `tool_command` attribute. |
+| `stack.manager_loop` | Orchestrates sprint-based iteration over a child pipeline. |
+
+**Shape-to-handler inference**:
+
+| `shape` value | Inferred handler type |
+|---------------|----------------------|
+| `Mdiamond` | `start` |
+| `Msquare` | `exit` |
+| Any other | `codergen` (default) |
+
+**Start node detection** (in order):
+1. Node with `shape=Mdiamond`
+2. Node whose name matches `start` (case-insensitive)
+
+**Terminal node detection** (any of):
+- `shape=Msquare` (handler type `exit`)
+- Name matches `exit` or `end` (case-insensitive)
+- Node has no outgoing edges
+
+### Edge Attributes
+
+Set as key=value pairs inside edge brackets: `source -> target [attr="value"]`.
+
+| Attribute | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `condition` | string | Boolean expression evaluated against `PipelineContext`. See Section 3. | None (unconditional) |
+| `weight` | integer | Priority. Higher values evaluated first. | 0 |
+| `label` | string | Human-readable label. Used for preferred-label routing. | `""` |
+| `fidelity` | string | Context fidelity mode override. Highest precedence. | None |
+| `thread_id` | string | Thread grouping identifier. | None |
+| `loop_restart` | boolean | When true, traversing this edge resets `completed_nodes` and `node_outcomes`. | `false` |
+
+**CRITICAL**: Edge priority uses `weight` (higher = higher priority). `weight=2` takes precedence over `weight=0`.
+
+### Fidelity Values
+
+| Value | Behavior |
+|-------|----------|
+| `full` | No transformation; all context data preserved. |
+| `truncate` | String values exceeding 500 characters are truncated with a `[truncated]` marker. |
+| `compact` | Large strings replaced with byte-count placeholder. Default. |
+| `summary:low` | Marks context for low-detail summarization. |
+| `summary:medium` | Marks context for medium-detail summarization. |
+| `summary:high` | Marks context for high-detail summarization. |
+
+**Fidelity precedence** (highest to lowest):
+1. Edge `fidelity` attribute
+2. Node `fidelity` attribute
+3. Graph `default_fidelity` attribute
+4. Default: `compact`
 
 ---
 
-### `Pipeline`
+## 3. Condition Expression Reference
 
-**Module**: `attractor.pipeline.models`
+Edge conditions are evaluated by a custom tokenizer/parser. No `eval`, `exec`, or `ast.parse` is used.
+
+### Operators
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `=` | Equality (string comparison) | `outcome = success` |
+| `!=` | Inequality | `exit_code != 0` |
+| `&&` | Logical AND (all clauses must be true) | `outcome = success && tests_passed = true` |
+
+### Explicitly Unsupported Operators
+
+| Operator | Error |
+|----------|-------|
+| `==` | Use `=` for equality checks |
+| `<`, `>`, `<=`, `>=` | Comparison operators not supported |
+| `and`, `or`, `not` | Use `&&` for AND; OR and NOT are not supported |
+
+Unsupported operators raise `ConditionError`.
+
+### Variable Resolution
+
+Variables are bare names resolved against `PipelineContext` and engine-injected extra variables.
+
+**Engine-injected variables** (always available):
+
+| Variable | Value |
+|----------|-------|
+| `outcome` | Handler outcome string: `success`, `partial_success`, `retry`, `fail`, `skipped` |
+| `preferred_label` | Value of `NodeResult.preferred_label`, or `""` |
+
+**Resolution order**:
+1. Extra vars (`outcome`, `preferred_label` injected by engine)
+2. `PipelineContext` data
+3. Missing keys resolve to `""` (falsy for bare-key truthy checks)
+
+### Syntax Forms
+
+```
+# Equality check
+outcome = success
+
+# Inequality check
+exit_code != 0
+
+# Context variable check with context. prefix
+context.tests_passed = true
+
+# Bare key truthy check (non-empty value)
+tests_passed
+
+# Multiple conditions (all must be true)
+outcome = success && tests_passed = true
+
+# Unconditional (omit condition attribute entirely)
+```
+
+### `evaluate_condition()`
 
 ```python
-@dataclass
-class Pipeline:
-    name: str
-    nodes: dict[str, PipelineNode] = field(default_factory=dict)
-    edges: list[PipelineEdge] = field(default_factory=list)
-    start_node: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
+evaluate_condition(
+    expression: str,
+    context: PipelineContext,
+    extra_vars: dict[str, Any] | None = None,
+) -> bool
 ```
 
-Complete pipeline definition parsed from a DOT file.
+- **Returns**: `True` if all `&&`-joined clauses evaluate to true.
+- **Raises**: `ConditionError` if the expression is syntactically invalid.
+- **Empty expression**: Returns `True` (unconditional).
 
-**Fields**:
+### `validate_condition_syntax()`
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | `str` | Pipeline identifier — typically the DOT graph name, or the file stem if unnamed. |
-| `nodes` | `dict[str, PipelineNode]` | Mapping of node name to `PipelineNode`. |
-| `edges` | `list[PipelineEdge]` | All directed edges in the graph. |
-| `start_node` | `str` | Name of the designated start node. |
-| `metadata` | `dict[str, Any]` | Graph-level attributes from the DOT file. |
+```python
+validate_condition_syntax(expression: str) -> str | None
+```
 
-**Methods**:
+- **Returns**: `None` if valid; an error message string if invalid.
 
-#### `outgoing_edges(node_name: str) -> list[PipelineEdge]`
+---
 
-Returns edges originating from `node_name`, sorted ascending by `edge.priority`.
+## 4. Pipeline Module Reference
 
-#### `incoming_edges(node_name: str) -> list[PipelineEdge]`
+Source: `src/attractor/pipeline/`
 
-Returns edges whose `target` is `node_name`. Not sorted.
+---
+
+### `OutcomeStatus`
+
+```python
+class OutcomeStatus(str, enum.Enum):
+    SUCCESS = "success"
+    PARTIAL_SUCCESS = "partial_success"
+    RETRY = "retry"
+    FAIL = "fail"
+    SKIPPED = "skipped"
+```
+
+`NodeResult.success` returns `True` for both `SUCCESS` and `PARTIAL_SUCCESS`.
 
 ---
 
 ### `PipelineNode`
 
-**Module**: `attractor.pipeline.models`
+Dataclass representing a single node in the pipeline graph.
 
 ```python
 @dataclass
@@ -277,34 +404,57 @@ class PipelineNode:
     attributes: dict[str, Any] = field(default_factory=dict)
     is_start: bool = False
     is_terminal: bool = False
+    label: str = ""
+    shape: str = "box"
+    classes: list[str] = field(default_factory=list)
+    prompt: str = ""
+    max_retries: int = 0
+    goal_gate: bool = False
+    retry_target: str | None = None
+    fallback_retry_target: str | None = None
+    fidelity: str | None = None
+    thread_id: str | None = None
+    timeout: float | None = None
+    llm_model: str | None = None
+    llm_provider: str | None = None
+    reasoning_effort: str = "high"
+    auto_status: bool = False
+    allow_partial: bool = False
+    retry_policy: RetryPolicy | None = None
 ```
-
-A single node in the pipeline graph.
 
 **Fields**:
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `name` | `str` | — | Unique identifier for the node. Matches the DOT node name. |
-| `handler_type` | `str` | — | Dispatch key for the handler registry (e.g. `"codergen"`, `"human_gate"`, `"tool"`). Defaults to `"codergen"` if the `handler` attribute is absent from the DOT node. |
-| `attributes` | `dict[str, Any]` | `{}` | Handler-specific configuration extracted from DOT attributes and/or stylesheet overrides. Common keys: `prompt`, `model`, `temperature`, `max_tokens`, `timeout`, `command`. |
-| `is_start` | `bool` | `False` | `True` for the pipeline entry point. |
-| `is_terminal` | `bool` | `False` | `True` for nodes that end pipeline execution. |
-
-**DOT attribute mapping**:
-
-| DOT attribute | Field / effect |
-|---------------|----------------|
-| `handler` | Sets `handler_type`. Default: `"codergen"`. |
-| `start=true` | Sets `is_start = True`. |
-| `terminal=true` | Sets `is_terminal = True`. |
-| All other attributes | Stored in `attributes`. |
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `str` | Unique node identifier. |
+| `handler_type` | `str` | Dispatch key for the handler registry. |
+| `attributes` | `dict[str, Any]` | Handler-specific configuration from DOT attributes and stylesheet overrides. |
+| `is_start` | `bool` | Whether this is the entry point. |
+| `is_terminal` | `bool` | Whether this is a terminal (exit) node. |
+| `label` | `str` | Human-readable display label. |
+| `shape` | `str` | GraphViz node shape. Default: `"box"`. |
+| `classes` | `list[str]` | CSS-like class names for stylesheet matching. |
+| `prompt` | `str` | LLM prompt template string. |
+| `max_retries` | `int` | Maximum retry count. 0 inherits from pipeline default. |
+| `goal_gate` | `bool` | Whether this node must complete before terminal exit. |
+| `retry_target` | `str | None` | Node to jump to on failure. |
+| `fallback_retry_target` | `str | None` | Secondary retry target. |
+| `fidelity` | `str | None` | Context fidelity mode override. |
+| `thread_id` | `str | None` | Thread grouping identifier. |
+| `timeout` | `float | None` | Execution timeout in seconds. |
+| `llm_model` | `str | None` | LLM model override. Set by stylesheet or DOT attribute. |
+| `llm_provider` | `str | None` | LLM provider override. |
+| `reasoning_effort` | `str` | Reasoning effort: `"low"`, `"medium"`, `"high"`. Default: `"high"`. |
+| `auto_status` | `bool` | Synthesize auto-status note if handler provides none. |
+| `allow_partial` | `bool` | Accept `PARTIAL_SUCCESS` when retries are exhausted. |
+| `retry_policy` | `RetryPolicy | None` | Node-specific retry policy. Overrides engine default when set. |
 
 ---
 
 ### `PipelineEdge`
 
-**Module**: `attractor.pipeline.models`
+Dataclass representing a directed edge between two nodes.
 
 ```python
 @dataclass
@@ -313,117 +463,178 @@ class PipelineEdge:
     target: str
     condition: str | None = None
     label: str = ""
-    priority: int = 0
+    weight: int = 0
+    fidelity: str | None = None
+    thread_id: str | None = None
+    loop_restart: bool = False
 ```
-
-A directed edge between two pipeline nodes.
 
 **Fields**:
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `source` | `str` | — | Name of the originating node. |
-| `target` | `str` | — | Name of the destination node. |
-| `condition` | `str \| None` | `None` | Condition expression evaluated against `PipelineContext`. `None` means unconditional (default/fallback edge). |
-| `label` | `str` | `""` | Human-readable label for visualization purposes. |
-| `priority` | `int` | `0` | Ordering hint when multiple edges share a source. Lower values are evaluated first. |
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | `str` | Name of the originating node. |
+| `target` | `str` | Name of the destination node. |
+| `condition` | `str | None` | Condition expression. `None` means unconditional. |
+| `label` | `str` | Display label. Used for preferred-label routing. |
+| `weight` | `int` | Priority: higher values evaluated first. Default: 0. |
+| `fidelity` | `str | None` | Fidelity mode override. Highest precedence in fidelity resolution. |
+| `thread_id` | `str | None` | Thread grouping identifier. |
+| `loop_restart` | `bool` | When `True`, traversal resets `completed_nodes` and `node_outcomes`. |
 
 ---
 
-### `PipelineContext`
+### `Pipeline`
 
-**Module**: `attractor.pipeline.models`
+Dataclass representing a complete pipeline parsed from a DOT file.
 
 ```python
 @dataclass
-class PipelineContext:
-    data: dict[str, Any] = field(default_factory=dict)
+class Pipeline:
+    name: str
+    nodes: dict[str, PipelineNode] = field(default_factory=dict)
+    edges: list[PipelineEdge] = field(default_factory=list)
+    start_node: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    goal: str = ""
+    default_max_retry: int = 50
+    retry_target: str | None = None
+    fallback_retry_target: str | None = None
+    default_fidelity: str | None = None
+    model_stylesheet: str | None = None
 ```
 
-Shared key-value state store (blackboard) for pipeline execution. All nodes read from and write to a single shared context.
+**Fields**:
 
-**Internal keys** (set by the engine, prefixed with `_`):
-
-| Key | Type | Set when |
-|-----|------|----------|
-| `_last_error` | `str` | A node's `result.success` is `False`. |
-| `_failed_node` | `str` | A node's `result.success` is `False`. |
-| `_completed_nodes` | `list[str]` | After pipeline finishes. |
-| `_goal_gate_unmet` | `list[str]` | If a `GoalGate` check fails at terminal exit. |
-| `_supervisor_iteration` | `int` | Set by `SupervisorHandler` each iteration. |
-| `_supervisor_iterations` | `int` | Total iterations used by `SupervisorHandler`. |
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `str` | Pipeline identifier (DOT graph name). |
+| `nodes` | `dict[str, PipelineNode]` | Node name to `PipelineNode` mapping. |
+| `edges` | `list[PipelineEdge]` | All directed edges in the graph. |
+| `start_node` | `str` | Name of the designated start node. |
+| `metadata` | `dict[str, Any]` | Arbitrary graph-level attributes from the DOT file. |
+| `goal` | `str` | Top-level goal description. |
+| `default_max_retry` | `int` | Default retry count for nodes without explicit setting. Default: 50. |
+| `retry_target` | `str | None` | Pipeline-level retry target. |
+| `fallback_retry_target` | `str | None` | Pipeline-level fallback retry target. |
+| `default_fidelity` | `str | None` | Graph-level default fidelity mode. |
+| `model_stylesheet` | `str | None` | Inline stylesheet content. |
 
 **Methods**:
 
-#### `get(key: str, default: Any = None) -> Any`
+#### `outgoing_edges(node_name)`
 
-Return the value for `key`, or `default` if absent.
+```python
+def outgoing_edges(self, node_name: str) -> list[PipelineEdge]
+```
 
-#### `set(key: str, value: Any) -> None`
+Returns edges from `node_name`, sorted by weight descending, then target lexically ascending.
 
-Set `key` to `value`.
+#### `incoming_edges(node_name)`
 
-#### `has(key: str) -> bool`
+```python
+def incoming_edges(self, node_name: str) -> list[PipelineEdge]
+```
 
-Return `True` if `key` is present.
-
-#### `delete(key: str) -> None`
-
-Remove `key`. No-op if absent.
-
-#### `update(updates: dict[str, Any]) -> None`
-
-Merge `updates` into the context, overwriting existing keys.
-
-#### `to_dict() -> dict[str, Any]`
-
-Return a shallow copy of the internal data dict.
-
-#### `from_dict(data: dict[str, Any]) -> PipelineContext` (classmethod)
-
-Construct a `PipelineContext` from a plain dict.
-
-#### `create_scope(prefix: str) -> PipelineContext`
-
-Create an empty child context for branch isolation. The `prefix` argument is used only when merging back.
-
-#### `merge_scope(scope: PipelineContext, prefix: str) -> None`
-
-Merge a scoped context back into this context. Keys from `scope` are stored as `"{prefix}.{key}"`.
+Returns all edges targeting `node_name`.
 
 ---
 
 ### `NodeResult`
 
-**Module**: `attractor.pipeline.models`
+Dataclass returned by a node handler after execution.
 
 ```python
 @dataclass
 class NodeResult:
-    success: bool
+    status: OutcomeStatus
     output: Any = None
-    error: str | None = None
+    failure_reason: str | None = None
     next_node: str | None = None
     context_updates: dict[str, Any] = field(default_factory=dict)
+    preferred_label: str | None = None
+    suggested_next_ids: list[str] = field(default_factory=list)
+    notes: str | None = None
 ```
-
-Result returned by a node handler after execution.
 
 **Fields**:
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `success` | `bool` | — | Whether the handler completed without error. |
-| `output` | `Any` | `None` | Arbitrary output payload (stored in context by some handlers). |
-| `error` | `str \| None` | `None` | Error description when `success` is `False`. |
-| `next_node` | `str \| None` | `None` | Explicit routing override — bypasses edge evaluation. If set, the engine goes directly to this node. |
-| `context_updates` | `dict[str, Any]` | `{}` | Key-value pairs merged into `PipelineContext` after execution. |
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `OutcomeStatus` | Outcome of handler execution. |
+| `output` | `Any` | Arbitrary output payload. |
+| `failure_reason` | `str | None` | Error description when status indicates failure. |
+| `next_node` | `str | None` | Explicit routing override — bypasses edge evaluation entirely. |
+| `context_updates` | `dict[str, Any]` | Key-value pairs merged into `PipelineContext` after execution. |
+| `preferred_label` | `str | None` | Preferred edge label for routing (step 2 of edge selection). |
+| `suggested_next_ids` | `list[str]` | Suggested next node IDs (step 3 of edge selection). |
+| `notes` | `str | None` | Free-form notes written to `status.json`. |
+
+**Properties**:
+
+#### `success`
+
+```python
+@property
+def success(self) -> bool
+```
+
+Returns `True` when `status` is `SUCCESS` or `PARTIAL_SUCCESS`.
+
+---
+
+### `PipelineContext`
+
+Shared key-value state store (blackboard pattern) for pipeline execution. Supports JSON serialization for checkpointing.
+
+**Internal key conventions** (all prefixed with `_`):
+
+| Key | Set by | Description |
+|-----|--------|-------------|
+| `_last_error` | Engine | Error description from the most recent node failure. |
+| `_failed_node` | Engine | Name of the node that most recently failed. |
+| `_completed_nodes` | Engine | Ordered list of nodes that finished successfully. |
+| `_goal_gate_unmet` | Engine | List of unsatisfied goal gate node names. |
+| `_fidelity_mode` | Engine | Currently active fidelity mode string. |
+| `_condition_error` | Engine | Condition evaluation error description. |
+| `_needs_summarization` | Engine | `True` when fidelity is `summary:*`. |
+| `_summary_detail` | Engine | Summary detail level when fidelity is `summary:*`. |
+
+**Engine-set plain keys**:
+
+| Key | Set by | Description |
+|-----|--------|-------------|
+| `outcome` | Engine | Handler outcome value string after each node. |
+| `preferred_label` | Engine | Value of `NodeResult.preferred_label` after each node. |
+| `current_node` | Engine | Name of the node just executed. |
+| `last_stage` | Engine | Same as `current_node`. |
+| `graph.goal` | Engine | Value of `Pipeline.goal`, set at start. |
+| `last_response` | `CodergenHandler` | Text output from the most recent codergen node. |
+
+**Methods**:
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `get(key, default=None)` | `Any` | Value for `key`, or `default`. |
+| `get_string(key, default="")` | `str` | Value coerced to `str`, or `default`. |
+| `set(key, value)` | `None` | Store `value` under `key`. |
+| `has(key)` | `bool` | Whether `key` exists. |
+| `delete(key)` | `None` | Remove `key` if present. |
+| `to_dict()` | `dict[str, Any]` | Shallow copy of all context data. |
+| `snapshot()` | `dict[str, Any]` | Deep copy of all context data. |
+| `update(updates)` | `None` | Merge `updates` into context. |
+| `clone()` | `PipelineContext` | Deep copy for branch isolation. |
+| `create_scope(prefix)` | `PipelineContext` | Child context for parallel branch isolation. |
+| `merge_scope(scope, prefix)` | `None` | Merge scoped context back, prefixing keys as `{prefix}.{key}`. |
+| `from_dict(data)` | `PipelineContext` | Classmethod. Create from existing dictionary. |
+| `append_log(entry)` | `None` | Append structured log entry. |
+| `get_logs()` | `list[dict]` | Copy of all log entries. |
 
 ---
 
 ### `Checkpoint`
 
-**Module**: `attractor.pipeline.models`
+Serializable execution snapshot for resume-on-failure.
 
 ```python
 @dataclass
@@ -433,45 +644,38 @@ class Checkpoint:
     context: PipelineContext
     completed_nodes: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
+    node_retries: dict[str, int] = field(default_factory=dict)
+    logs: list[dict[str, Any]] = field(default_factory=list)
 ```
-
-Serializable execution snapshot for resume-on-failure.
 
 **Fields**:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `pipeline_name` | `str` | Name of the pipeline being executed. |
-| `current_node` | `str` | Node that was about to execute (or just completed) when the checkpoint was written. |
+| `current_node` | `str` | Node that will execute on resume. |
 | `context` | `PipelineContext` | Full pipeline context at checkpoint time. |
 | `completed_nodes` | `list[str]` | Ordered list of nodes that finished successfully. |
-| `timestamp` | `float` | UNIX epoch (seconds) when the checkpoint was created. |
+| `timestamp` | `float` | UNIX epoch when the checkpoint was created. |
+| `node_retries` | `dict[str, int]` | Per-node retry counts (key: node name, value: attempt count). |
+| `logs` | `list[dict[str, Any]]` | Structured log entries. |
 
-**Serialization methods**:
+**Filename format**: `checkpoint_{timestamp_ms}.json`
 
-#### `to_dict() -> dict[str, Any]`
+**Methods**:
 
-Serialize to a JSON-serializable dict with keys: `pipeline_name`, `current_node`, `context`, `completed_nodes`, `timestamp`.
-
-#### `from_dict(data: dict[str, Any]) -> Checkpoint` (classmethod)
-
-Deserialize from a dict produced by `to_dict()`.
-
-#### `save_to_file(path: str | Path) -> None`
-
-Write JSON to `path`. Creates parent directories with `parents=True, exist_ok=True`.
-
-#### `load_from_file(path: str | Path) -> Checkpoint` (classmethod)
-
-Read and deserialize a checkpoint JSON file.
-
-**File naming**: The engine writes files as `checkpoint_{timestamp_ms}.json` where `timestamp_ms = int(timestamp * 1000)`.
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `to_dict()` | `() -> dict[str, Any]` | Serialize to JSON-compatible dict. |
+| `from_dict(data)` | `(dict) -> Checkpoint` | Reconstruct from dict. |
+| `save_to_file(path)` | `(str | Path) -> None` | Write JSON to file (creates parent dirs). |
+| `load_from_file(path)` | `(str | Path) -> Checkpoint` | Load from JSON file. |
 
 ---
 
 ### `PipelineEngine`
 
-**Module**: `attractor.pipeline.engine`
+DAG execution engine. Walks the pipeline from the start node, dispatching handlers, evaluating edges, and checkpointing.
 
 ```python
 class PipelineEngine:
@@ -482,24 +686,28 @@ class PipelineEngine:
         checkpoint_dir: str | Path | None = None,
         goal_gate: GoalGate | None = None,
         max_steps: int = 1000,
-    ) -> None: ...
+        event_emitter: PipelineEventEmitter | None = None,
+        logs_root: str | Path | None = None,
+        default_retry_policy: RetryPolicy | None = None,
+    ) -> None
 ```
-
-Single-threaded pipeline execution engine. Walks the DAG from the start node.
 
 **Constructor parameters**:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `registry` | `HandlerRegistry \| None` | `None` | Handler registry. If `None`, `create_default_registry()` is called at run time. |
-| `stylesheet` | `ModelStylesheet \| None` | `None` | Stylesheet for attribute defaults. Defaults to an empty `ModelStylesheet`. |
-| `checkpoint_dir` | `str \| Path \| None` | `None` | Directory for checkpoint files. Checkpointing is disabled when `None`. |
-| `goal_gate` | `GoalGate \| None` | `None` | Optional gate checked before allowing terminal exit. |
-| `max_steps` | `int` | `1000` | Maximum node executions before the engine halts with a warning. |
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `registry` | `HandlerRegistry | None` | Handler registry. Auto-creates default if `None`. | None |
+| `stylesheet` | `ModelStylesheet | None` | Stylesheet for node attribute defaults. | Empty |
+| `checkpoint_dir` | `str | Path | None` | Directory for checkpoint files. No checkpoints if `None`. | None |
+| `goal_gate` | `GoalGate | None` | Legacy goal gate object. Prefer `goal_gate=True` on nodes. | None |
+| `max_steps` | `int` | Maximum node execution steps before stopping. | 1000 |
+| `event_emitter` | `PipelineEventEmitter | None` | Emitter for pipeline observability events. | None |
+| `logs_root` | `str | Path | None` | Root directory for per-run logs and artifacts. | None |
+| `default_retry_policy` | `RetryPolicy | None` | Default retry policy for nodes without explicit `retry_policy`. | None |
 
 **Methods**:
 
-#### `run(pipeline, context=None, checkpoint=None) -> PipelineContext` (async)
+#### `run(pipeline, context=None, checkpoint=None)`
 
 ```python
 async def run(
@@ -510,449 +718,126 @@ async def run(
 ) -> PipelineContext
 ```
 
-Execute `pipeline` and return the final context.
+Executes `pipeline` and returns the final context.
 
-- `pipeline`: The pipeline definition to execute.
-- `context`: Initial context. Defaults to an empty `PipelineContext`.
-- `checkpoint`: If provided, resumes from `checkpoint.current_node` with `checkpoint.context`.
+- **`context`**: Initial context. Uses empty `PipelineContext` if `None`.
+- **`checkpoint`**: Resume state. Starts from `checkpoint.current_node` when provided.
+- **Returns**: `PipelineContext` after pipeline completion.
+- **Raises**: `EngineError` on unrecoverable errors.
 
-**Returns**: `PipelineContext` after pipeline completion.
+**Execution flow** per node:
+1. Apply stylesheet attribute defaults.
+2. Resolve and apply fidelity mode.
+3. Check goal gates (before terminal nodes).
+4. Dispatch to handler via registry.
+5. Apply retry policy (up to `max_attempts`).
+6. Merge `context_updates` into context.
+7. Evaluate outgoing edges (5-step algorithm).
+8. Write checkpoint.
 
-**Raises**: `EngineError` on unrecoverable errors (missing handler, unknown next node).
+**Edge selection algorithm** (5 steps, in order):
+1. Evaluate all conditional edges. Select highest-weight match if any conditions are true.
+2. Match `preferred_label` against edge labels.
+3. Match `suggested_next_ids` against edge targets.
+4. Select unconditional edges by weight descending, then target lexically.
+5. Final fallback: any edge by weight descending, then target lexically.
 
-**Execution loop per step**:
-
-1. Apply stylesheet defaults to node attributes.
-2. Dispatch to handler via `registry.get(node.handler_type)`.
-3. Merge `result.context_updates` into context.
-4. Append node name to completed list.
-5. Write checkpoint (if `checkpoint_dir` is set).
-6. Determine next node via `_resolve_next()`.
-
-**Routing resolution order**:
-
-1. `result.next_node` (explicit override) — used if set.
-2. `node.is_terminal` — stops if True.
-3. Outgoing edges sorted by `priority` (ascending) — first condition that evaluates True wins.
-4. Unconditional edge — used as fallback if no conditions matched.
-5. No outgoing edges — implicitly terminal, stops.
-
-#### `run_sub_pipeline(pipeline_name, context) -> PipelineContext` (async)
-
-Hook for `SupervisorHandler`. The base implementation logs a warning and returns the context unchanged. Override or subclass to provide sub-pipeline resolution.
-
----
-
-### `EngineError`
-
-**Module**: `attractor.pipeline.engine`
-
-```python
-class EngineError(Exception): ...
-```
-
-Raised for unrecoverable engine failures: missing handler type, unknown next node.
+**Failure routing** (for `FAIL` status, in order):
+1. Edge with condition referencing `outcome` and `fail`.
+2. `node.retry_target`.
+3. `node.fallback_retry_target`.
+4. If none: raise `EngineError`.
 
 ---
 
-### `NodeHandler` protocol
-
-**Module**: `attractor.pipeline.handlers`
+### `NodeHandler` (Protocol)
 
 ```python
 @runtime_checkable
 class NodeHandler(Protocol):
     async def execute(
-        self, node: PipelineNode, context: PipelineContext
+        self,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
     ) -> NodeResult: ...
 ```
 
-Protocol that all node handlers must satisfy. Structural typing — no inheritance required.
+All node handlers must satisfy this protocol.
 
 ---
 
 ### `HandlerRegistry`
 
-**Module**: `attractor.pipeline.handlers`
+Maps handler-type strings to handler instances.
 
 ```python
 class HandlerRegistry:
-    def __init__(self) -> None: ...
+    def __init__(
+        self,
+        default_handler: NodeHandler | None = None,
+        hooks: list[HandlerHook] | None = None,
+    ) -> None
 ```
-
-Maps handler-type strings to `NodeHandler` instances.
 
 **Methods**:
 
-#### `register(handler_type: str, handler: NodeHandler) -> None`
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `register(handler_type, handler)` | `(str, NodeHandler) -> None` | Register a handler under a type key. |
+| `get(handler_type)` | `(str) -> NodeHandler | None` | Return the handler for `handler_type`, or the default handler if none registered. |
+| `has(handler_type)` | `(str) -> bool` | Return `True` if `handler_type` is registered. |
+| `dispatch(handler_type, node, context, ...)` | `async (...) -> NodeResult` | Look up and execute a handler with hook invocation. |
+| `add_hook(hook)` | `(HandlerHook) -> None` | Append a pre/post execution hook. |
 
-Register a handler for `handler_type`. Overwrites any existing registration.
+**Properties**:
 
-#### `get(handler_type: str) -> NodeHandler | None`
+| Property | Type | Description |
+|----------|------|-------------|
+| `default_handler` | `NodeHandler | None` | Fallback handler for unknown types. Read/write. |
+| `hooks` | `list[HandlerHook]` | Copy of registered hooks. Read-only. |
+| `registered_types` | `list[str]` | All registered handler type strings. |
 
-Return the handler for `handler_type`, or `None` if not registered.
+**`create_default_registry(pipeline=None, interviewer=None, event_emitter=None)`**
 
-#### `has(handler_type: str) -> bool`
+Factory that pre-loads all built-in handlers:
 
-Return `True` if `handler_type` is registered.
+| Registered type | Handler class |
+|----------------|--------------|
+| `start` | `StartHandler` |
+| `exit` | `ExitHandler` |
+| `codergen` | `CodergenHandler` |
+| `wait.human` | `WaitHumanHandler` |
+| `conditional` | `ConditionalHandler` |
+| `parallel` | `ParallelHandler` |
+| `parallel.fan_in` | `FanInHandler` |
+| `tool` | `ToolHandler` |
+| `stack.manager_loop` | `ManagerLoopHandler` |
 
-#### `registered_types` (property) `-> list[str]`
-
-Return all registered handler type strings.
+Default fallback handler: `CodergenHandler`.
 
 ---
 
-### `create_default_registry()`
-
-**Module**: `attractor.pipeline.handlers`
+### `HandlerHook` (Protocol)
 
 ```python
-def create_default_registry(
-    pipeline: Pipeline | None = None,
-    interviewer: Any = None,
-) -> HandlerRegistry
+@runtime_checkable
+class HandlerHook(Protocol):
+    async def before_execute(
+        self, node: PipelineNode, context: PipelineContext
+    ) -> None: ...
+
+    async def after_execute(
+        self, node: PipelineNode, context: PipelineContext, result: NodeResult
+    ) -> None: ...
 ```
-
-Create a `HandlerRegistry` pre-loaded with all built-in handlers.
-
-**Registered handler types**:
-
-| Type string | Handler class |
-|-------------|---------------|
-| `"codergen"` | `CodergenHandler()` |
-| `"human_gate"` | `HumanGateHandler(interviewer=interviewer)` |
-| `"conditional"` | `ConditionalHandler(pipeline=pipeline)` |
-| `"parallel"` | `ParallelHandler(registry=registry, pipeline=pipeline)` |
-| `"tool"` | `ToolHandler()` |
-| `"supervisor"` | `SupervisorHandler()` |
-
----
-
-### `CodergenHandler`
-
-**Module**: `attractor.pipeline.handlers`
-
-Invokes the Attractor coding agent to execute a prompt. Falls back to an echo stub if `attractor.agent` cannot be imported.
-
-**Node attributes consumed**:
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `prompt` | `str` | Prompt sent to the agent session. Supports `{key}` interpolation from context. |
-| `model` | `str` | Model identifier. Passed to `Session(model=model)`. Empty string uses the session default. |
-
-**Context updates set**:
-
-| Key | Value |
-|-----|-------|
-| `last_codergen_output` | The output string returned by the agent session, or `"[stub] {prompt}"` in fallback mode. |
-
-**Fallback behavior**: If `from attractor.agent import Session` raises `ImportError`, the handler returns `success=True` with a stub output string and logs a WARNING.
-
----
-
-### `HumanGateHandler`
-
-**Module**: `attractor.pipeline.handlers`
-
-Presents a prompt to a human interviewer and gates on approval.
-
-**Constructor**:
-
-```python
-HumanGateHandler(interviewer: Any = None)
-```
-
-**Node attributes consumed**:
-
-| Attribute | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `prompt` | `str` | `"Approve this step?"` | Question shown to the interviewer. |
-
-**Context updates set**:
-
-| Key | Value |
-|-----|-------|
-| `approved` | `bool` — `True` if approved, `False` if rejected, `True` if no interviewer (auto-approve). |
-
-**Auto-approve behavior**: If no interviewer is configured (neither constructor arg nor `context.get("_interviewer")`), the handler logs a WARNING and approves automatically.
-
----
-
-### `ConditionalHandler`
-
-**Module**: `attractor.pipeline.handlers`
-
-Evaluates outgoing edge conditions and sets `result.next_node` to the first matching target. Does not perform work itself.
-
-**Constructor**:
-
-```python
-ConditionalHandler(pipeline: Pipeline | None = None)
-```
-
----
-
-### `ParallelHandler`
-
-**Module**: `attractor.pipeline.handlers`
-
-Fan-out execution across multiple sub-paths via `asyncio.gather`.
-
-**Constructor**:
-
-```python
-ParallelHandler(
-    registry: HandlerRegistry | None = None,
-    pipeline: Pipeline | None = None,
-)
-```
-
-**Node attributes consumed**:
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `branches` | `str \| list[str]` | Comma-separated string or list of node names to execute in parallel. |
-
-**Context updates set**:
-
-| Key | Value |
-|-----|-------|
-| `parallel_results` | `dict[branch_name, output]` for each branch. |
-| `{branch_name}.{key}` | Each branch's `context_updates` are written with the branch name as prefix. |
-
----
-
-### `ToolHandler`
-
-**Module**: `attractor.pipeline.handlers`
-
-Executes a shell command and captures exit code and output.
-
-**Node attributes consumed**:
-
-| Attribute | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `command` | `str` | — | Shell command to execute. Required. Supports `{key}` context interpolation. |
-| `timeout` | `float` | `300` | Command timeout in seconds. |
-
-**Context updates set**:
-
-| Key | Value |
-|-----|-------|
-| `exit_code` | `int` — process return code (`-1` on timeout). |
-| `stdout` | `str` — standard output. |
-| `stderr` | `str` — standard error. |
-
-**Success condition**: `exit_code == 0`.
-
----
-
-### `SupervisorHandler`
-
-**Module**: `attractor.pipeline.handlers`
-
-Iterative refinement loop. Executes a named sub-pipeline repeatedly until a condition is met or `max_iterations` is reached.
-
-**Constructor**:
-
-```python
-SupervisorHandler(engine: Any = None)
-```
-
-**Node attributes consumed**:
-
-| Attribute | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `sub_pipeline` | `str` | — | Name of the sub-pipeline to run. Required. |
-| `max_iterations` | `int` | `5` | Maximum loop iterations. |
-| `done_condition` | `str` | `""` | Condition expression evaluated against context after each iteration. Loop exits early when `True`. |
-
-**Context writes**:
-
-| Key | Value |
-|-----|-------|
-| `_supervisor_iteration` | `int` — current iteration number (1-based), set before each sub-pipeline run. |
-| `_supervisor_iterations` | `int` — total iterations used, set on completion. |
-
----
-
-### `parse_dot_file()`
-
-**Module**: `attractor.pipeline.parser`
-
-```python
-def parse_dot_file(path: str | Path) -> Pipeline
-```
-
-Parse a DOT file at `path` and return a `Pipeline`.
-
-**Parameters**:
-
-- `path` (`str | Path`): Path to a `.dot` file.
-
-**Returns**: `Pipeline`
-
-**Raises**:
-
-- `ParseError`: If the file cannot be read or the DOT content is invalid.
-- `FileNotFoundError`: If `path` does not exist.
-
----
-
-### `parse_dot_string()`
-
-**Module**: `attractor.pipeline.parser`
-
-```python
-def parse_dot_string(dot_content: str, name: str = "pipeline") -> Pipeline
-```
-
-Parse a DOT string directly.
-
-**Parameters**:
-
-- `dot_content` (`str`): Raw DOT source text.
-- `name` (`str`): Fallback pipeline name if the graph has no name. Default: `"pipeline"`.
-
-**Returns**: `Pipeline`
-
-**Raises**: `ParseError` if the DOT content is invalid or empty.
-
----
-
-### `ParseError`
-
-**Module**: `attractor.pipeline.parser`
-
-```python
-class ParseError(Exception): ...
-```
-
-Raised when a DOT file cannot be parsed into a valid pipeline.
-
----
-
-### Start node detection
-
-Precedence (evaluated in order):
-
-1. Node with `start=true` attribute.
-2. Node named `"start"`.
-3. If neither exists: `ParseError` is raised.
-
-### Terminal node detection
-
-A node is terminal if:
-
-- It has `terminal=true` attribute, **or**
-- It has no outgoing edges (implicitly terminal — set by `_mark_terminals()`).
-
----
-
-### `validate_pipeline()`
-
-**Module**: `attractor.pipeline.validator`
-
-```python
-def validate_pipeline(pipeline: Pipeline) -> list[ValidationError]
-```
-
-Run all validation checks on `pipeline`. Returns a list of `ValidationError` findings, possibly empty.
-
-**Checks performed** (in order):
-
-| Check | Produces |
-|-------|----------|
-| Start node exists and is in `pipeline.nodes` | ERROR |
-| At least one terminal node | ERROR |
-| All `handler_type` values are in the known set | ERROR |
-| Required attributes present per handler type | ERROR |
-| All edge source/target node names exist | ERROR |
-| All edge condition expressions are syntactically valid | ERROR |
-| All nodes reachable from start node | WARNING |
-| Cycles not involving a `supervisor` node | WARNING |
-
-**Required attributes per handler type**:
-
-| Handler type | Required attributes |
-|-------------|---------------------|
-| `"tool"` | `command` |
-
----
-
-### `has_errors()`
-
-**Module**: `attractor.pipeline.validator`
-
-```python
-def has_errors(findings: list[ValidationError]) -> bool
-```
-
-Return `True` if any finding has `level == ValidationLevel.ERROR`.
-
----
-
-### `ValidationLevel`
-
-**Module**: `attractor.pipeline.validator`
-
-```python
-class ValidationLevel(str, enum.Enum):
-    ERROR = "error"
-    WARNING = "warning"
-```
-
----
-
-### `ValidationError`
-
-**Module**: `attractor.pipeline.validator`
-
-```python
-@dataclass
-class ValidationError:
-    level: ValidationLevel
-    message: str
-    node_name: str | None = None
-    edge: PipelineEdge | None = None
-```
-
-A single validation finding.
-
-**Fields**:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `level` | `ValidationLevel` | Severity: `ERROR` or `WARNING`. |
-| `message` | `str` | Human-readable description. |
-| `node_name` | `str \| None` | Name of the offending node, if applicable. |
-| `edge` | `PipelineEdge \| None` | The offending edge, if applicable. |
-
-**`__str__`**: Formats as `"[LEVEL] (location) message"`.
-
----
-
-### Known handler types (validator)
-
-The following `handler_type` strings are recognized by the built-in validator:
-
-```
-"codergen"
-"human_gate"
-"conditional"
-"parallel"
-"tool"
-"supervisor"
-```
-
-Custom handler types registered at runtime will produce ERROR findings during static validation unless the validator is extended.
 
 ---
 
 ### `GoalGate`
 
-**Module**: `attractor.pipeline.goals`
+Enforces required node completions and context conditions before pipeline exit.
 
 ```python
 @dataclass
@@ -961,30 +846,38 @@ class GoalGate:
     context_conditions: list[str] = field(default_factory=list)
 ```
 
-Gate that must be satisfied before pipeline completion is allowed. Checked by `PipelineEngine` before exiting at a terminal node.
-
 **Fields**:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `required_nodes` | `list[str]` | Node names that must appear in the completed set. |
-| `context_conditions` | `list[str]` | Condition expressions that must all evaluate to `True` against the final context. Uses the same syntax as edge conditions. |
+| `required_nodes` | `list[str]` | Node names that must appear in `_completed_nodes`. |
+| `context_conditions` | `list[str]` | Condition expressions that must all evaluate to `True`. |
 
 **Methods**:
 
-#### `check(completed_nodes: list[str], context: PipelineContext) -> bool`
+#### `check(completed_nodes, context)`
 
-Return `True` if all required nodes have completed and all context conditions hold.
+```python
+def check(self, completed_nodes: list[str], context: PipelineContext) -> bool
+```
 
-#### `unmet_requirements(completed_nodes: list[str], context: PipelineContext) -> list[str]`
+Returns `True` if all required nodes completed and all conditions hold.
 
-Return a list of human-readable strings describing each unmet requirement. Empty list means all requirements are met.
+#### `unmet_requirements(completed_nodes, context)`
+
+```python
+def unmet_requirements(
+    self, completed_nodes: list[str], context: PipelineContext
+) -> list[str]
+```
+
+Returns human-readable descriptions of unmet requirements.
 
 ---
 
 ### `ModelStylesheet`
 
-**Module**: `attractor.pipeline.stylesheet`
+Rule-based default attributes applied per-node before handler dispatch.
 
 ```python
 @dataclass
@@ -992,265 +885,237 @@ class ModelStylesheet:
     rules: list[StyleRule] = field(default_factory=list)
 ```
 
-Ordered collection of `StyleRule` entries. Rules are evaluated top-to-bottom; later rules override earlier ones for conflicting keys. Node-specific attributes always win over stylesheet defaults.
+**CSS-like selector types** (used with `parse_stylesheet(css: str)`):
 
-**Methods**:
+| Selector | `selector_type` | Specificity | Example |
+|----------|----------------|-------------|---------|
+| `*` | `universal` | 0 | `* { model: gpt-4o }` |
+| `shape_name` | `shape` | 1 | `Mdiamond { timeout: 30 }` |
+| `.classname` | `class` | 2 | `.expensive { max_tokens: 4096 }` |
+| `#nodename` | `id` | 3 | `#implement { model: claude-opus-4-6 }` |
 
-#### `from_dict(data: dict[str, Any]) -> ModelStylesheet` (classmethod)
+**Attribute precedence** (lowest to highest):
+1. Universal stylesheet rules.
+2. Shape/class stylesheet rules (in specificity order).
+3. ID stylesheet rules.
+4. Node-specific DOT attributes (always win).
 
-Build a stylesheet from a dict (e.g. parsed YAML/JSON).
+**Stylesheet properties**:
 
-**Expected format**:
+| Property | Type | Description |
+|----------|------|-------------|
+| `llm_model` | string | Sets `PipelineNode.llm_model`. |
+| `llm_provider` | string | Sets `PipelineNode.llm_provider`. |
+| `reasoning_effort` | string | Sets `PipelineNode.reasoning_effort`. |
+| `model` | string | Legacy model default (stored in `attributes`). |
+| `temperature` | float | Temperature default. |
+| `max_tokens` | integer | Max tokens default. |
+| `timeout` | float | Timeout default in seconds. |
+| `retry_count` | integer | Retry count default. |
 
+**`ModelStylesheet.from_dict(data)`** — builds from a dictionary:
 ```python
-{
+ModelStylesheet.from_dict({
     "rules": [
-        {
-            "handler_type": "codergen",
-            "model": "gpt-4o",
-            "temperature": 0.2,
-        },
-        {
-            "name_pattern": "test_*",
-            "timeout": 120,
-        },
+        {"handler_type": "codergen", "model": "gpt-4o", "timeout": 120},
     ]
-}
+})
 ```
+
+**`parse_stylesheet(css)`** — parses CSS-like text:
+```python
+stylesheet = parse_stylesheet("""
+* { model: gpt-4o }
+#implement { model: claude-opus-4-6; reasoning_effort: high }
+.fast { timeout: 30 }
+""")
+```
+
+**`apply_stylesheet(stylesheet, node, pipeline=None)`** — resolves final attributes for a node:
+```python
+resolved_attrs = apply_stylesheet(stylesheet, node, pipeline=pipeline)
+```
+
+Returns merged attribute dict. Also sets `node.llm_model`, `node.llm_provider`, `node.reasoning_effort` directly when resolved.
 
 ---
 
-### `StyleRule`
+### Pipeline Validation
 
-**Module**: `attractor.pipeline.stylesheet`
+**`validate_pipeline(pipeline, extra_rules=None)`**
+
+```python
+def validate_pipeline(
+    pipeline: Pipeline,
+    extra_rules: list[LintRule] | None = None,
+) -> list[ValidationError]
+```
+
+Runs all static validation checks. Returns a list of `ValidationError` findings.
+
+**`validate_or_raise(pipeline, extra_rules=None)`**
+
+Raises `ValidationException` if any `ERROR`-level findings are present.
+
+**`has_errors(findings)`**
+
+Returns `True` if any finding has level `ERROR`.
+
+**`ValidationError`**:
 
 ```python
 @dataclass
-class StyleRule:
-    # Matching criteria
-    handler_type: str | None = None
-    name_pattern: str | None = None
-    match_attributes: dict[str, Any] = field(default_factory=dict)
-
-    # Defaults to apply
-    model: str | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
-    timeout: float | None = None
-    retry_count: int | None = None
-    extra: dict[str, Any] = field(default_factory=dict)
+class ValidationError:
+    level: ValidationLevel  # ERROR, WARNING, INFO
+    message: str
+    node_name: str | None = None
+    edge: PipelineEdge | None = None
+    rule: str = ""
+    fix: str | None = None
 ```
 
-A single rule that applies default attribute values to matching nodes.
+**Validation rules**:
 
-**Matching fields** (all specified criteria must match):
+| Rule | Level | Description |
+|------|-------|-------------|
+| `start_node` | ERROR | Missing, duplicate, or nonexistent start node. |
+| `start_no_incoming` | ERROR | Start node has incoming edges. |
+| `terminal_node` | ERROR | Missing terminal nodes. |
+| `exit_no_outgoing` | ERROR | Exit node has outgoing edges. |
+| `type_known` | WARNING | Unknown handler type (not in built-in registry). |
+| `required_attributes` | ERROR | Handler-required attributes missing (e.g. `tool_command` for `tool` handler). |
+| `edge_target_exists` | ERROR | Edge source or target does not exist. |
+| `condition_syntax` | ERROR | Invalid condition expression syntax. |
+| `reachability` | ERROR | Node unreachable from start. |
+| cycles | WARNING | Node is part of a non-supervisor cycle. |
+| `retry_target_exists` | WARNING | `retry_target` or `fallback_retry_target` references nonexistent node. |
+| `goal_gate_has_retry` | WARNING | `goal_gate` node has no `retry_target` and no pipeline-level `retry_target`. |
+| `prompt_on_llm_nodes` | WARNING | `codergen` node has neither `prompt` nor `label`. |
+| `stylesheet_syntax` | ERROR | `model_stylesheet` contains invalid syntax or no rules. |
+| `fidelity_valid` | WARNING | Invalid fidelity value on graph, node, or edge. |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `handler_type` | `str \| None` | Exact match on `node.handler_type`. |
-| `name_pattern` | `str \| None` | `fnmatch` glob pattern matched against `node.name`. |
-| `match_attributes` | `dict[str, Any]` | All key-value pairs must be present and equal in `node.attributes`. |
-
-**Default fields applied to matching nodes**:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | `str \| None` | Model identifier. |
-| `temperature` | `float \| None` | Sampling temperature. |
-| `max_tokens` | `int \| None` | Maximum output tokens. |
-| `timeout` | `float \| None` | Timeout in seconds. |
-| `retry_count` | `int \| None` | Retry count. |
-| `extra` | `dict[str, Any]` | Additional arbitrary key-value defaults. |
-
-**Methods**:
-
-#### `matches(node: PipelineNode) -> bool`
-
-Return `True` if this rule applies to `node`.
-
-#### `defaults() -> dict[str, Any]`
-
-Return only the non-`None` default values as a dict, merged with `extra`.
+**`register_lint_rule(rule)`** — registers a custom `LintRule` applied during every `validate_pipeline()` call.
 
 ---
 
-### `apply_stylesheet()`
+### Checkpoint State Functions
 
-**Module**: `attractor.pipeline.stylesheet`
-
-```python
-def apply_stylesheet(
-    stylesheet: ModelStylesheet, node: PipelineNode
-) -> dict[str, Any]
-```
-
-Resolve final attributes for `node` by layering stylesheet defaults.
-
-**Returns**: Merged attribute dict: stylesheet defaults (later rules override earlier) overridden by the node's own attributes.
-
----
-
-### `Interviewer` protocol
-
-**Module**: `attractor.pipeline.interviewer`
-
-```python
-@runtime_checkable
-class Interviewer(Protocol):
-    async def ask(self, prompt: str, options: list[str] | None = None) -> str: ...
-    async def confirm(self, prompt: str) -> bool: ...
-    async def inform(self, message: str) -> None: ...
-```
-
-Protocol for human-in-the-loop interaction used by `HumanGateHandler`.
-
-**Methods**:
-
-| Method | Description |
-|--------|-------------|
-| `ask(prompt, options=None)` | Ask a free-form or multiple-choice question. If `options` is provided, returns one of the option strings. |
-| `confirm(prompt)` | Ask for yes/no confirmation. Returns `bool`. |
-| `inform(message)` | Display an informational message. No response expected. |
-
----
-
-### `CLIInterviewer`
-
-**Module**: `attractor.pipeline.interviewer`
-
-```python
-class CLIInterviewer:
-    def __init__(self, console: Console | None = None) -> None: ...
-```
-
-Interactive interviewer using `rich` for terminal formatting. Blocks on `asyncio.to_thread` for stdin reads.
-
-- `ask()` with `options`: Presents a numbered menu; returns the selected option string.
-- `ask()` without `options`: Free-form `Prompt.ask`.
-- `confirm()`: `Confirm.ask` returning `bool`.
-- `inform()`: Prints a Rich `Panel` with `border_style="blue"`.
-
----
-
-### `QueueInterviewer`
-
-**Module**: `attractor.pipeline.interviewer`
-
-```python
-class QueueInterviewer:
-    def __init__(self) -> None:
-        self.responses: asyncio.Queue[str]
-        self.messages: list[str]
-```
-
-Programmatic interviewer for tests and automation. Pre-load responses into `self.responses` before execution.
-
-- `ask()`: Returns `await self.responses.get()`.
-- `confirm()`: Returns `response.lower() in ("yes", "y", "true", "1")`.
-- `inform()`: Appends `message` to `self.messages`.
-
----
-
-### Checkpoint state functions
-
-**Module**: `attractor.pipeline.state`
-
-#### `save_checkpoint(checkpoint, directory) -> Path`
+**`save_checkpoint(checkpoint, directory)`**
 
 ```python
 def save_checkpoint(checkpoint: Checkpoint, directory: str | Path) -> Path
 ```
 
-Persist `checkpoint` to `directory` with a timestamp-based filename. Creates the directory if needed. Returns the `Path` to the written file.
+Writes `checkpoint` to `{directory}/checkpoint_{timestamp_ms}.json`. Creates directory if needed. Returns the file path.
 
-**File name format**: `checkpoint_{int(timestamp * 1000)}.json`
-
-#### `list_checkpoints(directory) -> list[Path]`
+**`list_checkpoints(directory)`**
 
 ```python
 def list_checkpoints(directory: str | Path) -> list[Path]
 ```
 
-Return all `checkpoint_*.json` files in `directory`, sorted newest first. Returns `[]` if directory does not exist.
+Returns all `checkpoint_*.json` files in `directory`, newest first.
 
-#### `latest_checkpoint(directory) -> Checkpoint | None`
+**`latest_checkpoint(directory)`**
 
 ```python
 def latest_checkpoint(directory: str | Path) -> Checkpoint | None
 ```
 
-Load and return the most recent checkpoint from `directory`, or `None` if none exist.
+Loads and returns the most recent checkpoint, or `None` if none exist.
 
 ---
 
-### Condition expression syntax
-
-**Module**: `attractor.pipeline.conditions`
-
-Conditions are evaluated by `evaluate_condition(expression, context)` using Python's `ast` module. No `eval` or `exec` is used.
-
-**Supported operators**:
-
-| Operator | Type | Example |
-|----------|------|---------|
-| `==` | Comparison | `exit_code == 0` |
-| `!=` | Comparison | `status != "failed"` |
-| `<` | Comparison | `retries < 3` |
-| `>` | Comparison | `score > 90` |
-| `<=` | Comparison | `attempts <= 5` |
-| `>=` | Comparison | `confidence >= 0.8` |
-| `and` | Boolean | `approved == true and exit_code == 0` |
-| `or` | Boolean | `status == "done" or skip == true` |
-| `not` | Unary | `not failed` |
-
-**Variable resolution**:
-
-- Bare names (identifiers) resolve to `context.get(name)`.
-- Dotted names (e.g. `result.status`) resolve to `context.get("result.status")`.
-- `true`, `false` → `True`, `False`.
-- `null`, `none` → `None`.
-- String literals: `"double-quoted"`.
-- Integer and float literals: `42`, `3.14`.
-
-**Empty condition**: An empty or whitespace-only condition always evaluates to `True`.
-
-**Unsupported**: Function calls, subscripts, lambda, comprehensions, arithmetic, bitwise operators. These raise `ConditionError`.
-
-#### `evaluate_condition()`
+### `Interviewer` Protocol
 
 ```python
-def evaluate_condition(expression: str, context: PipelineContext) -> bool
+class Interviewer(Protocol):
+    async def confirm(self, prompt: str) -> bool: ...
+    async def ask(self, question: Question) -> Answer: ...
+    async def inform(self, message: str) -> None: ...
 ```
 
-**Raises**: `ConditionError` if the expression is syntactically invalid or contains unsupported constructs.
+**Concrete implementations**:
 
-#### `validate_condition_syntax()`
+| Class | Description |
+|-------|-------------|
+| `CLIInterviewer` | Rich-based interactive terminal interviewer. Used by `run` and `resume` commands. |
+| `QueueInterviewer` | Queue-based interviewer for testing. Pre-loads expected answers. |
+
+**`Question`**:
 
 ```python
-def validate_condition_syntax(expression: str) -> str | None
+@dataclass
+class Question:
+    text: str
+    type: QuestionType          # FREE_TEXT or MULTIPLE_CHOICE
+    options: list[Option] = field(default_factory=list)
+    stage: str = ""
+    timeout_seconds: float | None = None
 ```
 
-Static syntax check. Returns `None` if valid, or an error message string.
-
-#### `ConditionError`
+**`Answer`**:
 
 ```python
-class ConditionError(Exception): ...
+@dataclass
+class Answer:
+    value: str | AnswerValue
+    selected_option: Option | None = None
 ```
 
-Raised when a condition expression cannot be parsed or evaluated.
+`AnswerValue` enum: `SKIPPED`.
 
 ---
 
-## 3. Agent API Reference
+## 5. Agent Module Reference
 
-**Module prefix**: `attractor.agent`
+Source: `src/attractor/agent/`
+
+---
+
+### `SessionConfig`
+
+Configuration dataclass for an agent session.
+
+```python
+@dataclass
+class SessionConfig:
+    max_turns: int = 0
+    max_tool_rounds_per_input: int = 0
+    default_command_timeout_ms: int | None = None
+    max_command_timeout_ms: int = 600_000
+    reasoning_effort: ReasoningEffort | None = None
+    enable_loop_detection: bool = True
+    loop_detection_window: int = 10
+    max_subagent_depth: int = 1
+    model_id: str = ""
+    user_instructions: str = ""
+    truncation_config: TruncationConfig | None = None
+    context_window_warning_threshold: float = 0.8
+```
+
+**Fields**:
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `max_turns` | `int` | Maximum total LLM round-trips across the entire session. 0 = unlimited. | 0 |
+| `max_tool_rounds_per_input` | `int` | Maximum tool execution rounds per `submit()` call. 0 = unlimited. | 0 |
+| `default_command_timeout_ms` | `int | None` | Default shell command timeout in milliseconds. `None` uses the profile default (Anthropic: 120,000ms; others: 10,000ms). | None |
+| `max_command_timeout_ms` | `int` | Hard ceiling on shell command timeouts. Enforced even if the model requests longer. | 600,000 |
+| `reasoning_effort` | `ReasoningEffort | None` | Optional reasoning effort override for LLM calls. | None |
+| `enable_loop_detection` | `bool` | Whether to detect and warn on repeating tool call patterns. | True |
+| `loop_detection_window` | `int` | Number of recent tool calls to examine for repeating patterns. | 10 |
+| `max_subagent_depth` | `int` | Maximum nesting depth for subagents. | 1 |
+| `model_id` | `str` | Model identifier string passed to the LLM client. | `""` |
+| `user_instructions` | `str` | Extra instructions appended to the system prompt. | `""` |
+| `truncation_config` | `TruncationConfig | None` | Per-tool truncation limits. Uses defaults if `None`. | None |
+| `context_window_warning_threshold` | `float` | Fraction (0.0–1.0) of context window usage that triggers a `CONTEXT_WINDOW_WARNING` event. | 0.8 |
 
 ---
 
 ### `Session`
 
-**Module**: `attractor.agent.session`
+Top-level API for the autonomous coding agent.
 
 ```python
 class Session:
@@ -1260,367 +1125,107 @@ class Session:
         environment: ExecutionEnvironment,
         config: SessionConfig,
         llm_client: LLMClientProtocol,
-    ) -> None: ...
+        *,
+        _depth: int = 0,
+    ) -> None
 ```
-
-Top-level session managing conversation history and the agentic loop.
 
 **Constructor parameters**:
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `profile` | `ProviderProfile` | Provider-specific tool set and system prompt template. |
-| `environment` | `ExecutionEnvironment` | Execution environment for file and shell operations. |
+| `profile` | `ProviderProfile` | Provider-specific tools and system prompt configuration. |
+| `environment` | `ExecutionEnvironment` | OS-level file and shell operations. |
 | `config` | `SessionConfig` | Session configuration. |
-| `llm_client` | `LLMClientProtocol` | LLM client implementing `complete()`. |
+| `llm_client` | `LLMClientProtocol` | LLM client for completions. |
 
 **Properties**:
 
-#### `state -> SessionState`
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | `str` | UUID for this session instance. |
+| `state` | `SessionState` | Current lifecycle state. Read-only. |
+| `conversation_history` | `list[Message]` | Defensive copy of conversation history. |
+| `turns` | `list[Turn]` | Defensive copy of typed turn history. |
 
-Current session state. Read-only.
+**State machine**:
 
-#### `conversation_history -> list[Message]`
+| State | Description |
+|-------|-------------|
+| `IDLE` | Ready to accept `submit()`. |
+| `PROCESSING` | Actively running the agentic loop. |
+| `AWAITING_INPUT` | Reserved for future human-in-the-loop use. |
+| `CLOSED` | Session ended via `abort()` or `shutdown()`. |
 
-Copy of the current conversation history.
+```
+IDLE ──submit()──> PROCESSING ──loop complete──> IDLE
+                              ──abort()──────> CLOSED
+```
 
 **Methods**:
 
-#### `submit(user_input: str) -> AsyncIterator[AgentEvent]` (async generator)
+#### `submit(user_input)`
 
-Submit user input and yield events as the agent works.
+```python
+async def submit(self, user_input: str) -> AsyncIterator[AgentEvent]
+```
 
-- Transitions state: `IDLE → RUNNING → IDLE`.
-- Emits `SESSION_START` at the beginning, `SESSION_END` at the end.
-- Runs the agentic loop as a background `asyncio.Task` and yields events as they arrive.
-- Raises `RuntimeError` if the session is `CLOSED`.
+Submits user input and yields `AgentEvent` instances as the agent works.
+
+- **Accepts from**: `IDLE` or `AWAITING_INPUT` states.
+- **Raises**: `RuntimeError` if state is `CLOSED` or `PROCESSING`.
+- **Returns**: Async iterator of `AgentEvent` objects. Iteration ends when the loop completes.
 
 **Example**:
-
 ```python
 async for event in session.submit("Fix the bug in auth.py"):
-    print(event.type, event.data)
+    if event.type == AgentEventType.ASSISTANT_TEXT_DELTA:
+        print(event.data.get("text", ""), end="", flush=True)
 ```
 
-#### `follow_up(message: str) -> None`
-
-Queue a message for processing after the current input completes. Messages are consumed in order after the primary submit loop finishes.
-
-#### `steer(message: str) -> None`
-
-Queue a steering message to inject after the current tool round, redirecting the agent mid-execution. (Reaches into the current loop via `AgentLoop.queue_steering()`.)
-
-#### `set_reasoning_effort(effort: ReasoningEffort) -> None`
-
-Change the reasoning effort for the next LLM call.
-
-#### `shutdown() -> None` (async)
-
-Graceful shutdown. Sets state to `CLOSED` and calls `environment.cleanup()`.
-
----
-
-### `SessionConfig`
-
-**Module**: `attractor.agent.session`
+#### `steer(message)`
 
 ```python
-@dataclass
-class SessionConfig:
-    max_turns: int = 0
-    max_tool_rounds_per_input: int = 0
-    default_command_timeout_ms: int = 10_000
-    reasoning_effort: ReasoningEffort | None = None
-    enable_loop_detection: bool = True
-    max_subagent_depth: int = 1
-    model_id: str = ""
-    user_instructions: str = ""
-    truncation_config: TruncationConfig | None = None
+def steer(self, message: str) -> None
 ```
 
-**Fields**:
+Queues a steering message to inject between tool rounds. Only effective when state is `PROCESSING`.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_turns` | `int` | `0` | Maximum LLM turns per `submit()` call. `0` = unlimited. |
-| `max_tool_rounds_per_input` | `int` | `0` | Maximum tool-use rounds per input. `0` = unlimited. |
-| `default_command_timeout_ms` | `int` | `10_000` | Default shell command timeout in milliseconds. |
-| `reasoning_effort` | `ReasoningEffort \| None` | `None` | Model reasoning budget. `None` = provider default. |
-| `enable_loop_detection` | `bool` | `True` | Enable `LoopDetector` to emit warnings on repeating tool-call patterns. |
-| `max_subagent_depth` | `int` | `1` | Maximum nesting depth for subagents spawned via `spawn_agent`. |
-| `model_id` | `str` | `""` | Model identifier passed to the LLM client and embedded in the system prompt. |
-| `user_instructions` | `str` | `""` | Additional instructions appended to the system prompt. |
-| `truncation_config` | `TruncationConfig \| None` | `None` | Output truncation limits. Uses `TruncationConfig` defaults if `None`. |
-
----
-
-### `SessionState`
-
-**Module**: `attractor.agent.session`
+#### `follow_up(message)`
 
 ```python
-class SessionState(str, enum.Enum):
-    IDLE = "idle"
-    RUNNING = "running"
-    CLOSED = "closed"
+def follow_up(self, message: str) -> None
 ```
 
-| Value | Description |
-|-------|-------------|
-| `IDLE` | No active execution. Ready to accept `submit()`. |
-| `RUNNING` | Agentic loop is executing. |
-| `CLOSED` | Session has been shut down. `submit()` raises `RuntimeError`. |
+Queues a message for processing after the current input completes.
 
----
-
-### `AgentLoop`
-
-**Module**: `attractor.agent.loop`
+#### `set_reasoning_effort(effort)`
 
 ```python
-class AgentLoop:
-    def __init__(
-        self,
-        profile: ProviderProfile,
-        environment: ExecutionEnvironment,
-        registry: ToolRegistry,
-        llm_client: LLMClientProtocol,
-        emitter: EventEmitter,
-        config: LoopConfig,
-        loop_detector: LoopDetector,
-    ) -> None: ...
+def set_reasoning_effort(self, effort: ReasoningEffort) -> None
 ```
 
-Executes the agentic tool-use loop. Stateless between runs — all conversation state lives in the `history` list passed in from `Session`.
+Changes reasoning effort for the next LLM call.
 
-**Constructor parameters**:
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `profile` | `ProviderProfile` | Provider profile for tool definitions and system prompt. |
-| `environment` | `ExecutionEnvironment` | Execution environment for tool calls. |
-| `registry` | `ToolRegistry` | Tool dispatch registry. |
-| `llm_client` | `LLMClientProtocol` | LLM client. |
-| `emitter` | `EventEmitter` | Event emitter for streaming events to `Session`. |
-| `config` | `LoopConfig` | Loop configuration. |
-| `loop_detector` | `LoopDetector` | Shared loop detector instance. |
-
-**Methods**:
-
-#### `run(user_input: str, history: list[Message]) -> None` (async)
-
-Execute the agentic loop for a single user input. Modifies `history` in place.
-
-**Loop termination conditions**:
-
-1. Text-only LLM response (no tool calls) — natural completion.
-2. `config.max_turns` reached — emits `TURN_LIMIT` event and returns.
-3. `config.max_tool_rounds` reached — emits `TURN_LIMIT` event and returns.
-4. LLM call exception — emits `ERROR` event and returns.
-
-#### `queue_steering(message: str) -> None`
-
-Queue a steering message for injection after the current tool round.
-
----
-
-### `LoopConfig`
-
-**Module**: `attractor.agent.loop`
+#### `abort()`
 
 ```python
-class LoopConfig:
-    def __init__(
-        self,
-        max_turns: int = 0,
-        max_tool_rounds: int = 0,
-        enable_loop_detection: bool = True,
-        reasoning_effort: ReasoningEffort | None = None,
-        default_command_timeout_ms: int = 10_000,
-        truncation_config: TruncationConfig | None = None,
-        model_id: str = "",
-        user_instructions: str = "",
-    ) -> None: ...
+def abort(self) -> None
 ```
 
-Configuration passed into `AgentLoop` from `Session`.
+Cancels the running loop and transitions to `CLOSED`. If not currently processing, transitions immediately.
 
-**Fields**:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_turns` | `int` | `0` | Maximum total turns. `0` = unlimited. |
-| `max_tool_rounds` | `int` | `0` | Maximum tool-use rounds. `0` = unlimited. |
-| `enable_loop_detection` | `bool` | `True` | Enable loop detection. |
-| `reasoning_effort` | `ReasoningEffort \| None` | `None` | Reasoning budget. |
-| `default_command_timeout_ms` | `int` | `10_000` | Shell timeout. |
-| `truncation_config` | `TruncationConfig \| None` | `None` | Truncation limits. |
-| `model_id` | `str` | `""` | Model identifier. |
-| `user_instructions` | `str` | `""` | Additional system prompt instructions. |
-
----
-
-### `LLMClientProtocol`
-
-**Module**: `attractor.agent.loop`
+#### `shutdown()`
 
 ```python
-@runtime_checkable
-class LLMClientProtocol(Protocol):
-    async def complete(self, request: Request) -> Response: ...
+async def shutdown(self) -> None
 ```
 
-Minimal interface the loop requires from an LLM client.
-
----
-
-### `ExecutionEnvironment` protocol
-
-**Module**: `attractor.agent.environment`
-
-```python
-@runtime_checkable
-class ExecutionEnvironment(Protocol):
-    async def read_file(
-        self, path: str, offset: int | None = None, limit: int | None = None
-    ) -> str: ...
-
-    async def write_file(self, path: str, content: str) -> None: ...
-
-    async def file_exists(self, path: str) -> bool: ...
-
-    async def list_directory(self, path: str, depth: int = 1) -> list[DirEntry]: ...
-
-    async def exec_command(
-        self,
-        command: str,
-        timeout_ms: int = 10_000,
-        working_dir: str | None = None,
-        env_vars: dict[str, str] | None = None,
-    ) -> ExecResult: ...
-
-    async def grep(
-        self, pattern: str, path: str, options: dict[str, str] | None = None
-    ) -> str: ...
-
-    async def glob(self, pattern: str, path: str | None = None) -> list[str]: ...
-
-    async def initialize(self) -> None: ...
-
-    async def cleanup(self) -> None: ...
-
-    def working_directory(self) -> str: ...
-
-    def platform(self) -> str: ...
-```
-
-Interface that agent tools use to interact with the outside world. Structural typing — no inheritance required.
-
-**Method details**:
-
-| Method | Description |
-|--------|-------------|
-| `read_file(path, offset=None, limit=None)` | Read a file. Returns line-numbered content (`"     N\tline"`). `offset` is 1-based. |
-| `write_file(path, content)` | Create or overwrite a file. Creates parent directories. |
-| `file_exists(path)` | Return `True` if the path exists. |
-| `list_directory(path, depth=1)` | Return directory entries up to `depth` levels deep. |
-| `exec_command(command, timeout_ms, working_dir, env_vars)` | Execute a shell command. Returns `ExecResult`. |
-| `grep(pattern, path, options)` | Regex search returning `"file:line: content"` matches. |
-| `glob(pattern, path=None)` | Return file paths matching `pattern`, sorted by modification time descending. |
-| `initialize()` | Lifecycle: called before first use. |
-| `cleanup()` | Lifecycle: called on `Session.shutdown()`. |
-| `working_directory()` | Return the working directory path string. |
-| `platform()` | Return the platform string (e.g. `"darwin"`, `"linux"`). |
-
----
-
-### `DirEntry`
-
-**Module**: `attractor.agent.environment`
-
-```python
-@dataclass
-class DirEntry:
-    name: str
-    path: str
-    is_dir: bool
-    size: int = 0
-```
-
-A single directory entry returned by `list_directory()`.
-
----
-
-### `ExecResult`
-
-**Module**: `attractor.agent.environment`
-
-```python
-@dataclass
-class ExecResult:
-    stdout: str = ""
-    stderr: str = ""
-    exit_code: int = 0
-    timed_out: bool = False
-```
-
-Result of a shell command execution.
-
----
-
-### `LocalExecutionEnvironment`
-
-**Module**: `attractor.agent.environment`
-
-```python
-class LocalExecutionEnvironment:
-    def __init__(self, working_dir: str | None = None) -> None: ...
-```
-
-`ExecutionEnvironment` backed by the host filesystem and OS.
-
-**Constructor**:
-
-- `working_dir` (`str | None`): Working directory. Defaults to `Path.cwd()`.
-
-**Behavior details**:
-
-- Relative paths in `read_file`, `write_file`, etc. are resolved against `working_dir`.
-- `exec_command` spawns processes with `start_new_session=True`. On timeout, sends SIGTERM to the process group, then SIGKILL after 2 seconds.
-- `exec_command` filters sensitive environment variables (matching `*_API_KEY`, `*_SECRET`, `*_TOKEN`, `*_PASSWORD`) from the subprocess environment.
-- `grep` uses Python `re` — not the system `grep` binary.
-- `glob` results are sorted by `mtime` descending.
-- `cleanup()` is a no-op for the local environment.
-
----
-
-### `AgentEvent`
-
-**Module**: `attractor.agent.events`
-
-```python
-@dataclass
-class AgentEvent:
-    type: AgentEventType
-    data: dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
-```
-
-A single event from the agent execution pipeline.
-
-**Fields**:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `type` | `AgentEventType` | The kind of event. |
-| `data` | `dict[str, Any]` | Event payload. Shape varies by `type`. |
-| `timestamp` | `float` | UNIX epoch when the event was created. |
+Graceful shutdown — closes the execution environment and marks the session `CLOSED`.
 
 ---
 
 ### `AgentEventType`
-
-**Module**: `attractor.agent.events`
 
 ```python
 class AgentEventType(str, enum.Enum):
@@ -1636,135 +1241,229 @@ class AgentEventType(str, enum.Enum):
     STEERING_INJECTED = "steering_injected"
     TURN_LIMIT = "turn_limit"
     LOOP_DETECTION = "loop_detection"
+    CONTEXT_WINDOW_WARNING = "context_window_warning"
     ERROR = "error"
 ```
 
-**Event data shapes**:
+**Event data payloads**:
 
-| Event type | `data` keys |
-|------------|-------------|
-| `SESSION_START` | `{"state": str}` |
-| `SESSION_END` | `{"state": str}` |
-| `USER_INPUT` | `{"text": str}` |
-| `ASSISTANT_TEXT_START` | `{}` |
-| `ASSISTANT_TEXT_DELTA` | `{"text": str}` |
-| `ASSISTANT_TEXT_END` | `{"text": str}` — full accumulated text |
-| `TOOL_CALL_START` | `{"tool_name": str, "tool_call_id": str, "arguments": dict}` |
-| `TOOL_CALL_OUTPUT_DELTA` | `{"tool_call_id": str, "output": str}` — truncated |
-| `TOOL_CALL_END` | `{"tool_name": str, "tool_call_id": str, "output": str, "full_output": str, "is_error": bool}` |
-| `STEERING_INJECTED` | `{"text": str}` |
-| `TURN_LIMIT` | `{"turns": int, "limit": int}` |
-| `LOOP_DETECTION` | `{"warning": str}` |
-| `ERROR` | `{"error": str, "phase": str}` — `phase` is `"llm_call"` or `"session"` |
+| Event type | `data` keys | Description |
+|------------|-------------|-------------|
+| `SESSION_START` | `state` | Session lifecycle state value string. |
+| `SESSION_END` | `state` | Session lifecycle state after completion. |
+| `USER_INPUT` | `text` | The submitted user input text. |
+| `ASSISTANT_TEXT_START` | _(empty)_ | Model started generating text. |
+| `ASSISTANT_TEXT_DELTA` | `text` | Incremental text chunk from the model. |
+| `ASSISTANT_TEXT_END` | `text` | Complete assistant response text. |
+| `TOOL_CALL_START` | `tool_name`, `tool_call_id`, `arguments` | Tool invocation starting. |
+| `TOOL_CALL_OUTPUT_DELTA` | `text` | Incremental tool output chunk. |
+| `TOOL_CALL_END` | `tool_name`, `tool_call_id`, `output`, `truncated_output`, `is_error` | Tool execution completed. `output` is full output; `truncated_output` is the LLM-facing version. |
+| `STEERING_INJECTED` | `text` | Steering message injected between tool rounds. |
+| `TURN_LIMIT` | `turns`, `limit` | Turn limit reached; loop terminating. |
+| `LOOP_DETECTION` | `pattern`, `window` | Repeating tool call pattern detected (warning only — loop continues). |
+| `CONTEXT_WINDOW_WARNING` | `usage_fraction`, `threshold` | Context window usage nearing configured threshold. |
+| `ERROR` | `error`, `phase` | Unhandled exception during session execution. |
 
 ---
 
-### `EventEmitter`
-
-**Module**: `attractor.agent.events`
+### `AgentEvent`
 
 ```python
-class EventEmitter:
-    def __init__(self) -> None: ...
+@dataclass
+class AgentEvent:
+    type: AgentEventType
+    data: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    session_id: str = ""
 ```
 
-Async event emitter with iterator-based delivery. Events are placed into an internal `asyncio.Queue` and consumed by async-iterating over the emitter instance.
+---
 
-**Methods**:
+### `ExecutionEnvironment` (Protocol)
 
-#### `emit(event: AgentEvent) -> None`
-
-Enqueue an event for delivery. No-op after `close()`.
-
-#### `close() -> None`
-
-Signal that no more events will be emitted. Enqueues a sentinel that causes `__anext__` to raise `StopAsyncIteration`.
-
-**Usage**:
+Interface that agent tools use to interact with the filesystem and OS.
 
 ```python
-async for event in emitter:
-    print(event.type)
+@runtime_checkable
+class ExecutionEnvironment(Protocol):
+    async def initialize(self) -> None: ...
+    async def cleanup(self) -> None: ...
+    def working_directory(self) -> str: ...
+    def platform(self) -> str: ...
+    async def read_file(
+        self, path: str, offset: int | None = None, limit: int | None = None
+    ) -> str: ...
+    async def write_file(self, path: str, content: str) -> None: ...
+    async def file_exists(self, path: str) -> bool: ...
+    async def list_directory(self, path: str, depth: int = 1) -> list[DirEntry]: ...
+    async def exec_command(
+        self,
+        command: str,
+        timeout_ms: int = 10_000,
+        working_dir: str | None = None,
+        env_vars: dict[str, str] | None = None,
+    ) -> ExecResult: ...
+    async def grep(
+        self, pattern: str, path: str, options: dict[str, str] | None = None
+    ) -> str: ...
+    async def glob(self, pattern: str, path: str | None = None) -> list[str]: ...
 ```
+
+**Method specifications**:
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `initialize()` | `None` | Setup before tool execution begins. |
+| `cleanup()` | `None` | Release resources when session ends. |
+| `working_directory()` | `str` | Current working directory path. |
+| `platform()` | `str` | Platform identifier (e.g. `"linux"`, `"darwin"`). |
+| `read_file(path, offset=None, limit=None)` | `str` | File content with `cat -n` style line numbers. `offset` is 1-based. |
+| `write_file(path, content)` | `None` | Write content to file. Creates parent directories as needed. |
+| `file_exists(path)` | `bool` | Whether the file at `path` exists. |
+| `list_directory(path, depth=1)` | `list[DirEntry]` | Directory entries up to `depth` levels deep. |
+| `exec_command(command, timeout_ms=10000, working_dir=None, env_vars=None)` | `ExecResult` | Execute shell command with timeout and signal handling. |
+| `grep(pattern, path, options=None)` | `str` | Regex search across files. `options` supports `include` (glob) and `max_results`. |
+| `glob(pattern, path=None)` | `list[str]` | File paths matching pattern, sorted by modification time. |
+
+**`DirEntry`**:
+```python
+@dataclass
+class DirEntry:
+    name: str
+    path: str
+    is_dir: bool
+    size: int = 0
+```
+
+**`ExecResult`**:
+```python
+@dataclass
+class ExecResult:
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = 0
+    timed_out: bool = False
+    duration_ms: int = 0
+```
+
+**`LocalExecutionEnvironment`**
+
+Concrete implementation backed by the host filesystem and OS.
+
+```python
+class LocalExecutionEnvironment:
+    def __init__(self, working_dir: str | None = None) -> None
+```
+
+- **`working_dir`**: Working directory. Defaults to `Path.cwd()`.
+- Resolves relative paths against `working_dir`.
+- `exec_command` uses `SIGTERM` → 2s wait → `SIGKILL` for timeout handling.
+- Filters sensitive environment variables from subprocess environments.
+
+**Filtered env var patterns**: `*_API_KEY`, `*_SECRET`, `*_TOKEN`, `*_PASSWORD`, `AWS_*KEY*`, `DATABASE_URL`, `*_DATABASE_URL`, `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`, `DOCKER_*`.
+
+---
+
+### `ProviderProfile` (Protocol)
+
+Provider-specific configuration for tools and system prompts.
+
+```python
+@runtime_checkable
+class ProviderProfile(Protocol):
+    @property
+    def provider_name(self) -> str: ...
+    @property
+    def tool_definitions(self) -> list[ToolDefinition]: ...
+    @property
+    def system_prompt_template(self) -> str: ...
+    @property
+    def context_window_size(self) -> int: ...
+    @property
+    def supports_reasoning(self) -> bool: ...
+    @property
+    def supports_streaming(self) -> bool: ...
+    @property
+    def supports_parallel_tool_calls(self) -> bool: ...
+    @property
+    def default_timeout_ms(self) -> int: ...
+    def provider_options(self) -> dict | None: ...
+    def get_tools(self) -> list[ToolDefinition]: ...
+    def format_system_prompt(self, **kwargs: str) -> str: ...
+```
+
+**Properties**:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `provider_name` | `str` | Short provider identifier: `"anthropic"`, `"openai"`, `"google"`. |
+| `tool_definitions` | `list[ToolDefinition]` | Tools this profile exposes to the model. |
+| `system_prompt_template` | `str` | Template for the base system prompt with `{placeholder}` variables. |
+| `context_window_size` | `int` | Maximum context window size in tokens for this profile. |
+| `supports_reasoning` | `bool` | Whether the provider supports reasoning/thinking capabilities. |
+| `supports_streaming` | `bool` | Whether the provider supports streaming responses. |
+| `supports_parallel_tool_calls` | `bool` | Whether the provider supports parallel tool execution. |
+| `default_timeout_ms` | `int` | Default shell command timeout. Anthropic: 120,000ms. Others: 10,000ms. |
+
+**`format_system_prompt(**kwargs)`**: Replaces `{key}` placeholders in `system_prompt_template`.
+
+Common template variables: `working_dir`, `platform`, `date`, `model_id`, `git_branch`, `git_status`.
+
+**Concrete implementations**: `AnthropicProfile`, `OpenAIProfile`, `GeminiProfile` in `agent/profiles/`.
 
 ---
 
 ### `LoopDetector`
 
-**Module**: `attractor.agent.loop_detection`
+Fingerprints tool calls and detects repeating patterns.
 
-```python
-@dataclass
-class LoopDetector:
-    _history: list[str] = field(default_factory=list)
-```
-
-Tracks tool call history and detects repeating patterns.
-
-**Detection algorithm**:
-
-- Fingerprints each tool call as `sha256("{tool_name}:{arguments_hash}")[:16]`.
-- Checks the last `window_size` (default: 10) calls for repeating cycles of length 1, 2, or 3.
-- A pattern is a loop if it repeats at least 3 consecutive times.
-
-**Methods**:
-
-#### `record_call(tool_name: str, arguments_hash: str) -> None`
-
-Record a tool call fingerprint. `arguments_hash` is a pre-computed hash of the arguments dict.
-
-#### `check_for_loops(window_size: int = 10) -> str | None`
-
-Check for repeating cycles. Returns a warning message string if detected, or `None`.
-
-#### `reset() -> None`
-
-Clear all recorded history.
+- Computes fingerprints as `(tool_name, hash(args))` for each tool call.
+- Detects repeating patterns of length 1, 2, and 3 within the most recent `loop_detection_window` calls.
+- On detection, emits a `LOOP_DETECTION` warning event.
+- Does NOT terminate the loop. The loop terminates only on (1) text-only response or (2) turn/tool-round limit.
 
 ---
 
 ### `TruncationConfig`
 
-**Module**: `attractor.agent.truncation`
+Per-tool output truncation limits applied by `truncate_output()`.
 
 ```python
 @dataclass
 class TruncationConfig:
-    char_limits: dict[str, int] = field(default_factory=lambda: { ... })
-    line_limits: dict[str, int] = field(default_factory=lambda: { ... })
+    char_limits: dict[str, int]
+    truncation_modes: dict[str, str]
+    line_limits: dict[str, int]
 ```
 
-Per-tool truncation limits. Setting a limit to `0` disables that stage for the tool.
+**Default Stage 1 character limits and modes**:
 
-**Default character limits (Stage 1)**:
+| Tool | Char limit | Mode |
+|------|-----------|------|
+| `read_file` | 50,000 | `head_tail` |
+| `shell` | 30,000 | `head_tail` |
+| `grep` | 20,000 | `tail` |
+| `glob` | 20,000 | `tail` |
+| `list_dir` | 20,000 | `tail` |
+| `spawn_agent` | 20,000 | `head_tail` |
+| `edit_file` | 10,000 | `tail` |
+| `apply_patch` | 10,000 | `tail` |
+| `write_file` | 1,000 | `tail` |
 
-| Tool | Character limit |
-|------|----------------|
-| `read_file` | 50,000 |
-| `shell` | 30,000 |
-| `grep` | 20,000 |
-| `glob` | 20,000 |
-| `edit_file` | 10,000 |
-| `apply_patch` | 10,000 |
-| `write_file` | 1,000 |
-
-**Default line limits (Stage 2)**:
+**Default Stage 2 line limits** (applied after Stage 1):
 
 | Tool | Line limit |
 |------|-----------|
 | `shell` | 256 |
 | `grep` | 200 |
 | `glob` | 500 |
+| `list_dir` | 500 |
 
-**Truncation format**: When truncation occurs, the middle is replaced with:
+**Truncation modes**:
+- `head_tail`: Keeps the first and last halves; omits the middle with a `[WARNING: Tool output was truncated. N characters were removed from the middle.]` marker.
+- `tail`: Discards the beginning; keeps only the tail with a `[WARNING: Tool output was truncated. First N characters were removed.]` prefix marker.
 
-```
-[WARNING: Tool output was truncated. N characters/lines removed from middle of output]
-```
-
-Head and tail each receive half the limit.
-
-#### `truncate_output()`
+**`truncate_output(tool_name, output, config=None)`**
 
 ```python
 def truncate_output(
@@ -1774,410 +1473,21 @@ def truncate_output(
 ) -> tuple[str, str]
 ```
 
-Apply the two-stage truncation pipeline.
-
-**Returns**: `(truncated, full_original)` — `truncated` is sent to the LLM; `full_original` is the unmodified output stored in `TOOL_CALL_END`.
-
----
-
-### `ProviderProfile` ABC
-
-**Module**: `attractor.agent.profiles.base`
-
-```python
-class ProviderProfile(ABC):
-    @property
-    @abstractmethod
-    def provider_name(self) -> str: ...
-
-    @property
-    @abstractmethod
-    def tool_definitions(self) -> list[ToolDefinition]: ...
-
-    @property
-    @abstractmethod
-    def system_prompt_template(self) -> str: ...
-
-    @property
-    @abstractmethod
-    def context_window_size(self) -> int: ...
-
-    def get_tools(self) -> list[ToolDefinition]: ...
-
-    def format_system_prompt(self, **kwargs: str) -> str: ...
-```
-
-Provider-specific configuration for tools and system prompts.
-
-**Abstract properties**:
-
-| Property | Return type | Description |
-|----------|-------------|-------------|
-| `provider_name` | `str` | Short provider identifier (`"anthropic"`, `"openai"`, `"google"`). |
-| `tool_definitions` | `list[ToolDefinition]` | Tool definitions exposed to the model. |
-| `system_prompt_template` | `str` | Template string with `{placeholder}` variables. |
-| `context_window_size` | `int` | Maximum context window in tokens. |
-
-**Concrete methods**:
-
-#### `get_tools() -> list[ToolDefinition]`
-
-Returns `list(self.tool_definitions)`.
-
-#### `format_system_prompt(**kwargs: str) -> str`
-
-Replace `{key}` placeholders in `system_prompt_template` with provided values.
-
-**Common variables**: `working_dir`, `platform`, `date`, `model_id`, `git_branch`, `git_status`, `project_docs`, `user_instructions`.
+Returns `(truncated, full_original)`.
+- `truncated` is sent to the LLM.
+- `full_original` is available in the `TOOL_CALL_END` event `output` field.
 
 ---
 
-### Provider profiles
+## 6. LLM Client Reference
 
-#### `AnthropicProfile`
-
-**Module**: `attractor.agent.profiles.anthropic_profile`
-
-- `provider_name`: `"anthropic"`
-- `context_window_size`: `200_000`
-- **Tools**: `edit_file`, `read_file`, `write_file`, `shell`, `grep`, `glob`, `spawn_agent`
-- **Edit tool**: `edit_file` (search-and-replace)
-
-#### `OpenAIProfile`
-
-**Module**: `attractor.agent.profiles.openai_profile`
-
-- `provider_name`: `"openai"`
-- `context_window_size`: `128_000`
-- **Tools**: `apply_patch`, `read_file`, `write_file`, `shell`, `grep`, `glob`, `spawn_agent`
-- **Edit tool**: `apply_patch` (v4a unified diff format)
-
-#### `GeminiProfile`
-
-**Module**: `attractor.agent.profiles.gemini_profile`
-
-- `provider_name`: `"google"`
-- `context_window_size`: `1_000_000`
-- **Tools**: `edit_file`, `read_file`, `write_file`, `shell`, `grep`, `glob`, `list_dir`, `spawn_agent`
-- **Additional tool**: `list_dir` — list directory contents with file sizes.
-
----
-
-### `build_system_prompt()`
-
-**Module**: `attractor.agent.prompts`
-
-```python
-def build_system_prompt(
-    profile: ProviderProfile,
-    environment: ExecutionEnvironment,
-    model_id: str = "",
-    user_instructions: str = "",
-) -> str
-```
-
-Construct the full system prompt for an agent session.
-
-**Layers** (later overrides earlier):
-
-1. Provider base prompt with environment context.
-2. Project documentation discovered from the working directory.
-3. User instruction overrides.
-
-**Project documentation discovery** (`discover_project_docs()`):
-
-- Walks from the current working directory up to the git repository root.
-- Loads `AGENTS.md` and provider-specific files (`CLAUDE.md` for Anthropic, `.codex/instructions.md` for OpenAI, `GEMINI.md` for Google).
-- Enforces a 32 KB total budget. Files exceeding the budget are truncated with a note.
-
----
-
-### `ToolRegistry`
-
-**Module**: `attractor.agent.tools.registry`
-
-```python
-class ToolRegistry:
-    def __init__(self) -> None: ...
-```
-
-Maps tool names to async handler callables and their `ToolDefinition`s.
-
-**Methods**:
-
-#### `register(name: str, handler: ToolHandler, definition: ToolDefinition) -> None`
-
-Register a tool. Overwrites any existing registration for `name`.
-
-#### `dispatch(name: str, arguments: dict[str, Any], environment: ExecutionEnvironment) -> ToolResult` (async)
-
-Look up and execute a tool by name.
-
-- Returns an error `ToolResult` for unknown tools rather than raising.
-- Returns an error `ToolResult` if the handler raises an exception.
-
-#### `definitions() -> list[ToolDefinition]`
-
-Return all registered tool definitions.
-
-#### `has_tool(name: str) -> bool`
-
-Return `True` if `name` is registered.
-
-#### `tool_names() -> list[str]`
-
-Return all registered tool name strings.
-
----
-
-### `ToolResult`
-
-**Module**: `attractor.agent.tools.registry`
-
-```python
-@dataclass
-class ToolResult:
-    output: str
-    is_error: bool = False
-    full_output: str = ""
-```
-
-**Fields**:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `output` | `str` | — | Text sent back to the LLM (possibly truncated). |
-| `is_error` | `bool` | `False` | `True` if the tool produced an error. |
-| `full_output` | `str` | `""` | The untruncated original output. |
-
----
-
-### Tool definitions
-
-All tools accept `(arguments: dict[str, Any], environment: ExecutionEnvironment) -> ToolResult` (async).
-
-#### `read_file`
-
-**Module**: `attractor.agent.tools.core_tools`
-
-Read a file and return line-numbered content.
-
-**Parameters**:
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `path` | `string` | Yes | Absolute or relative path to the file. |
-| `offset` | `integer` | No | 1-based line number to start reading from. |
-| `limit` | `integer` | No | Maximum number of lines to read. |
-
-**Returns**: Line-numbered content as `"     N\tline content"`. Error if file not found.
-
-**Truncation**: 50,000 characters (Stage 1 only).
-
----
-
-#### `write_file`
-
-**Module**: `attractor.agent.tools.core_tools`
-
-Create or overwrite a file with given content.
-
-**Parameters**:
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `path` | `string` | Yes | Absolute or relative path for the file. |
-| `content` | `string` | Yes | The full content to write. |
-
-**Returns**: `"Successfully wrote to {path}"`. Error on write failure.
-
-**Truncation**: 1,000 characters (Stage 1 only).
-
----
-
-#### `edit_file`
-
-**Module**: `attractor.agent.tools.core_tools`
-
-Make a search-and-replace edit in a file. Used by `AnthropicProfile` and `GeminiProfile`.
-
-**Parameters**:
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `path` | `string` | Yes | Path to the file to edit. |
-| `old_string` | `string` | Yes | The exact text to find. Must appear exactly once in the file. |
-| `new_string` | `string` | Yes | The replacement text. |
-
-**Returns**: `"Successfully edited {path}"`. Errors if file not found, `old_string` not found, or `old_string` appears more than once.
-
-**Truncation**: 10,000 characters (Stage 1 only).
-
----
-
-#### `shell`
-
-**Module**: `attractor.agent.tools.core_tools`
-
-Execute a shell command.
-
-**Parameters**:
-
-| Name | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `command` | `string` | Yes | — | The shell command to execute. |
-| `timeout_ms` | `integer` | No | `10000` | Timeout in milliseconds. |
-
-**Returns**: Combined stdout/stderr output. `is_error=True` if exit code != 0 or timed out.
-
-**Truncation**: 30,000 characters (Stage 1), 256 lines (Stage 2).
-
----
-
-#### `grep`
-
-**Module**: `attractor.agent.tools.core_tools`
-
-Search for a regex pattern across files.
-
-**Parameters**:
-
-| Name | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `pattern` | `string` | Yes | — | Regular expression pattern. |
-| `path` | `string` | No | working directory | File or directory to search in. |
-| `include` | `string` | No | `None` | Glob pattern to filter files (e.g. `*.py`). |
-| `max_results` | `integer` | No | `100` | Maximum number of results. |
-
-**Returns**: Newline-separated `"file:line: content"` matches, or `"No matches found."`.
-
-**Truncation**: 20,000 characters (Stage 1), 200 lines (Stage 2).
-
----
-
-#### `glob`
-
-**Module**: `attractor.agent.tools.core_tools`
-
-Find files matching a glob pattern, sorted by modification time descending.
-
-**Parameters**:
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `pattern` | `string` | Yes | Glob pattern (e.g. `**/*.py`). |
-| `path` | `string` | No | Base directory for the search. Defaults to working directory. |
-
-**Returns**: Newline-separated file paths, or `"No files matched."`.
-
-**Truncation**: 20,000 characters (Stage 1), 500 lines (Stage 2).
-
----
-
-#### `apply_patch`
-
-**Module**: `attractor.agent.tools.apply_patch`
-
-Apply a v4a-format patch to create, modify, delete, or move files. Used by `OpenAIProfile`.
-
-**Parameters**:
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `patch` | `string` | Yes | The patch text in v4a unified diff format. |
-
-**Supported operations**:
-
-| Operation | Triggered by |
-|-----------|-------------|
-| `ADD_FILE` | `--- /dev/null` followed by `+++ b/path` |
-| `DELETE_FILE` | `+++ /dev/null` following `--- a/path` |
-| `UPDATE_FILE` | `diff --git a/path b/path` with same old and new path |
-| `MOVE_FILE` | `diff --git a/old b/new` with different paths |
-
-**Returns**: `"Patch applied successfully to: {files}"`. Error listing failed operations if any fail.
-
-**Truncation**: 10,000 characters (Stage 1 only).
-
----
-
-#### `spawn_agent`
-
-**Module**: `attractor.agent.tools.subagent`
-
-Spawn a subagent to work on a delegated task.
-
-**Parameters**:
-
-| Name | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `task` | `string` | Yes | — | Description of the task for the subagent. |
-| `working_dir` | `string` | No | — | Working directory for the subagent. |
-| `model` | `string` | No | — | Model to use for the subagent. |
-| `max_turns` | `integer` | No | — | Maximum turns for the subagent. |
-
-**Returns**: Message with the generated `agent_id` (format: `subagent_{8 hex chars}`). Use `wait(agent_id=...)` to retrieve results.
-
----
-
-#### `send_input`
-
-**Module**: `attractor.agent.tools.subagent`
-
-Send a follow-up message to a running subagent.
-
-**Parameters**:
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `agent_id` | `string` | Yes | The subagent ID. |
-| `message` | `string` | Yes | The message to send. |
-
-**Returns**: Confirmation string. Error if subagent not found or closed.
-
----
-
-#### `wait`
-
-**Module**: `attractor.agent.tools.subagent`
-
-Wait for a subagent to complete and return its result.
-
-**Parameters**:
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `agent_id` | `string` | Yes | The subagent ID to wait on. |
-
-**Returns**: The subagent's result string. Error if not found or if the task failed.
-
----
-
-#### `close_agent`
-
-**Module**: `attractor.agent.tools.subagent`
-
-Close a subagent and free its resources.
-
-**Parameters**:
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `agent_id` | `string` | Yes | The subagent ID to close. |
-
-**Returns**: Confirmation string. Cancels any running task.
-
----
-
-## 4. LLM Client API Reference
-
-**Module prefix**: `attractor.llm`
+Source: `src/attractor/llm/`
 
 ---
 
 ### `LLMClient`
 
-**Module**: `attractor.llm.client`
+Provider-agnostic LLM client with middleware pipeline, retry logic, and tool-loop support.
 
 ```python
 class LLMClient:
@@ -2186,43 +1496,42 @@ class LLMClient:
         adapters: list[Any] | None = None,
         middleware: list[Middleware] | None = None,
         retry_policy: RetryPolicy | None = None,
-    ) -> None: ...
+        on_retry: Callable[[int, Exception, float], None] | None = None,
+    ) -> None
 ```
-
-Provider-agnostic LLM client with middleware and tool-loop support. Routes requests to the appropriate provider adapter based on model name.
 
 **Constructor parameters**:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `adapters` | `list[Any] \| None` | `None` | Provider adapters. If `None`, loads all available adapters via `_default_adapters()`. |
-| `middleware` | `list[Middleware] \| None` | `None` | Middleware pipeline. Applied in order on request, in reverse order on response. |
-| `retry_policy` | `RetryPolicy \| None` | `None` | Retry configuration. Defaults to `RetryPolicy()`. |
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `adapters` | `list[Any] | None` | Provider adapters. Auto-discovers installed providers if `None`. | Auto-discovered |
+| `middleware` | `list[Middleware] | None` | Middleware pipeline. | `[]` |
+| `retry_policy` | `RetryPolicy | None` | Retry configuration. | `RetryPolicy()` (2 retries) |
+| `on_retry` | `Callable | None` | Callback `(attempt, exception, delay)` called before each retry. | None |
 
-**Adapter loading**: `_default_adapters()` tries to import `OpenAIAdapter`, `AnthropicAdapter`, and `GeminiAdapter` in that order. Adapters whose provider SDK is not installed are silently skipped.
+**`LLMClient.from_env(middleware=None, retry_policy=None)`** — recommended factory. Reads API keys from environment variables and registers only providers whose SDKs are installed.
 
 **Methods**:
 
-#### `detect_provider(model: str) -> ProviderAdapter`
+#### `complete(request)`
 
-Return the first adapter that claims the model string.
+```python
+async def complete(self, request: Request) -> Response
+```
 
-**Raises**: `ValueError` if no adapter claims the model.
+Sends a non-streaming completion request through middleware and retry policy.
 
-#### `complete(request: Request) -> Response` (async)
+- **Raises**: `ConfigurationError` if no adapter matches the model. `RuntimeError` if client is closed.
 
-Send a completion request, applying middleware and retries.
+#### `stream(request)`
 
-1. Detect provider via model name.
-2. Apply `before_request` middleware (in order).
-3. Call adapter with retry logic.
-4. Apply `after_response` middleware (in reverse order).
+```python
+async def stream(self, request: Request) -> AsyncIterator[StreamEvent]
+```
 
-#### `stream(request: Request) -> AsyncIterator[StreamEvent]` (async generator)
+Sends a streaming request. Applies `before_request` middleware and `wrap_stream` middleware. Does not apply `after_response`.
 
-Send a streaming request, applying `before_request` middleware only. Yields `StreamEvent` objects.
-
-#### `generate(prompt, model, tools=None, tool_executor=None, max_tool_rounds=10, **kwargs) -> Response` (async)
+#### `generate(prompt, model, ...)`
 
 ```python
 async def generate(
@@ -2232,45 +1541,91 @@ async def generate(
     tools: list[ToolDefinition] | None = None,
     tool_executor: ToolExecutor | None = None,
     max_tool_rounds: int = 10,
+    timeout: float | None = None,
+    abort_signal: asyncio.Event | None = None,
     **kwargs: Any,
-) -> Response
+) -> GenerateResult
 ```
 
 High-level API with automatic tool execution loop.
 
-- `prompt`: String (converted to a user message) or list of `Message` objects.
-- `tool_executor`: Async callable `(ToolCallContent) -> str`. All tool calls in a single round are executed concurrently via `asyncio.gather`.
-- `max_tool_rounds`: Maximum tool-use round trips. Default: `10`.
-- `**kwargs`: Additional `Request` fields (`temperature`, `max_tokens`, `system_prompt`, etc.).
+- All tool calls in a round execute concurrently via `asyncio.gather`.
+- Loops up to `max_tool_rounds` times.
+- `**kwargs` passed as `Request` fields (e.g. `temperature`, `max_tokens`, `system_prompt`).
+- **Raises**: `RequestTimeoutError` if a round exceeds `timeout`. `AbortError` if `abort_signal` is set.
 
-#### `stream_generate(prompt, model, tools=None, **kwargs) -> AsyncIterator[StreamEvent]` (async generator)
+#### `stream_generate(prompt, model, tools=None, **kwargs)`
 
-Streaming version of `generate`. Single round only — no tool loop.
+```python
+async def stream_generate(
+    self,
+    prompt: str | list[Message],
+    model: str,
+    tools: list[ToolDefinition] | None = None,
+    **kwargs: Any,
+) -> AsyncIterator[StreamEvent]
+```
 
-#### `generate_object(prompt, model, schema, schema_name="response", strict=True, **kwargs) -> dict[str, Any]` (async)
+Single-round streaming generation. No automatic tool execution loop.
 
-Generate a structured JSON object validated against a JSON Schema.
+#### `stream_generate_with_tools(prompt, model, tools=None, tool_executor=None, max_tool_rounds=10, **kwargs)`
 
-- `schema`: JSON Schema dict describing the expected output shape.
-- `schema_name`: Name for the schema (used by some providers). Default: `"response"`.
-- `strict`: Whether to enforce strict schema adherence. Default: `True`.
+Streaming generation with automatic tool loop. Emits `STEP_FINISH` events between rounds with usage and round metadata.
 
-**Returns**: Parsed JSON as a Python `dict`.
+#### `generate_object(prompt, model, schema, schema_name="response", strict=True, **kwargs)`
 
-**Raises**: `ValueError` if the model output cannot be parsed as valid JSON.
+```python
+async def generate_object(
+    self,
+    prompt: str | list[Message],
+    model: str,
+    schema: dict[str, Any],
+    schema_name: str = "response",
+    strict: bool = True,
+    **kwargs: Any,
+) -> GenerateResult
+```
+
+Generates a structured JSON object constrained by `schema`.
+
+- **Returns**: `GenerateResult` with `output` set to the parsed Python object and `text` to the raw JSON string.
+- **Raises**: `NoObjectGeneratedError` if the model output is not valid JSON.
+
+#### `stream_object(prompt, model, schema, ...)`
+
+Streams the LLM response, accumulates text, and yields the final parsed JSON dict once the stream completes.
+
+- **Yields**: The parsed JSON object as a Python `dict` (single yield).
+- **Raises**: `NoObjectGeneratedError` if accumulated output cannot be parsed as JSON.
+
+#### `close()`
+
+```python
+async def close(self) -> None
+```
+
+Releases resources. Idempotent. After closing, all operations raise `RuntimeError`.
+
+#### `detect_provider(model)`
+
+```python
+def detect_provider(self, model: str) -> Any
+```
+
+Returns the first adapter that claims the model string. Raises `ConfigurationError` if none found.
 
 ---
 
 ### `Request`
-
-**Module**: `attractor.llm.models`
 
 ```python
 @dataclass
 class Request:
     messages: list[Message] = field(default_factory=list)
     model: str = ""
+    provider: str | None = None
     tools: list[ToolDefinition] = field(default_factory=list)
+    tool_choice: ToolChoice | str | dict[str, Any] | None = None
     system_prompt: str = ""
     temperature: float | None = None
     max_tokens: int | None = None
@@ -2279,604 +1634,89 @@ class Request:
     reasoning_effort: ReasoningEffort | None = None
     response_format: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    provider_options: dict[str, Any] | None = None
 ```
-
-A request to an LLM provider.
 
 **Fields**:
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `messages` | `list[Message]` | `[]` | Conversation history. |
-| `model` | `str` | `""` | Model identifier (e.g. `"gpt-4o"`, `"claude-opus-4-6"`). |
-| `tools` | `list[ToolDefinition]` | `[]` | Tool definitions available to the model. |
-| `system_prompt` | `str` | `""` | System instructions. |
-| `temperature` | `float \| None` | `None` | Sampling temperature. |
-| `max_tokens` | `int \| None` | `None` | Maximum output tokens. Anthropic adapter defaults to `4096` if `None`. |
-| `top_p` | `float \| None` | `None` | Nucleus sampling probability. |
-| `stop_sequences` | `list[str]` | `[]` | Stop sequences. |
-| `reasoning_effort` | `ReasoningEffort \| None` | `None` | Model reasoning budget. |
-| `response_format` | `dict[str, Any] \| None` | `None` | Structured output format specification. |
-| `metadata` | `dict[str, Any]` | `{}` | Arbitrary metadata passed through middleware. |
+| Field | Type | Description |
+|-------|------|-------------|
+| `messages` | `list[Message]` | Conversation history. |
+| `model` | `str` | Model identifier for provider routing. |
+| `provider` | `str | None` | Explicit provider name override. Routes directly when set. |
+| `tools` | `list[ToolDefinition]` | Tool definitions available to the model. |
+| `tool_choice` | varies | Controls tool usage mode. See `ToolChoice`. |
+| `system_prompt` | `str` | System instruction text. |
+| `temperature` | `float | None` | Sampling temperature. |
+| `max_tokens` | `int | None` | Maximum output tokens. |
+| `top_p` | `float | None` | Nucleus sampling parameter. |
+| `stop_sequences` | `list[str]` | Stop generation on these sequences. |
+| `reasoning_effort` | `ReasoningEffort | None` | Reasoning budget level. |
+| `response_format` | `dict | None` | Structured output format specification. |
+| `metadata` | `dict[str, Any]` | Arbitrary request metadata. |
+| `provider_options` | `dict | None` | Provider-specific options. |
 
 ---
 
 ### `Response`
 
-**Module**: `attractor.llm.models`
-
 ```python
 @dataclass
 class Response:
-    message: Message = field(default_factory=lambda: Message(role=Role.ASSISTANT))
+    message: Message
     model: str = ""
-    finish_reason: FinishReason = FinishReason.STOP
-    usage: TokenUsage = field(default_factory=TokenUsage)
+    provider: str = ""
+    finish_reason: FinishReason
+    usage: TokenUsage
     provider_response_id: str = ""
     latency_ms: float = 0.0
+    raw: dict[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
+    rate_limit: RateLimitInfo | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
-A response from an LLM provider.
+**Properties**:
 
-**Fields**:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `message` | `Message` | empty assistant | The assistant message containing text and/or tool calls. |
-| `model` | `str` | `""` | Model identifier as returned by the provider. |
-| `finish_reason` | `FinishReason` | `STOP` | Why the model stopped generating. |
-| `usage` | `TokenUsage` | empty | Token consumption details. |
-| `provider_response_id` | `str` | `""` | Provider-assigned response identifier. |
-| `latency_ms` | `float` | `0.0` | Round-trip time in milliseconds. |
-| `metadata` | `dict[str, Any]` | `{}` | Provider-specific metadata. |
+| Property | Type | Description |
+|----------|------|-------------|
+| `text` | `str` | Concatenated text from all `TextContent` parts in the message. |
+| `tool_calls` | `list[ToolCallContent]` | Extracted tool calls from the response message. |
+| `reasoning` | `str | None` | Concatenated `ThinkingContent` text, or `None` if absent. |
 
 ---
 
 ### `Message`
 
-**Module**: `attractor.llm.models`
-
 ```python
 @dataclass
 class Message:
     role: Role
-    content: list[ContentPart] = field(default_factory=list)
+    content: list[ContentPart]
+    name: str | None = None
+    tool_call_id: str | None = None
 ```
-
-A single message in a conversation.
 
 **Static constructors**:
 
-| Method | Returns |
-|--------|---------|
-| `Message.system(text: str)` | `Message(role=SYSTEM, content=[TextContent(text=text)])` |
-| `Message.user(text: str)` | `Message(role=USER, content=[TextContent(text=text)])` |
-| `Message.assistant(text: str)` | `Message(role=ASSISTANT, content=[TextContent(text=text)])` |
-| `Message.tool_result(tool_call_id, content, is_error=False)` | `Message(role=TOOL, content=[ToolResultContent(...)])` |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `Message.system(text)` | `Message` | `SYSTEM` role, single `TextContent`. |
+| `Message.user(text)` | `Message` | `USER` role, single `TextContent`. |
+| `Message.assistant(text)` | `Message` | `ASSISTANT` role, single `TextContent`. |
+| `Message.tool_result(tool_call_id, content, is_error=False)` | `Message` | `TOOL` role, single `ToolResultContent`. |
 
-**Methods**:
+**Instance methods**:
 
-#### `text() -> str`
-
-Extract and concatenate text from all `TextContent` parts.
-
-#### `tool_calls() -> list[ToolCallContent]`
-
-Extract all `ToolCallContent` parts.
-
-#### `has_tool_calls() -> bool`
-
-Return `True` if any `ToolCallContent` part exists.
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `text()` | `str` | Concatenated text from all `TextContent` parts. |
+| `tool_calls()` | `list[ToolCallContent]` | All `ToolCallContent` parts. |
+| `has_tool_calls()` | `bool` | Whether any `ToolCallContent` parts are present. |
 
 ---
 
-### Content types
-
-All content types are dataclasses with a `kind: ContentKind` field set automatically.
-
-#### `TextContent`
-
-```python
-@dataclass
-class TextContent:
-    kind: ContentKind  # = ContentKind.TEXT
-    text: str = ""
-```
-
-#### `ImageContent`
-
-```python
-@dataclass
-class ImageContent:
-    kind: ContentKind  # = ContentKind.IMAGE
-    url: str | None = None
-    base64_data: str | None = None
-    media_type: str = "image/png"
-```
-
-#### `AudioContent`
-
-```python
-@dataclass
-class AudioContent:
-    kind: ContentKind  # = ContentKind.AUDIO
-    base64_data: str = ""
-    media_type: str = "audio/wav"
-```
-
-#### `DocumentContent`
-
-```python
-@dataclass
-class DocumentContent:
-    kind: ContentKind  # = ContentKind.DOCUMENT
-    base64_data: str = ""
-    media_type: str = "application/pdf"
-```
-
-#### `ToolCallContent`
-
-```python
-@dataclass
-class ToolCallContent:
-    kind: ContentKind  # = ContentKind.TOOL_CALL
-    tool_call_id: str  # default: "call_{12 hex chars}"
-    tool_name: str = ""
-    arguments: dict[str, Any] = field(default_factory=dict)
-    arguments_json: str = ""
-```
-
-#### `ToolResultContent`
-
-```python
-@dataclass
-class ToolResultContent:
-    kind: ContentKind  # = ContentKind.TOOL_RESULT
-    tool_call_id: str = ""
-    content: str = ""
-    is_error: bool = False
-```
-
-#### `ThinkingContent`
-
-```python
-@dataclass
-class ThinkingContent:
-    kind: ContentKind  # = ContentKind.THINKING
-    text: str = ""
-```
-
-Model reasoning/thinking content (extended thinking). Anthropic-specific.
-
-#### `RedactedThinkingContent`
-
-```python
-@dataclass
-class RedactedThinkingContent:
-    kind: ContentKind  # = ContentKind.REDACTED_THINKING
-    data: str = ""
-```
-
-Redacted model reasoning. Anthropic-specific.
-
-**`ContentPart` union type**:
-
-```python
-ContentPart = (
-    TextContent | ImageContent | AudioContent | DocumentContent
-    | ToolCallContent | ToolResultContent
-    | ThinkingContent | RedactedThinkingContent
-)
-```
-
----
-
-### `ToolDefinition`
-
-**Module**: `attractor.llm.models`
-
-```python
-@dataclass
-class ToolDefinition:
-    name: str
-    description: str
-    parameters: dict[str, Any] = field(default_factory=dict)
-    strict: bool = False
-```
-
-Definition of a tool that can be invoked by the model.
-
-**Fields**:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `name` | `str` | — | Tool name. Must match what the model is told to call. |
-| `description` | `str` | — | Human-readable description for the model. |
-| `parameters` | `dict[str, Any]` | `{}` | JSON Schema object describing tool parameters. |
-| `strict` | `bool` | `False` | Enforce strict schema adherence (used by OpenAI). |
-
-**Methods**:
-
-#### `to_json_schema() -> dict[str, Any]`
-
-Convert to JSON Schema format: `{"type": "object", "properties": ..., "required": [...]}`.
-
----
-
-### `ToolParameter`
-
-**Module**: `attractor.llm.models`
-
-```python
-@dataclass
-class ToolParameter:
-    name: str
-    type: str
-    description: str = ""
-    required: bool = False
-    enum: list[str] | None = None
-    default: Any = None
-```
-
-A single parameter in a tool's input schema. Utility dataclass — not used directly in API calls (parameters are passed as raw dicts in `ToolDefinition.parameters`).
-
----
-
-### `TokenUsage`
-
-**Module**: `attractor.llm.models`
-
-```python
-@dataclass
-class TokenUsage:
-    input_tokens: int = 0
-    output_tokens: int = 0
-    reasoning_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
-```
-
-Token consumption details.
-
-**Fields**:
-
-| Field | Description |
-|-------|-------------|
-| `input_tokens` | Tokens in the request (prompt). |
-| `output_tokens` | Tokens in the response. |
-| `reasoning_tokens` | Tokens used for extended thinking/reasoning (if applicable). |
-| `cache_read_tokens` | Tokens served from prompt cache. |
-| `cache_write_tokens` | Tokens written to prompt cache. |
-
-**Property**:
-
-#### `total_tokens -> int`
-
-`input_tokens + output_tokens`.
-
----
-
-### `RetryPolicy`
-
-**Module**: `attractor.llm.models`
-
-```python
-@dataclass
-class RetryPolicy:
-    max_retries: int = 2
-    base_delay_seconds: float = 1.0
-    multiplier: float = 2.0
-    max_delay_seconds: float = 60.0
-```
-
-Configuration for request retry behavior with exponential backoff.
-
-**Fields**:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_retries` | `int` | `2` | Maximum number of retry attempts after the initial failure. |
-| `base_delay_seconds` | `float` | `1.0` | Base delay before the first retry. |
-| `multiplier` | `float` | `2.0` | Backoff multiplier applied per attempt. |
-| `max_delay_seconds` | `float` | `60.0` | Cap on any single delay. |
-
-**Methods**:
-
-#### `delay_for_attempt(attempt: int) -> float`
-
-Return the delay in seconds for the given attempt number (0-indexed).
-
-Formula: `min(base_delay_seconds * (multiplier ** attempt), max_delay_seconds)`
-
-**Example delays** (defaults):
-
-| Attempt | Delay |
-|---------|-------|
-| 0 | 1.0 s |
-| 1 | 2.0 s |
-| 2 | 4.0 s |
-
----
-
-### `StreamEvent`
-
-**Module**: `attractor.llm.models`
-
-```python
-@dataclass
-class StreamEvent:
-    type: StreamEventType
-    text: str = ""
-    tool_call: ToolCallContent | None = None
-    finish_reason: FinishReason | None = None
-    usage: TokenUsage | None = None
-    error: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-```
-
-A single event in a streaming response.
-
-**Fields**:
-
-| Field | Type | Present for |
-|-------|------|-------------|
-| `type` | `StreamEventType` | All events |
-| `text` | `str` | `TEXT_DELTA`, `REASONING_DELTA`, `TOOL_CALL_DELTA` |
-| `tool_call` | `ToolCallContent \| None` | `TOOL_CALL_START`, `TOOL_CALL_DELTA`, `TOOL_CALL_END` |
-| `finish_reason` | `FinishReason \| None` | `FINISH` |
-| `usage` | `TokenUsage \| None` | `FINISH`, `STREAM_START` |
-| `error` | `str \| None` | `ERROR` |
-| `metadata` | `dict[str, Any]` | `FINISH` — contains `latency_ms` |
-
----
-
-### `StreamEventType`
-
-**Module**: `attractor.llm.models`
-
-```python
-class StreamEventType(str, enum.Enum):
-    STREAM_START = "stream_start"
-    TEXT_DELTA = "text_delta"
-    REASONING_DELTA = "reasoning_delta"
-    TOOL_CALL_START = "tool_call_start"
-    TOOL_CALL_DELTA = "tool_call_delta"
-    TOOL_CALL_END = "tool_call_end"
-    FINISH = "finish"
-    ERROR = "error"
-```
-
-| Value | Description |
-|-------|-------------|
-| `STREAM_START` | First event in a stream. May carry input token `usage`. |
-| `TEXT_DELTA` | Incremental text output chunk. |
-| `REASONING_DELTA` | Incremental reasoning/thinking chunk. |
-| `TOOL_CALL_START` | A tool call has begun. `tool_call` carries initial metadata. |
-| `TOOL_CALL_DELTA` | Incremental tool call argument chunk. `text` is partial JSON. |
-| `TOOL_CALL_END` | Tool call arguments complete. `tool_call` has fully parsed `arguments`. |
-| `FINISH` | Stream complete. Carries `finish_reason`, `usage`, `metadata.latency_ms`. |
-| `ERROR` | Stream error. Carries `error` string. |
-
----
-
-### `StreamCollector`
-
-**Module**: `attractor.llm.streaming`
-
-```python
-@dataclass
-class StreamCollector:
-    text_parts: list[str] = field(default_factory=list)
-    tool_calls: list[ToolCallContent] = field(default_factory=list)
-    finish_reason: FinishReason = FinishReason.STOP
-    usage: TokenUsage = field(default_factory=TokenUsage)
-    model: str = ""
-    metadata: dict = field(default_factory=dict)
-```
-
-Accumulates `StreamEvent`s into a complete `Response`.
-
-**Methods**:
-
-#### `process_event(event: StreamEvent) -> None`
-
-Process a single stream event, updating internal state.
-
-#### `to_response() -> Response`
-
-Assemble all accumulated events into a complete `Response`.
-
-#### `collect(stream) -> Response` (async)
-
-Consume an entire async stream and return the assembled `Response`.
-
-**Example**:
-
-```python
-collector = StreamCollector()
-async for event in client.stream(request):
-    collector.process_event(event)
-response = collector.to_response()
-```
-
----
-
-### `ProviderAdapter` protocol
-
-**Module**: `attractor.llm.adapters.base`
-
-```python
-@runtime_checkable
-class ProviderAdapter(Protocol):
-    def provider_name(self) -> str: ...
-    def detect_model(self, model: str) -> bool: ...
-    async def complete(self, request: Request) -> Response: ...
-    async def stream(self, request: Request) -> AsyncIterator[StreamEvent]: ...
-```
-
-Protocol that all provider adapters must satisfy.
-
-**Methods**:
-
-| Method | Description |
-|--------|-------------|
-| `provider_name()` | Return provider identifier string. |
-| `detect_model(model)` | Return `True` if this adapter handles the given model string. |
-| `complete(request)` | Send a non-streaming completion request. Returns `Response`. |
-| `stream(request)` | Send a streaming request. Yields `StreamEvent` objects. |
-
----
-
-### Provider adapters
-
-#### `AnthropicAdapter`
-
-**Module**: `attractor.llm.adapters.anthropic_adapter`
-
-```python
-class AnthropicAdapter:
-    def __init__(self, api_key: str | None = None) -> None: ...
-```
-
-Adapter for the Anthropic Messages API.
-
-- **Model detection**: `model.startswith("claude-")`
-- **API key**: `api_key` or `ANTHROPIC_API_KEY` environment variable.
-- **`max_tokens`**: Defaults to `4096` if not specified.
-- **Message alternation**: Inserts synthetic `"..."` placeholder messages to enforce strict user/assistant alternation required by the Anthropic API.
-- **Reasoning effort mapping**:
-
-| `ReasoningEffort` | Budget tokens |
-|-------------------|---------------|
-| `LOW` | 2,048 |
-| `MEDIUM` | 8,192 |
-| `HIGH` | 32,768 |
-
-- **Finish reason mapping**:
-
-| Anthropic `stop_reason` | `FinishReason` |
-|-------------------------|----------------|
-| `"end_turn"` | `STOP` |
-| `"tool_use"` | `TOOL_USE` |
-| `"max_tokens"` | `LENGTH` |
-| `"stop_sequence"` | `STOP` |
-
----
-
-#### `OpenAIAdapter`
-
-**Module**: `attractor.llm.adapters.openai_adapter`
-
-```python
-class OpenAIAdapter:
-    def __init__(self, api_key: str | None = None) -> None: ...
-```
-
-Adapter for the OpenAI Responses API (`client.responses.create()`).
-
-- **Model detection**: `model.startswith(("gpt-", "o1", "o3", "o4"))`
-- **API key**: `api_key` or `OPENAI_API_KEY` environment variable.
-- **Uses**: OpenAI Responses API (not `chat.completions`) — returns typed output items.
-- **`reasoning_effort`**: Maps to `{"reasoning": {"effort": value}}`.
-- **`response_format`**: Maps to `{"text": {"format": value}}`.
-- **`max_tokens`**: Maps to `max_output_tokens`.
-
----
-
-#### `GeminiAdapter`
-
-**Module**: `attractor.llm.adapters.gemini_adapter`
-
-```python
-class GeminiAdapter:
-    def __init__(self, api_key: str | None = None) -> None: ...
-```
-
-Adapter for the Google Gemini API (`google-genai`).
-
-- **Model detection**: `model.startswith("gemini-")`
-- **API key**: `api_key` or `GOOGLE_API_KEY` environment variable.
-- **System prompt handling**: Injected as a user/model exchange (`"[System Instructions]\n{prompt}"` → `"Understood."`), since Gemini does not have a first-class system role in the contents array.
-- **Tool call IDs**: Synthesized as `call_{12 hex chars}` (Gemini does not return IDs).
-- **`max_tokens`**: Maps to `max_output_tokens` in config.
-- **`reasoning_effort`**: Not mapped (Gemini does not support this parameter).
-
-**Finish reason mapping**:
-
-| Gemini finish reason | `FinishReason` |
-|----------------------|----------------|
-| `"STOP"` | `STOP` |
-| `"MAX_TOKENS"` | `LENGTH` |
-| `"SAFETY"` | `CONTENT_FILTER` |
-| `"RECITATION"` | `CONTENT_FILTER` |
-
----
-
-### `Middleware` protocol
-
-**Module**: `attractor.llm.middleware`
-
-```python
-@runtime_checkable
-class Middleware(Protocol):
-    async def before_request(self, request: Request) -> Request: ...
-    async def after_response(self, response: Response) -> Response: ...
-```
-
-Protocol for request/response middleware.
-
-**Pipeline behavior**:
-
-- `before_request` is called in registration order.
-- `after_response` is called in reverse registration order.
-
----
-
-### Built-in middleware
-
-#### `LoggingMiddleware`
-
-**Module**: `attractor.llm.middleware`
-
-```python
-class LoggingMiddleware:
-    def __init__(self, log_level: int = logging.INFO) -> None: ...
-```
-
-Logs request metadata (model, message count, tool count) and response latency/token usage at the specified log level.
-
-#### `TokenTrackingMiddleware`
-
-**Module**: `attractor.llm.middleware`
-
-```python
-@dataclass
-class TokenTrackingMiddleware:
-    total_usage: TokenUsage = field(default_factory=TokenUsage)
-```
-
-Accumulates token usage across all calls in `total_usage`.
-
-#### `RetryMiddleware`
-
-**Module**: `attractor.llm.middleware`
-
-```python
-class RetryMiddleware:
-    def __init__(self, policy: RetryPolicy | None = None) -> None: ...
-    last_attempt: int
-```
-
-Tracking middleware around retry behavior. Note: the actual retry loop is in `LLMClient` — this middleware provides timing/logging context.
-
----
-
-### Enums
-
-#### `Role`
-
-**Module**: `attractor.llm.models`
+### `Role`
 
 ```python
 class Role(str, enum.Enum):
@@ -2887,17 +1727,9 @@ class Role(str, enum.Enum):
     DEVELOPER = "developer"
 ```
 
-| Value | Description |
-|-------|-------------|
-| `SYSTEM` | System instructions (not included in Anthropic/Gemini message lists — extracted to `system` parameter). |
-| `USER` | Human turn. |
-| `ASSISTANT` | Model turn. |
-| `TOOL` | Tool result message. |
-| `DEVELOPER` | Developer-role message (OpenAI-specific). |
+---
 
-#### `ContentKind`
-
-**Module**: `attractor.llm.models`
+### `ContentKind`
 
 ```python
 class ContentKind(str, enum.Enum):
@@ -2911,32 +1743,97 @@ class ContentKind(str, enum.Enum):
     REDACTED_THINKING = "redacted_thinking"
 ```
 
-Discriminator for the `ContentPart` tagged union.
+---
 
-#### `FinishReason`
+### Content Part Types
 
-**Module**: `attractor.llm.models`
+| Class | `kind` | Key fields |
+|-------|--------|-----------|
+| `TextContent` | `TEXT` | `text: str` |
+| `ImageContent` | `IMAGE` | `url: str | None`, `base64_data: str | None`, `media_type: str`, `detail: str | None`. Requires at least one of `url` or `base64_data`. |
+| `AudioContent` | `AUDIO` | `base64_data: str`, `media_type: str` |
+| `DocumentContent` | `DOCUMENT` | `base64_data: str`, `media_type: str` |
+| `ToolCallContent` | `TOOL_CALL` | `tool_call_id: str`, `tool_name: str`, `arguments: dict`, `arguments_json: str`. `arguments` and `arguments_json` are kept in sync via `__post_init__`. |
+| `ToolResultContent` | `TOOL_RESULT` | `tool_call_id: str`, `content: str`, `is_error: bool` |
+| `ThinkingContent` | `THINKING` | `text: str`, `signature: str | None` (provider-specific opaque string for round-tripping) |
+| `RedactedThinkingContent` | `REDACTED_THINKING` | `data: str` |
+
+---
+
+### `ToolDefinition`
 
 ```python
-class FinishReason(str, enum.Enum):
-    STOP = "stop"
-    TOOL_USE = "tool_use"
-    LENGTH = "length"
-    CONTENT_FILTER = "content_filter"
-    ERROR = "error"
+@dataclass
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    strict: bool = False
 ```
 
-| Value | Description |
-|-------|-------------|
-| `STOP` | Natural completion (model chose to stop). |
-| `TOOL_USE` | Model returned tool calls. |
-| `LENGTH` | `max_tokens` reached. |
-| `CONTENT_FILTER` | Output blocked by safety filters. |
-| `ERROR` | Error during generation. |
+`parameters` is a JSON Schema object with `properties` and `required` keys.
 
-#### `ReasoningEffort`
+**`to_json_schema()`**: Returns `{"type": "object", "properties": ..., "required": ...}`.
 
-**Module**: `attractor.llm.models`
+---
+
+### `TokenUsage`
+
+```python
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+```
+
+**`total_tokens`** property: `input_tokens + output_tokens`.
+
+Supports `+` operator for aggregation: `total = step1.usage + step2.usage`.
+
+---
+
+### `RetryPolicy` (LLM layer)
+
+```python
+@dataclass
+class RetryPolicy:
+    max_retries: int = 2
+    base_delay_seconds: float = 1.0
+    multiplier: float = 2.0
+    max_delay_seconds: float = 60.0
+```
+
+Applied at the client level in `LLMClient._complete_with_retry`. Transparent to callers.
+
+**`delay_for_attempt(attempt)`**: Returns `base_delay * multiplier^attempt`, capped at `max_delay_seconds`. Jitter of 0.5x–1.5x applied to computed delays. Server-specified `retry_after` delays respected as-is (no jitter).
+
+**Raises** `ValueError` if:
+- `max_retries < 0`
+- `base_delay_seconds <= 0`
+- `multiplier <= 0`
+- `max_delay_seconds < base_delay_seconds`
+
+---
+
+### `FinishReason`
+
+```python
+@dataclass(frozen=True)
+class FinishReason:
+    reason: str  # "stop", "length", "tool_calls", "content_filter", "error", "other"
+    raw: str | None = None  # Provider-native reason string
+```
+
+Compares equal to both `FinishReason` instances and strings via `reason` field.
+
+**Class-level constants**: `FinishReason.STOP`, `FinishReason.TOOL_CALLS`, `FinishReason.TOOL_USE` (alias), `FinishReason.LENGTH`, `FinishReason.CONTENT_FILTER`, `FinishReason.ERROR`, `FinishReason.OTHER`.
+
+---
+
+### `ReasoningEffort`
 
 ```python
 class ReasoningEffort(str, enum.Enum):
@@ -2945,23 +1842,186 @@ class ReasoningEffort(str, enum.Enum):
     HIGH = "high"
 ```
 
-Model reasoning/thinking budget level.
-
-| Value | Anthropic budget tokens | OpenAI `reasoning.effort` |
-|-------|------------------------|--------------------------|
-| `LOW` | 2,048 | `"low"` |
-| `MEDIUM` | 8,192 | `"medium"` |
-| `HIGH` | 32,768 | `"high"` |
-
-#### `StreamEventType`
-
-See [StreamEventType](#streameventtype) above.
+Maps to provider-specific thinking budget parameters. Anthropic maps to extended thinking token budgets.
 
 ---
 
-### `ModelInfo`
+### `StreamEventType`
 
-**Module**: `attractor.llm.models`
+```python
+class StreamEventType(str, enum.Enum):
+    STREAM_START = "stream_start"
+    TEXT_START = "text_start"
+    TEXT_DELTA = "text_delta"
+    TEXT_END = "text_end"
+    THINKING_START = "thinking_start"   # also REASONING_START (alias)
+    REASONING_DELTA = "reasoning_delta"
+    THINKING_END = "thinking_end"       # also REASONING_END (alias)
+    TOOL_CALL_START = "tool_call_start"
+    TOOL_CALL_DELTA = "tool_call_delta"
+    TOOL_CALL_END = "tool_call_end"
+    PROVIDER_EVENT = "provider_event"
+    STEP_FINISH = "step_finish"
+    FINISH = "finish"
+    ERROR = "error"
+```
+
+---
+
+### `StreamEvent`
+
+```python
+@dataclass
+class StreamEvent:
+    type: StreamEventType
+    text: str = ""
+    delta: str | None = None
+    text_id: str | None = None
+    reasoning_delta: str | None = None
+    tool_call: ToolCallContent | None = None
+    finish_reason: FinishReason | None = None
+    usage: TokenUsage | None = None
+    error: str | None = None
+    raw: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+### `GenerateResult`
+
+```python
+@dataclass
+class GenerateResult:
+    text: str = ""
+    reasoning: str | None = None
+    tool_calls: list[ToolCallContent] = field(default_factory=list)
+    tool_results: list[ToolResultContent] = field(default_factory=list)
+    finish_reason: FinishReason
+    usage: TokenUsage           # Final step usage
+    total_usage: TokenUsage     # Aggregated across all steps
+    steps: list[StepResult] = field(default_factory=list)
+    response: Response | None = None
+    output: Any = None          # Parsed object from generate_object()
+```
+
+---
+
+### `ToolChoice`
+
+```python
+@dataclass
+class ToolChoice:
+    mode: str = "auto"  # "auto", "none", "required", "named"
+    tool_name: str | None = None
+```
+
+`tool_name` is required when `mode="named"`. Raises `ValueError` for invalid mode.
+
+---
+
+### `ResponseFormat`
+
+```python
+@dataclass
+class ResponseFormat:
+    type: str = "text"          # "text", "json", "json_schema"
+    json_schema: dict | None = None
+    strict: bool = False
+```
+
+`json_schema` is required when `type="json_schema"`. `to_dict()` returns provider-ready dict.
+
+---
+
+### `Middleware` (Protocol)
+
+```python
+@runtime_checkable
+class Middleware(Protocol):
+    async def before_request(self, request: Request) -> Request: ...
+    async def after_response(self, response: Response) -> Response: ...
+```
+
+**Pipeline order**: `before_request` applied in registration order; `after_response` applied in reverse registration order.
+
+**Optional `StreamingMiddleware` protocol**:
+
+```python
+def wrap_stream(
+    self, stream: AsyncIterator[StreamEvent]
+) -> AsyncIterator[StreamEvent]: ...
+```
+
+Presence checked via `hasattr`. Existing middleware not implementing it is unaffected.
+
+**Built-in middleware**:
+
+| Class | Constructor | Description |
+|-------|-------------|-------------|
+| `LoggingMiddleware` | `(log_level=INFO)` | Logs request metadata and response latency/token usage. |
+| `TokenTrackingMiddleware` | `()` | Accumulates total token usage. Access via `total_usage` property. |
+| `RetryMiddleware` | `(policy=None)` | Timing/logging wrapper for retries. Actual retry loop is in `LLMClient`. |
+
+---
+
+### `ProviderAdapter` (Protocol)
+
+```python
+@runtime_checkable
+class ProviderAdapter(Protocol):
+    def provider_name(self) -> str: ...
+    def detect_model(self, model: str) -> bool: ...
+    async def complete(self, request: Request) -> Response: ...
+    async def stream(self, request: Request) -> AsyncIterator[StreamEvent]: ...
+```
+
+**Model detection by adapter**:
+
+| Adapter | `provider_name()` | Detected model prefixes |
+|---------|------------------|------------------------|
+| `AnthropicAdapter` | `"anthropic"` | `claude-` |
+| `OpenAIAdapter` | `"openai"` | `gpt-`, `o3`, `o4-`, `codex-` |
+| `GeminiAdapter` | `"gemini"` | `gemini-` |
+
+**Adapter lazy-loading**: `LLMClient._default_adapters()` catches `ImportError` per provider and logs at DEBUG. Missing SDK = silently skipped.
+
+**Anthropic-specific behavior**:
+- Enforces strict user/assistant message alternation. Inserts synthetic placeholder messages when consecutive same-role messages are detected.
+- `reasoning_effort` maps to extended thinking budget token parameters.
+- Tool use returned as `tool_use` content blocks (not function call format).
+
+---
+
+### Model Catalog
+
+Source: `src/attractor/llm/catalog.py`
+
+**`get_model_info(model_id)`**
+
+```python
+def get_model_info(model_id: str) -> ModelInfo | None
+```
+
+Looks up a model by ID or alias. Returns `None` if unknown. The catalog is advisory — unknown model strings are still passed through to the provider.
+
+**`list_models(provider=None)`**
+
+```python
+def list_models(provider: str | None = None) -> list[ModelInfo]
+```
+
+Lists all known models, optionally filtered by provider (`"anthropic"`, `"openai"`, `"gemini"`).
+
+**`get_latest_model(provider, capability=None)`**
+
+```python
+def get_latest_model(provider: str, capability: str | None = None) -> ModelInfo | None
+```
+
+Returns the first (latest/best) model for a provider. Capability filter: `"reasoning"`, `"vision"`, `"tools"`.
+
+**`ModelInfo`**:
 
 ```python
 @dataclass
@@ -2977,14 +2037,360 @@ class ModelInfo:
     supports_reasoning: bool = False
     input_cost_per_million: float = 0.0
     output_cost_per_million: float = 0.0
+    aliases: list[str] = field(default_factory=list)
 ```
 
-Metadata about a specific model. Informational — not used by the LLM client routing logic.
+**Known models** (catalog as of February 2026):
+
+| Model ID | Provider | Context | Max Output | Vision | Reasoning |
+|----------|---------|---------|-----------|--------|-----------|
+| `claude-opus-4-6` | anthropic | 200K | 128K | Yes | Yes |
+| `claude-sonnet-4-6` | anthropic | 200K | 64K | Yes | Yes |
+| `claude-opus-4-5` | anthropic | 200K | 64K | Yes | Yes |
+| `claude-sonnet-4-5` | anthropic | 200K | 64K | Yes | Yes |
+| `claude-haiku-4-5` | anthropic | 200K | 64K | Yes | Yes |
+| `gpt-5.2` | openai | 400K | 128K | Yes | Yes |
+| `gpt-5.2-mini` | openai | 400K | 128K | Yes | Yes |
+| `gpt-5.2-codex` | openai | 400K | 128K | Yes | Yes |
+| `codex-mini-latest` | openai | 128K | 65K | No | Yes |
+| `gpt-4.1` | openai | 1M | 32K | Yes | No |
+| `o3` | openai | 200K | 100K | Yes | Yes |
+| `o4-mini` | openai | 200K | 100K | Yes | Yes |
+| `gemini-3-pro-preview` | gemini | 1M | 65K | Yes | Yes |
+| `gemini-3-flash-preview` | gemini | 1M | 65K | Yes | Yes |
+| `gemini-2.5-pro` | gemini | 1M | 65K | Yes | Yes |
+| `gemini-2.5-flash` | gemini | 1M | 65K | Yes | Yes |
+
+**Aliases** (resolved by `get_model_info`):
+
+| Alias | Resolves to |
+|-------|------------|
+| `opus` | `claude-opus-4-6` |
+| `claude-opus` | `claude-opus-4-6` |
+| `sonnet` | `claude-sonnet-4-6` |
+| `claude-sonnet` | `claude-sonnet-4-6` |
+| `haiku` | `claude-haiku-4-5` |
+| `claude-haiku` | `claude-haiku-4-5` |
+| `gpt5` | `gpt-5.2` |
+| `gpt-5` | `gpt-5.2` |
+| `gpt5-mini` | `gpt-5.2-mini` |
+| `gpt-codex` | `gpt-5.2-codex` |
+| `codex-mini` | `codex-mini-latest` |
+| `gpt4.1` | `gpt-4.1` |
+| `openai-o3` | `o3` |
+| `openai-o4-mini` | `o4-mini` |
+| `gemini-pro` | `gemini-3-pro-preview` |
+| `gemini-3-pro` | `gemini-3-pro-preview` |
+| `gemini-flash` | `gemini-3-flash-preview` |
+| `gemini-3-flash` | `gemini-3-flash-preview` |
 
 ---
 
-## Cross-References
+## 7. Tool Reference
 
-- New to Attractor? Start with the [Tutorial](../tutorials/getting-started.md)
-- For practical tasks, see [How-to Guides](../how-to/common-tasks.md)
-- To understand design decisions, read [Explanation](../explanation/architecture.md)
+All tools are dispatched through the agent's `ToolRegistry`. Each tool function receives `arguments: dict[str, Any]` and `environment: ExecutionEnvironment` and returns a `ToolResult`.
+
+**`ToolResult`**:
+```python
+@dataclass
+class ToolResult:
+    output: str           # Truncated output sent to the LLM
+    is_error: bool = False
+    full_output: str = "" # Complete untruncated output (in TOOL_CALL_END event)
+```
+
+---
+
+### `read_file`
+
+Read a file and return line-numbered content.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `path` | string | Yes | Absolute or relative path to the file. |
+| `offset` | integer | No | 1-based line number to start reading from. |
+| `limit` | integer | No | Maximum number of lines to read. |
+
+**Returns**: Line-numbered content in `cat -n` format: `     1\tline content\n`.
+
+**Error**: `"Error: file not found: {path}"` (`is_error=True`) when the file does not exist.
+
+**Truncation**: 50,000 chars (Stage 1, `head_tail` mode). No Stage 2 line limit.
+
+---
+
+### `write_file`
+
+Create or overwrite a file with given content.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `path` | string | Yes | Absolute or relative path for the file. |
+| `content` | string | Yes | The full content to write. |
+
+**Returns**: `"Successfully wrote to {path}"`.
+
+**Behavior**: Creates parent directories as needed.
+
+**Truncation**: 1,000 chars (Stage 1, `tail` mode).
+
+---
+
+### `edit_file`
+
+Search-and-replace edit within a file.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `path` | string | Yes | Path to the file to edit. |
+| `old_string` | string | Yes | Exact text to find. Must be unique unless `replace_all=true`. |
+| `new_string` | string | Yes | Replacement text. |
+| `replace_all` | boolean | No | Replace all occurrences. Default: `false`. |
+
+**Returns**: `"Successfully edited {path}"` or `"Successfully edited {path} ({n} replacements)"`.
+
+**Errors** (`is_error=True`):
+- `"Error: file not found: {path}"`
+- `"Error: old_string not found in {path}"`
+- `"Error: old_string found {n} times in {path}. Provide more context to make it unique."` (when `replace_all=false` and count > 1)
+
+**Truncation**: 10,000 chars (Stage 1, `tail` mode).
+
+---
+
+### `shell`
+
+Execute a shell command and return stdout, stderr, and exit status.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `command` | string | Yes | The shell command to execute. |
+| `timeout_ms` | integer | No | Timeout in milliseconds. Default: 10,000. |
+
+**Returns**: Combined output. Includes `STDERR:\n{stderr}` section when stderr is non-empty. Appends `[Command timed out after {timeout_ms}ms]` on timeout.
+
+**`is_error`**: `True` when exit code is non-zero or command timed out.
+
+**Truncation**: 30,000 chars (Stage 1, `head_tail` mode); 256 lines (Stage 2).
+
+---
+
+### `grep`
+
+Regex search across files.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `pattern` | string | Yes | Regular expression pattern to search for. |
+| `path` | string | No | File or directory to search in. Default: working directory. |
+| `include` | string | No | Glob pattern to filter files (e.g. `"*.py"`). |
+| `max_results` | integer | No | Maximum number of matches. Default: 100. |
+
+**Returns**: Newline-separated `{relative_path}:{line_num}: {line}` entries, or `"No matches found."`.
+
+**Truncation**: 20,000 chars (Stage 1, `tail` mode); 200 lines (Stage 2).
+
+---
+
+### `glob`
+
+Find files matching a glob pattern, sorted by modification time (newest first).
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `pattern` | string | Yes | Glob pattern (e.g. `"**/*.py"`). |
+| `path` | string | No | Base directory for the search. Default: working directory. |
+
+**Returns**: Newline-separated absolute file paths, or `"No files matched."`.
+
+**Truncation**: 20,000 chars (Stage 1, `tail` mode); 500 lines (Stage 2).
+
+---
+
+### `list_dir`
+
+List directory contents with file sizes.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `path` | string | Yes | Directory path to list. |
+| `depth` | integer | No | How many levels deep to list. Default: 1. |
+
+**Returns**: Indented listing with `/` suffix for directories and `({n} bytes)` for files, or `"{path}: (empty directory)"`.
+
+**Availability**: Included in the Gemini provider profile. May not be registered in Anthropic or OpenAI profiles.
+
+**Truncation**: 20,000 chars (Stage 1, `tail` mode); 500 lines (Stage 2).
+
+---
+
+### `apply_patch`
+
+Apply a unified diff patch to the filesystem.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `patch` | string | Yes | Unified diff patch content. |
+
+**Returns**: Success or error message.
+
+**Note**: Implemented as a standalone tool in `tools/apply_patch.py`. Not an `ExecutionEnvironment` method.
+
+**Truncation**: 10,000 chars (Stage 1, `tail` mode).
+
+---
+
+### `spawn_agent`
+
+Spawn a subagent to work on a delegated task.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `task` | string | Yes | Description of the task for the subagent. |
+| `working_dir` | string | No | Working directory for the subagent. |
+| `model` | string | No | Model override for the subagent. |
+| `max_turns` | integer | No | Maximum turns for the subagent. |
+
+**Returns**: `"Subagent '{agent_id}' spawned for task: {task}\nUse wait(agent_id='{agent_id}') to get results."`
+
+**Behavior**: Creates a child `Session` that shares the parent's environment and configuration. Runs asynchronously in a background `asyncio.Task`. Subagent state stored per-session on `environment.subagents` (not module-level globals).
+
+**Depth limit**: Capped by `SessionConfig.max_subagent_depth`. At the depth limit, the session factory is not installed and `spawn_agent` returns a stub handle.
+
+**Truncation**: 20,000 chars (Stage 1, `head_tail` mode).
+
+---
+
+### `send_input`
+
+Send a follow-up message to a running subagent.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `agent_id` | string | Yes | The subagent ID returned by `spawn_agent`. |
+| `message` | string | Yes | The message to send. |
+
+**Returns**: Confirmation or error message.
+
+**Behavior**: Calls `session.follow_up(message)` on the child session when a real session is available.
+
+**Errors** (`is_error=True`): Agent ID not found; agent is closed.
+
+---
+
+### `wait`
+
+Wait for a subagent to complete and return its result.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `agent_id` | string | Yes | The subagent ID to wait on. |
+
+**Returns**: The subagent's collected `ASSISTANT_TEXT_END` text output joined by newlines.
+
+**Errors** (`is_error=True`): Agent ID not found; task cancelled; task raised an exception.
+
+---
+
+### `close_agent`
+
+Close a subagent and free its resources.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `agent_id` | string | Yes | The subagent ID to close. |
+
+**Returns**: `"Subagent '{agent_id}' closed"`.
+
+**Behavior**: Calls `session.shutdown()` on the child session. Cancels the background task. Removes the handle from the registry.
+
+**Errors** (`is_error=True`): Agent ID not found.
+
+---
+
+## 8. Configuration Reference
+
+### Environment Variables
+
+API keys are loaded from the environment or from a `.env` file (via `python-dotenv`, loaded at CLI startup).
+
+| Variable | Provider | Required for |
+|----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | Anthropic | Claude models (`claude-*`) |
+| `OPENAI_API_KEY` | OpenAI | GPT/o-series models (`gpt-*`, `o3`, `o4-*`, `codex-*`) |
+| `GOOGLE_API_KEY` | Google | Gemini models (`gemini-*`) |
+| `GEMINI_API_KEY` | Google | Alternative to `GOOGLE_API_KEY` |
+
+### Provider Default Timeouts
+
+Shell command timeout defaults by provider profile:
+
+| Provider profile | `default_timeout_ms` |
+|-----------------|---------------------|
+| `AnthropicProfile` | 120,000 (120 seconds) |
+| `OpenAIProfile` | 10,000 (10 seconds) |
+| `GeminiProfile` | 10,000 (10 seconds) |
+
+`SessionConfig.default_command_timeout_ms = None` (default) means use the profile default.
+
+`SessionConfig.max_command_timeout_ms` (default 600,000ms / 10 minutes) is the hard ceiling enforced regardless of what the model requests.
+
+### Checkpoint File Naming
+
+Format: `checkpoint_{timestamp_ms}.json`
+
+`timestamp_ms` is the UNIX timestamp in milliseconds at checkpoint creation. Files are sorted newest-first lexicographically (timestamp ordering preserved by zero-padding).
+
+Default checkpoint directory: `.attractor/checkpoints`
+
+### Run Directory Layout
+
+When `logs_root` is set on `PipelineEngine`:
+
+```
+{logs_root}/
+  manifest.json           # Pipeline metadata (name, goal, start time, node list)
+  {node_name}/
+    prompt.md             # Interpolated prompt sent to LLM (CodergenHandler nodes)
+    response.md           # Raw LLM response text (CodergenHandler nodes)
+    status.json           # Execution outcome (all handlers)
+```
+
+**`status.json`** format:
+```json
+{
+  "outcome": "success",
+  "preferred_next_label": "",
+  "suggested_next_ids": [],
+  "context_updates": {},
+  "notes": ""
+}
+```
+
+---
+
+*See also*: `docs/tutorials/` for getting-started guides. `docs/how-to/` for task-oriented guides. `docs/explanation/` for architecture and design rationale.

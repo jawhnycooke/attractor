@@ -7,88 +7,107 @@
 
 ## Table of Contents
 
-1. [How to Create a Pipeline](#1-how-to-create-a-pipeline)
-2. [How to Use Conditional Branching](#2-how-to-use-conditional-branching)
-3. [How to Add a Custom Node Handler](#3-how-to-add-a-custom-node-handler)
-4. [How to Add a New LLM Provider](#4-how-to-add-a-new-llm-provider)
-5. [How to Add a New Tool to the Agent](#5-how-to-add-a-new-tool-to-the-agent)
-6. [How to Use Model Stylesheets](#6-how-to-use-model-stylesheets)
-7. [How to Resume a Failed Pipeline](#7-how-to-resume-a-failed-pipeline)
-8. [How to Use Goal Gates](#8-how-to-use-goal-gates)
-9. [How to Configure Middleware](#9-how-to-configure-middleware)
-10. [How to Use the Agent Programmatically](#10-how-to-use-the-agent-programmatically)
-11. [How to Use Structured Output](#11-how-to-use-structured-output)
-12. [How to Manage Subagents](#12-how-to-manage-subagents)
+### Pipeline Authoring
+1. [How to Create a Basic Pipeline](#1-how-to-create-a-basic-pipeline)
+2. [How to Add Conditional Branching](#2-how-to-add-conditional-branching)
+3. [How to Use Prompt Interpolation](#3-how-to-use-prompt-interpolation)
+4. [How to Configure Node Attributes](#4-how-to-configure-node-attributes)
+5. [How to Add a Model Stylesheet](#5-how-to-add-a-model-stylesheet)
+
+### Pipeline Execution
+6. [How to Validate a Pipeline](#6-how-to-validate-a-pipeline)
+7. [How to Run a Pipeline](#7-how-to-run-a-pipeline)
+8. [How to Resume from a Checkpoint](#8-how-to-resume-from-a-checkpoint)
+9. [How to Use Goal Gates](#9-how-to-use-goal-gates)
+
+### Agent Configuration
+10. [How to Switch LLM Providers](#10-how-to-switch-llm-providers)
+11. [How to Configure Shell Timeouts](#11-how-to-configure-shell-timeouts)
+12. [How to Use the Agent Tools](#12-how-to-use-the-agent-tools)
+
+### Extension
+13. [How to Add a Custom Node Handler](#13-how-to-add-a-custom-node-handler)
+14. [How to Add a New LLM Provider Adapter](#14-how-to-add-a-new-llm-provider-adapter)
+15. [How to Add Middleware](#15-how-to-add-middleware)
+
+### Troubleshooting
+16. [How to Debug Edge Routing](#16-how-to-debug-edge-routing)
+17. [How to Handle Common Errors](#17-how-to-handle-common-errors)
 
 ---
 
-## 1. How to Create a Pipeline
+## 1. How to Create a Basic Pipeline
 
 > **Goal**: Define a working pipeline as a GraphViz DOT file and run it.
+> **Use case**: Automating a multi-step coding task (implement, test, review) against a codebase.
 > **Time required**: 5 minutes
 
 ### Prerequisites
 
-- Attractor installed (`pip install -e .` or via the install script)
+- Attractor installed (`bash .claude/scripts/install.sh` or `pip install -e .`)
 - At least one provider API key set (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`)
+- Basic familiarity with GraphViz DOT syntax
+
+### Problem Context
+
+You want to encode a repeatable coding workflow — for example, implement a fix, run tests, and review the result — without manually orchestrating each step. Attractor executes this workflow as a DAG of LLM-driven nodes.
+
+### Solution Overview
+
+We'll solve this by writing a DOT file that describes the graph, then running it with the CLI:
+1. Write the DOT file with start node, work nodes, and terminal node
+2. Validate the DOT file
+3. Run the pipeline
 
 ### Step 1: Write the DOT file
 
-A pipeline is a directed graph (`digraph`). Each node maps to a handler via the `handler` attribute. The `start=true` attribute or a node named `"start"` marks the entry point. Nodes with no outgoing edges, or marked `terminal=true`, end execution.
+A pipeline is a directed graph (`digraph`). Mark the entry point with `shape=Mdiamond` or name a node `"start"`. Mark the exit with `shape=Msquare`, name a node `"exit"` or `"end"`, or leave a node with no outgoing edges. Assign handler types using the `type` attribute.
 
 ```dot
 digraph fix_bug {
-    # Entry node — the agent reads the codebase and patches the bug
-    start [
-        handler="codergen"
+    start [shape=Mdiamond]
+
+    implement [
+        type="codergen"
         prompt="Read src/auth.py and fix the token expiry bug. Write tests."
         model="claude-opus-4-6"
     ]
 
-    # Quality gate — runs the test suite
     test [
-        handler="tool"
-        command="pytest tests/ -q"
+        type="codergen"
+        prompt="Run the test suite with: pytest tests/ -q. Report pass or fail."
     ]
 
-    # Human sign-off before merging
-    approve [
-        handler="human_gate"
-        prompt="Tests passed. Approve this change for merge?"
-    ]
+    done [shape=Msquare]
 
-    # Terminal — no outgoing edges, so implicitly terminal
-    done []
-
-    start -> test
-    test  -> approve [condition="exit_code == 0"]
-    test  -> start   [condition="exit_code != 0" priority=1]
-    approve -> done  [condition="approved == true"]
-    approve -> start [condition="approved == false" priority=1]
+    start -> implement
+    implement -> test
+    test -> done
 }
 ```
 
-**Node attributes** (all optional unless noted):
+**Node attributes reference**:
 
-| Attribute      | Purpose                                             | Default     |
-|----------------|-----------------------------------------------------|-------------|
-| `handler`      | Handler type dispatched by the engine               | `codergen`  |
-| `prompt`       | Prompt string; `{key}` interpolates context values  | `""`        |
-| `model`        | Model override for this node                        | stylesheet  |
-| `temperature`  | Temperature override                                | stylesheet  |
-| `max_tokens`   | Max tokens override                                 | stylesheet  |
-| `command`      | Shell command (required for `tool` handler)         |             |
-| `timeout`      | Timeout in seconds for `tool` handler               | `300`       |
-| `start`        | `true` to designate the start node                  | `false`     |
-| `terminal`     | `true` to force terminal status                     | `false`     |
+| Attribute     | Purpose                                              | Default    |
+|---------------|------------------------------------------------------|------------|
+| `type`        | Handler type dispatched by the engine                | `codergen` |
+| `shape`       | `Mdiamond` = start node, `Msquare` = terminal node   |            |
+| `prompt`      | Prompt string; `{key}` interpolates context values   | `""`       |
+| `model`       | Model override for this node                         | stylesheet |
+| `temperature` | Temperature override                                 | stylesheet |
+| `max_tokens`  | Max token limit override                             | stylesheet |
+| `max_retries` | Number of retry attempts on handler failure          | `0`        |
+| `timeout`     | Timeout in seconds for execution                     | provider   |
 
-**Edge attributes**:
+**Edge attributes reference**:
 
-| Attribute   | Purpose                                              | Default |
-|-------------|------------------------------------------------------|---------|
-| `condition` | Boolean expression evaluated against context         | none    |
-| `priority`  | Lower value = evaluated first among outgoing edges   | `0`     |
-| `label`     | Human-readable label for visualization               | `""`    |
+| Attribute   | Purpose                                                      | Default |
+|-------------|--------------------------------------------------------------|---------|
+| `condition` | Boolean expression evaluated against `PipelineContext`       | none    |
+| `weight`    | Higher value = higher priority when evaluating edges         | `0`     |
+| `label`     | Human-readable label for visualization                       | `""`    |
+
+**Expected result**: A valid DOT file that Attractor can parse and execute.
 
 ### Step 2: Validate the pipeline
 
@@ -96,11 +115,7 @@ digraph fix_bug {
 attractor validate fix_bug.dot
 ```
 
-Use `--strict` to promote warnings (unreachable nodes, non-supervisor cycles) to errors:
-
-```bash
-attractor validate fix_bug.dot --strict
-```
+**Verify it worked**: No errors printed to stdout. Exit code is 0.
 
 ### Step 3: Run the pipeline
 
@@ -108,91 +123,112 @@ attractor validate fix_bug.dot --strict
 attractor run fix_bug.dot --verbose
 ```
 
-Override the default model for all `codergen` nodes from the CLI:
-
-```bash
-attractor run fix_bug.dot --model gpt-4o
-```
-
-**Expected result**: The engine walks the graph, prints each node name as it executes, and prints a final context table.
+**Success criteria**: The engine prints each node name as it executes and prints a final context table when complete.
 
 ### Troubleshooting
 
 **Problem**: `No start node found`
-**Solution**: Add `start=true` to one node attribute, or name a node `"start"`.
+**Symptoms**: Validation or run fails immediately with this message.
+**Cause**: Neither `shape=Mdiamond` nor a node named `"start"` (case-insensitive) exists.
+**Solution**: Add `shape=Mdiamond` to your entry node, or name it `start`.
 
-**Problem**: `Unknown handler type 'my_type'`
-**Solution**: Either use one of the built-in types (`codergen`, `tool`, `human_gate`, `conditional`, `parallel`, `supervisor`) or register a custom handler before running — see [section 3](#3-how-to-add-a-custom-node-handler).
+**Problem**: `Unknown handler type 'codergen'` or similar
+**Symptoms**: Validation or run fails with an unknown handler error.
+**Cause**: The `type` attribute uses a value not registered in the `HandlerRegistry`.
+**Solution**: Use `type="codergen"` for LLM-driven coding nodes. Register custom types before running — see [section 13](#13-how-to-add-a-custom-node-handler).
 
-**Problem**: `No provider adapter found for model '...'`
-**Solution**: Ensure the correct API key environment variable is set and the provider SDK is installed.
+**Problem**: The `handler` attribute is silently ignored
+**Symptoms**: Nodes execute with the wrong handler or fall back to the default.
+**Cause**: The correct DOT attribute is `type`, not `handler`. The parser maps `type` to the internal `handler_type` field.
+**Solution**: Replace `handler="codergen"` with `type="codergen"` in your DOT file.
 
 ---
 
-## 2. How to Use Conditional Branching
+## 2. How to Add Conditional Branching
 
 > **Goal**: Route pipeline execution differently depending on context values set by previous nodes.
+> **Use case**: Retry a failing step, branch by classification result, or short-circuit to an error handler.
 > **Time required**: 10 minutes
+
+### Prerequisites
+
+- A working basic pipeline (see [section 1](#1-how-to-create-a-basic-pipeline))
+- Understanding that handlers write results to `PipelineContext` via `NodeResult.context_updates`
+
+### Problem Context
+
+After a node runs, the engine needs to decide which node comes next. Conditional edges let you express branching logic in the DOT file itself, without writing a custom handler.
 
 ### How edge conditions work
 
-After each node completes, the engine evaluates outgoing edges in `priority` order (lowest first). The first edge whose `condition` evaluates to `true` determines the next node. An edge with no `condition` acts as the unconditional fallback and is always tried last.
+After each node completes, the engine evaluates outgoing edges sorted by `weight` descending (higher weight = evaluated first). The first edge whose `condition` evaluates to `true` determines the next node. An edge with no `condition` acts as an unconditional fallback and matches last. If no edge matches on a non-terminal node, execution fails.
 
-Conditions are evaluated with a safe AST-based evaluator — no `eval` or `exec`. Bare names resolve to values in `PipelineContext`.
+Conditions are evaluated by a custom tokenizer/parser — no `eval` or `exec`. Variables resolve by bare name from `PipelineContext`.
 
-**Supported syntax**:
+**Supported operators**:
 
-```
-exit_code == 0
-approved != false
-retries < 3
-exit_code != 0 and retries < 5
-quality_score >= 8 or approved == true
-not tests_failed
-result.status == "ok"          # dotted key lookup
-```
+| Operator | Meaning       | Example                               |
+|----------|---------------|---------------------------------------|
+| `=`      | Equality      | `tests_passed = true`                 |
+| `!=`     | Inequality    | `review_result != approved`           |
+| `&&`     | Logical AND   | `tests_passed = true && score != low` |
 
-**Boolean literals**: `true`, `false`, `null`, `none` (case-insensitive in conditions).
+**Unsupported** (will cause a parse error): `==`, `<`, `>`, `<=`, `>=`, `and`, `or`, `not`.
 
-### Pattern: retry loop with a counter
+**Boolean literals**: `true` and `false` (bare, unquoted).
+
+**String literals**: Use double quotes — `severity = "high"`.
+
+### Step 1: Write a retry loop
 
 ```dot
 digraph retry_example {
-    start [handler="codergen" prompt="Implement the feature." start=true]
+    start [shape=Mdiamond]
 
-    check [
-        handler="tool"
-        command="pytest tests/ -q && echo 'OK'"
+    implement [
+        type="codergen"
+        prompt="Fix the failing test in src/auth.py."
     ]
 
-    done [terminal=true]
+    verify [
+        type="codergen"
+        prompt="Run pytest tests/test_auth.py -q. Set context key 'tests_passed' to true if all pass, false otherwise."
+    ]
 
-    start -> check
-    # Exit when tests pass
-    check -> done  [condition="exit_code == 0" priority=0]
-    # Retry up to the engine's max_steps limit
-    check -> start [condition="exit_code != 0" priority=1]
+    done [shape=Msquare]
+
+    start -> implement
+    implement -> verify
+
+    # Higher weight = evaluated first
+    verify -> done     [condition="tests_passed = true"  weight=2]
+    verify -> implement [condition="tests_passed = false" weight=1]
 }
 ```
 
-### Pattern: multi-branch routing
+**Expected result**: The pipeline loops through implement and verify until tests pass, then exits.
 
-Nodes can write arbitrary keys to context via `context_updates` in their `NodeResult`. Use those keys in subsequent edge conditions.
+### Step 2: Write a multi-branch routing pattern
 
 ```dot
 digraph classify {
-    start [handler="codergen"
-           prompt="Classify the bug severity. Set context key 'severity' to 'low', 'medium', or 'high'."
-           start=true]
+    start [shape=Mdiamond]
 
-    low_fix    [handler="codergen" prompt="Apply a quick patch for low severity."]
-    medium_fix [handler="codergen" prompt="File a ticket and apply a workaround."]
-    high_fix   [handler="codergen" prompt="Page the on-call team and hotfix immediately."]
-    done       [terminal=true]
+    classify [
+        type="codergen"
+        prompt="Classify the bug severity. Set context key 'severity' to 'low', 'medium', or 'high'."
+    ]
 
-    start -> low_fix    [condition="severity == \"low\""    priority=0]
-    start -> medium_fix [condition="severity == \"medium\"" priority=1]
-    start -> high_fix   [condition="severity == \"high\""   priority=2]
+    low_fix    [type="codergen" prompt="Apply a quick patch for a low-severity bug."]
+    medium_fix [type="codergen" prompt="Document and apply a workaround for a medium-severity bug."]
+    high_fix   [type="codergen" prompt="Escalate and hotfix the high-severity bug immediately."]
+    done       [shape=Msquare]
+
+    start -> classify
+
+    classify -> high_fix   [condition="severity = \"high\""   weight=3]
+    classify -> medium_fix [condition="severity = \"medium\"" weight=2]
+    classify -> low_fix    [condition="severity = \"low\""    weight=1]
 
     low_fix    -> done
     medium_fix -> done
@@ -200,34 +236,877 @@ digraph classify {
 }
 ```
 
-### Pattern: using internal context keys
+### Step 3: React to engine-internal context keys
 
-The engine sets internal keys automatically. Use them in conditions to react to failures:
+The engine writes these internal keys automatically. Use them in conditions to detect failures:
 
-| Key               | Set when                                       |
-|-------------------|------------------------------------------------|
-| `_last_error`     | The most recent handler returned `success=False` |
-| `_failed_node`    | Name of the node whose handler failed          |
-| `_completed_nodes`| List of all completed node names (at pipeline end) |
+| Key                | Set when                                             |
+|--------------------|------------------------------------------------------|
+| `_last_error`      | Most recent handler returned `success=False`         |
+| `_failed_node`     | Name of the node whose handler failed                |
+| `_completed_nodes` | List of all completed node names (at pipeline end)   |
+| `_goal_gate_unmet` | Set when the GoalGate conditions were not satisfied  |
 
 ```dot
-error_handler -> retry [condition="_last_error != null" priority=0]
+# Route to an error handler if the previous node failed
+some_node -> error_handler [condition="_last_error != false" weight=2]
+some_node -> next_step                                        [weight=1]
 ```
 
 ### Troubleshooting
 
-**Problem**: `Invalid condition syntax`
-**Solution**: Run `attractor validate pipeline.dot` — the validator reports the exact edge and syntax error. Conditions use `==` not `=`, and string literals require double quotes.
+**Problem**: `Invalid condition syntax` or parse error on an edge condition
+**Symptoms**: Validation fails and reports the specific edge.
+**Cause**: Using `==` instead of `=`, using `and`/`or` instead of `&&`, or using comparison operators like `<` or `>`.
+**Solution**: Replace `==` with `=`. Replace `and` with `&&`. Remove `<`/`>` — restructure the pipeline so nodes set categorical context values that can be compared with `=` or `!=`.
 
-**Problem**: Edge condition never matches, pipeline halts at non-terminal node
-**Solution**: Add an unconditional fallback edge (no `condition` attribute) to catch unmatched cases.
+**Problem**: Pipeline halts with "no matching edge" on a non-terminal node
+**Symptoms**: Runtime error after a node completes.
+**Cause**: None of the outgoing edges matched the current context state.
+**Solution**: Add an unconditional fallback edge (no `condition` attribute) as the lowest-weight option to catch all unmatched cases.
+
+```dot
+# Fallback catches everything that doesn't match higher-weight edges
+some_node -> fallback_handler [weight=0]
+```
 
 ---
 
-## 3. How to Add a Custom Node Handler
+## 3. How to Use Prompt Interpolation
 
-> **Goal**: Register a new handler type so it can be used in DOT files via `handler="my_type"`.
+> **Goal**: Inject context values from previous nodes into a node's prompt at execution time.
+> **Use case**: Passing a file path, error message, or classification result from one node to the next.
+> **Time required**: 5 minutes
+
+### Prerequisites
+
+- A working pipeline where upstream nodes set context values via `NodeResult.context_updates`
+
+### Problem Context
+
+You want node prompts to be dynamic — for example, telling a review node which file was changed by the implement node, without hardcoding filenames in the DOT file.
+
+### Step 1: Have an upstream node set a context value
+
+When a `codergen` node's agent completes, it can set context values. In your prompt, instruct the agent to set a specific key:
+
+```dot
+implement [
+    type="codergen"
+    prompt="Fix the auth bug in src/auth.py. When done, set context key 'changed_file' to 'src/auth.py'."
+]
+```
+
+### Step 2: Reference the context value in a downstream prompt
+
+Use `{key}` syntax in any node's `prompt` attribute. The engine substitutes the value before the handler executes:
+
+```dot
+review [
+    type="codergen"
+    prompt="Review the changes made to {changed_file}. Check for security issues and style violations."
+]
+```
+
+### Step 3: Use multiple interpolations
+
+```dot
+digraph interpolation_example {
+    start [shape=Mdiamond]
+
+    analyze [
+        type="codergen"
+        prompt="Analyze the codebase. Set context keys: 'target_file' (the file most needing refactor) and 'issue_count' (number of issues found)."
+    ]
+
+    refactor [
+        type="codergen"
+        prompt="Refactor {target_file}. There are {issue_count} known issues. Fix all of them."
+    ]
+
+    done [shape=Msquare]
+
+    start -> analyze
+    analyze -> refactor
+    refactor -> done
+}
+```
+
+**Expected result**: The `refactor` node receives a prompt with the actual file path and issue count substituted in.
+
+### Troubleshooting
+
+**Problem**: `{key}` appears literally in the prompt instead of being substituted
+**Symptoms**: The agent receives `{target_file}` as the string, not the resolved value.
+**Cause**: The upstream node did not set the context key, or the key name is misspelled.
+**Solution**: Add `--verbose` to the `attractor run` command and inspect the printed context table after each node. Verify the upstream node's context_updates contain the expected key.
+
+**Problem**: Prompt interpolation uses a stale value from a previous run on resume
+**Symptoms**: After resuming from a checkpoint, `{key}` resolves to an old value.
+**Cause**: Checkpoint files preserve the full `PipelineContext`, including all previously set values.
+**Solution**: This is expected behavior — the checkpoint restores the full state. If you need a fresh value, restructure the pipeline so the upstream node runs again before the interpolating node.
+
+---
+
+## 4. How to Configure Node Attributes
+
+> **Goal**: Set model, temperature, token limits, retry counts, and timeouts on individual nodes.
+> **Use case**: Using a fast cheap model for analysis nodes and a powerful model for implementation nodes.
+> **Time required**: 5 minutes
+
+### Prerequisites
+
+- A working pipeline (see [section 1](#1-how-to-create-a-basic-pipeline))
+
+### Problem Context
+
+Different nodes in a pipeline have different requirements. An analysis node might need a large context window but low temperature. An implementation node might need high token limits. You can configure these per-node in the DOT file.
+
+### Step 1: Set model and generation parameters
+
+```dot
+digraph multi_model {
+    start [shape=Mdiamond]
+
+    analyze [
+        type="codergen"
+        prompt="Analyze the codebase architecture and identify the three highest-priority refactors."
+        model="gpt-4o"
+        temperature="0.1"
+        max_tokens="4096"
+    ]
+
+    implement [
+        type="codergen"
+        prompt="Implement the highest-priority refactor identified in the analysis."
+        model="claude-opus-4-6"
+        temperature="0.3"
+        max_tokens="16384"
+    ]
+
+    done [shape=Msquare]
+
+    start -> analyze
+    analyze -> implement
+    implement -> done
+}
+```
+
+### Step 2: Configure reliability attributes
+
+```dot
+flaky_step [
+    type="codergen"
+    prompt="Run the integration test suite and report results."
+    max_retries="3"
+    timeout="120"
+    allow_partial="true"
+]
+```
+
+**All node attributes**:
+
+| Attribute      | Type    | Purpose                                                       |
+|----------------|---------|---------------------------------------------------------------|
+| `type`         | string  | Handler type (`codergen`, or custom registered types)         |
+| `prompt`       | string  | Prompt with optional `{key}` interpolation                    |
+| `model`        | string  | Model ID (overrides stylesheet; routes to matching adapter)   |
+| `temperature`  | float   | Sampling temperature (0.0–1.0)                               |
+| `max_tokens`   | int     | Maximum output tokens                                         |
+| `max_retries`  | int     | Retry attempts on handler failure                             |
+| `allow_partial`| bool    | Accept partial results if the handler fails after retries     |
+| `fidelity`     | string  | Fidelity hint passed to the handler (handler-specific)        |
+| `timeout`      | int     | Execution timeout in seconds                                  |
+| `shape`        | string  | `Mdiamond` = start, `Msquare` = terminal                      |
+
+### Troubleshooting
+
+**Problem**: Node `model` attribute is ignored and the stylesheet model is used
+**Symptoms**: The agent uses a different model than specified in the DOT file.
+**Cause**: Stylesheet rules can be overridden by node attributes, but the reverse is also true — a misconfigured stylesheet with an ID selector (`#node_id`) would win over a node attribute.
+**Solution**: Check for ID-specific stylesheet rules (`#node_name`). Node attributes in the DOT file take final precedence over universal (`*`) and class (`.class`) stylesheet rules, but a correctly applied ID rule in a custom stylesheet would also override. Confirm the engine logs show the correct model.
+
+**Problem**: `timeout` has no effect on a node
+**Symptoms**: The node runs longer than the configured timeout.
+**Cause**: Timeout enforcement depends on the handler implementation. The `codergen` handler passes timeout to the agent's `SessionConfig`, which governs shell command timeouts, not the total node execution time.
+**Solution**: For hard wall-clock limits on node execution, wrap the `engine.run()` call with `asyncio.wait_for()` in your Python code.
+
+---
+
+## 5. How to Add a Model Stylesheet
+
+> **Goal**: Apply default model, temperature, and token settings to classes of nodes without repeating attributes on every node.
+> **Use case**: Standardizing all codergen nodes to use a specific model, or giving review nodes higher temperature.
+> **Time required**: 10 minutes
+
+### Prerequisites
+
+- Attractor installed and importable as a Python library
+- A pipeline DOT file
+
+### Problem Context
+
+Large pipelines with many nodes become hard to maintain when model settings are repeated on every node. Stylesheets let you set defaults in one place, using CSS-style selectors.
+
+### How stylesheet selectors work
+
+The `ModelStylesheet` evaluates rules in specificity order. Higher specificity overrides lower. Node attributes in the DOT file always override all stylesheet rules.
+
+| Selector type | Syntax   | Example           | Specificity |
+|---------------|----------|-------------------|-------------|
+| Universal     | `*`      | Matches all nodes | Lowest      |
+| Class         | `.class` | `.review`         | Medium      |
+| ID            | `#id`    | `#implement`      | Highest     |
+
+When multiple rules match, the more specific rule wins. Among rules of equal specificity, the later rule wins.
+
+### Step 1: Build a stylesheet
+
+```python
+from attractor.pipeline.stylesheet import ModelStylesheet, StyleRule
+
+stylesheet = ModelStylesheet(rules=[
+    # Universal: all nodes default to gpt-4o
+    StyleRule(
+        selector="*",
+        model="gpt-4o",
+        temperature=0.2,
+        max_tokens=8192,
+    ),
+    # Class: nodes with class="implementation" get higher token limit
+    StyleRule(
+        selector=".implementation",
+        model="claude-opus-4-6",
+        max_tokens=32768,
+    ),
+    # ID: the specific "final_review" node gets a custom temperature
+    StyleRule(
+        selector="#final_review",
+        temperature=0.7,
+    ),
+])
+```
+
+### Step 2: Reference classes in the DOT file
+
+Assign a class to a node using the `class` attribute in DOT:
+
+```dot
+digraph styled_pipeline {
+    start [shape=Mdiamond]
+
+    implement [type="codergen" class="implementation"
+               prompt="Implement the feature."]
+
+    review    [type="codergen" class="review"
+               prompt="Review the implementation."]
+
+    final_review [type="codergen"
+                  prompt="Final review before merge."]
+
+    done [shape=Msquare]
+
+    start -> implement
+    implement -> review
+    review -> final_review
+    final_review -> done
+}
+```
+
+### Step 3: Pass the stylesheet to PipelineEngine
+
+```python
+import asyncio
+from attractor.pipeline.engine import PipelineEngine
+from attractor.pipeline.handlers import create_default_registry
+from attractor.pipeline.parser import parse_dot_file
+
+pipeline = parse_dot_file("styled_pipeline.dot")
+registry = create_default_registry(pipeline=pipeline)
+
+engine = PipelineEngine(
+    registry=registry,
+    stylesheet=stylesheet,
+    checkpoint_dir=".attractor/checkpoints",
+)
+
+ctx = asyncio.run(engine.run(pipeline))
+```
+
+**Verify it worked**: Enable verbose output or add logging to confirm each node receives the expected model from the stylesheet.
+
+### Alternative Approaches
+
+### For CLI use
+The `--model` flag on `attractor run` applies a universal default model for all codergen nodes:
+
+```bash
+attractor run pipeline.dot --model gpt-4o
+```
+
+**When to use**: Quick overrides during development. The CLI model flag applies universally and cannot express per-class or per-node specificity.
+
+### Troubleshooting
+
+**Problem**: A stylesheet rule applies to more nodes than intended
+**Solution**: Add an ID selector (`#node_name`) for the specific node, or narrow a universal rule to a class selector by assigning classes in the DOT file.
+
+**Problem**: A node ignores the stylesheet entirely and uses a different model
+**Cause**: The node has an explicit `model` attribute in the DOT file, which always wins over stylesheet rules.
+**Solution**: Remove the inline `model` attribute from the DOT node definition and rely on the stylesheet.
+
+---
+
+## 6. How to Validate a Pipeline
+
+> **Goal**: Catch structural errors in a DOT file before running it.
+> **Use case**: CI pre-flight check before executing a pipeline in production.
+> **Time required**: 2 minutes
+
+### Prerequisites
+
+- Attractor installed
+- A pipeline DOT file
+
+### Step 1: Run basic validation
+
+```bash
+attractor validate pipeline.dot
+```
+
+The validator checks:
+- Exactly one start node exists (shape=Mdiamond or name "start")
+- At least one terminal node exists
+- All edge endpoint node names match defined nodes
+- All `type` attribute values are known handler types
+- All nodes are reachable from the start node
+- No invalid cycle structures
+
+**Expected result**: No output and exit code 0 on success. Errors are printed to stderr on failure.
+
+### Step 2: Enable strict mode
+
+Strict mode promotes warnings to errors:
+
+```bash
+attractor validate pipeline.dot --strict
+```
+
+**Verify it worked**: Exit code 0 means the pipeline passed all checks including warnings.
+
+### Step 3: Validate programmatically
+
+```python
+from attractor.pipeline.parser import parse_dot_file
+from attractor.pipeline.validator import validate_pipeline
+
+pipeline = parse_dot_file("pipeline.dot")
+errors = validate_pipeline(pipeline, strict=False)
+
+if errors:
+    for error in errors:
+        print(f"ERROR: {error}")
+else:
+    print("Pipeline is valid.")
+```
+
+### Troubleshooting
+
+**Problem**: `No start node found`
+**Solution**: Ensure one node has `shape=Mdiamond` or is named `start` (case-insensitive).
+
+**Problem**: `Unknown handler type '...'`
+**Solution**: The `type` attribute value is not in the known handler types set in `validator.py`. Use `type="codergen"` for the built-in handler, or register your custom type — see [section 13](#13-how-to-add-a-custom-node-handler).
+
+**Problem**: `Edge references undefined node '...'`
+**Solution**: A node name in an edge definition (`a -> b`) does not match any defined node. Check for typos in node names.
+
+**Problem**: `Node '...' is not reachable from start`
+**Solution**: The node exists but no path leads to it from the start node. Either remove the node or add an edge connecting it to the reachable subgraph.
+
+---
+
+## 7. How to Run a Pipeline
+
+> **Goal**: Execute a validated pipeline from the command line.
+> **Use case**: Running a coding agent workflow against a local repository.
+> **Time required**: 2 minutes
+
+### Prerequisites
+
+- A valid pipeline DOT file
+- At least one provider API key in the environment
+
+### Step 1: Run with default settings
+
+```bash
+attractor run pipeline.dot
+```
+
+### Step 2: Specify a model
+
+The `--model` flag applies a default model to all codergen nodes. The model string determines which provider adapter is used — see [section 10](#10-how-to-switch-llm-providers) for routing details.
+
+```bash
+attractor run pipeline.dot --model claude-opus-4-6
+attractor run pipeline.dot --model gpt-4o
+attractor run pipeline.dot --model gemini-2.0-flash
+```
+
+### Step 3: Enable verbose output
+
+```bash
+attractor run pipeline.dot --model gpt-4o --verbose
+```
+
+Verbose mode prints node names, context updates, tool calls, and the final context table.
+
+**Success criteria**: The engine reaches a terminal node and exits with code 0. The final context table is printed to the terminal.
+
+### Troubleshooting
+
+**Problem**: `No provider adapter found for model '...'`
+**Cause**: The model string did not match any loaded adapter's `detect_model()` check, or the provider SDK is not installed.
+**Solution**: Check that the relevant package is installed (`anthropic`, `openai`, or `google-genai`) and that the model string uses the correct prefix. See [section 10](#10-how-to-switch-llm-providers).
+
+**Problem**: Pipeline runs but produces no output
+**Solution**: Add `--verbose` to see node-level progress.
+
+**Problem**: `ANTHROPIC_API_KEY` not found (or other provider key)
+**Solution**: Export the key in the shell before running:
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+attractor run pipeline.dot --model claude-opus-4-6
+```
+
+---
+
+## 8. How to Resume from a Checkpoint
+
+> **Goal**: Continue a pipeline from the point of failure after fixing the underlying issue.
+> **Use case**: A long-running pipeline failed mid-way due to a network error or API timeout.
+> **Time required**: 5 minutes
+
+### How checkpoints work
+
+The engine writes a checkpoint file after every successfully completed node. Files are named `checkpoint_{timestamp_ms}.json` in the configured checkpoint directory (default: `.attractor/checkpoints/`). Each checkpoint captures:
+
+- The pipeline name
+- The next node to execute
+- The full `PipelineContext` (all key-value pairs)
+- The list of completed node names
+
+### Step 1: Identify the latest checkpoint
+
+```bash
+ls -lt .attractor/checkpoints/
+```
+
+Or use the Python helper:
+
+```python
+from attractor.pipeline.state import latest_checkpoint
+
+cp = latest_checkpoint(".attractor/checkpoints")
+print(f"Pipeline: {cp.pipeline_name}")
+print(f"Resume from: {cp.current_node}")
+print(f"Completed: {cp.completed_nodes}")
+```
+
+### Step 2: Resume from the CLI
+
+```bash
+attractor resume .attractor/checkpoints/checkpoint_1712345678000.json \
+    --pipeline-dot pipeline.dot \
+    --verbose
+```
+
+The `--pipeline-dot` flag is required. The engine restores the saved context and begins execution from the checkpointed node.
+
+**Verify it worked**: The engine prints "Resuming from checkpoint" and starts at the correct node, skipping already-completed nodes.
+
+### Step 3: Resume programmatically
+
+```python
+import asyncio
+from attractor.pipeline.engine import PipelineEngine
+from attractor.pipeline.handlers import create_default_registry
+from attractor.pipeline.parser import parse_dot_file
+from attractor.pipeline.state import latest_checkpoint
+
+pipeline = parse_dot_file("pipeline.dot")
+cp = latest_checkpoint(".attractor/checkpoints")
+
+registry = create_default_registry(pipeline=pipeline)
+engine = PipelineEngine(registry=registry)
+
+ctx = asyncio.run(engine.run(pipeline, checkpoint=cp))
+```
+
+### Best Practices
+
+- Checkpointing is enabled by default. Disable only for short, fast pipelines where restart from scratch is acceptable.
+- The failed node re-executes on resume. Design handlers to be idempotent where possible.
+- Checkpoint files are plain JSON — safe to inspect and edit if you need to manually advance the resume point.
+
+### Troubleshooting
+
+**Problem**: `Start node '...' not found in pipeline` on resume
+**Cause**: The DOT file was modified and a node name changed between the original run and the resume.
+**Solution**: Restore the original node name in the DOT file, or open the checkpoint JSON and update `current_node` to the correct node name.
+
+**Problem**: Pipeline resumes at an unexpected node
+**Cause**: `current_node` in the checkpoint is the node that was about to execute when the checkpoint was written. If the pipeline failed during a node, that node will re-run.
+**Solution**: This is expected. The checkpoint saves state after each successfully completed node.
+
+**Problem**: `KeyError` when loading a checkpoint
+**Cause**: The checkpoint JSON schema is incompatible with the current code version after an upgrade.
+**Solution**: Checkpoints are plain JSON. Open the file, compare with the `Checkpoint` dataclass fields, and manually correct any missing or renamed fields.
+
+---
+
+## 9. How to Use Goal Gates
+
+> **Goal**: Prevent a pipeline from being considered successful unless specific nodes ran and specific context conditions are met.
+> **Use case**: CI enforcement — ensure that security scanning and testing nodes always execute, regardless of branching paths.
+> **Time required**: 10 minutes
+
+### What goal gates do
+
+A `GoalGate` checks two things when the engine reaches a terminal node:
+
+1. **Required nodes**: A set of node names that must all appear in `_completed_nodes`.
+2. **Context conditions**: Boolean expressions (same syntax as edge conditions) that must hold against the final `PipelineContext`.
+
+If the gate is not satisfied, the engine sets `_goal_gate_unmet` in the context. Execution still reaches the terminal node — the gate does not force re-routing. Check `_goal_gate_unmet` after `engine.run()` returns to enforce a non-zero exit code.
+
+### Step 1: Define a goal gate
+
+```python
+from attractor.pipeline.goals import GoalGate
+
+gate = GoalGate(
+    required_nodes=["test", "security_scan", "approve"],
+    context_conditions=[
+        "tests_passed = true",
+        "approved = true",
+    ],
+)
+```
+
+### Step 2: Pass it to PipelineEngine
+
+```python
+import asyncio
+from attractor.pipeline.engine import PipelineEngine
+from attractor.pipeline.handlers import create_default_registry
+from attractor.pipeline.parser import parse_dot_file
+
+pipeline = parse_dot_file("release.dot")
+registry = create_default_registry(pipeline=pipeline)
+
+engine = PipelineEngine(
+    registry=registry,
+    goal_gate=gate,
+)
+
+ctx = asyncio.run(engine.run(pipeline))
+
+if ctx.has("_goal_gate_unmet"):
+    unmet = ctx.get("_goal_gate_unmet")
+    print("Pipeline completed without meeting all goals:")
+    for issue in unmet:
+        print(f"  - {issue}")
+    raise SystemExit(1)
+```
+
+### Step 3: Use in CI
+
+```python
+import asyncio
+import sys
+from attractor.pipeline.engine import PipelineEngine
+from attractor.pipeline.goals import GoalGate
+from attractor.pipeline.handlers import create_default_registry
+from attractor.pipeline.parser import parse_dot_file
+
+pipeline = parse_dot_file("release.dot")
+registry = create_default_registry(pipeline=pipeline)
+
+gate = GoalGate(
+    required_nodes=["build", "test", "security_scan"],
+    context_conditions=["exit_code = 0"],
+)
+
+engine = PipelineEngine(registry=registry, goal_gate=gate)
+ctx = asyncio.run(engine.run(pipeline))
+
+if ctx.has("_goal_gate_unmet"):
+    for issue in ctx.get("_goal_gate_unmet", []):
+        print(f"UNMET: {issue}", file=sys.stderr)
+    sys.exit(1)
+```
+
+**Success criteria**: Exit code 0 means all required nodes ran and all context conditions held at pipeline completion.
+
+### Troubleshooting
+
+**Problem**: Gate reports a required node as unmet even though the DOT file includes it
+**Cause**: The pipeline took a conditional branch that skipped the node.
+**Solution**: Ensure all execution paths lead through the required nodes, or restructure the graph so required nodes are on the critical path with no bypass edges.
+
+**Problem**: `_goal_gate_unmet` is set but the pipeline exited with code 0
+**Cause**: `_goal_gate_unmet` is set in the context, but the exit code is your responsibility to check. The engine does not automatically fail.
+**Solution**: Check `ctx.has("_goal_gate_unmet")` after `engine.run()` and call `sys.exit(1)` explicitly, as shown in the example above.
+
+---
+
+## 10. How to Switch LLM Providers
+
+> **Goal**: Route pipeline nodes to different LLM providers by specifying model names.
+> **Use case**: Using Claude for implementation, GPT-4o for analysis, and Gemini for fast classification.
+> **Time required**: 5 minutes
+
+### Prerequisites
+
+- API keys set for the providers you want to use
+- Provider SDKs installed (`anthropic`, `openai`, `google-genai`)
+
+### How model routing works
+
+`LLMClient` contains a list of `ProviderAdapter` instances. When a request arrives, it calls each adapter's `detect_model(model_str)` in order. The first adapter to return `True` handles the request. Adapters are lazy-loaded — if a provider's SDK is not installed, that adapter is silently skipped.
+
+**Model name prefixes by provider**:
+
+| Model prefix      | Provider  | Required env var       | Required package |
+|-------------------|-----------|------------------------|------------------|
+| `claude-*`        | Anthropic | `ANTHROPIC_API_KEY`    | `anthropic`      |
+| `gpt-*`           | OpenAI    | `OPENAI_API_KEY`       | `openai`         |
+| `o1-*`, `o3-*`    | OpenAI    | `OPENAI_API_KEY`       | `openai`         |
+| `gemini-*`        | Gemini    | `GOOGLE_API_KEY`       | `google-genai`   |
+
+### Step 1: Set the provider API key
+
+```bash
+# Anthropic
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# OpenAI
+export OPENAI_API_KEY="sk-..."
+
+# Gemini
+export GOOGLE_API_KEY="AIza..."
+```
+
+Or place them in a `.env` file in the project root — Attractor loads it automatically.
+
+### Step 2: Specify the model in the DOT file or CLI
+
+In the DOT file (per node):
+
+```dot
+analyze [type="codergen" model="gpt-4o"          prompt="Analyze the codebase."]
+code    [type="codergen" model="claude-opus-4-6"  prompt="Implement the fix."]
+check   [type="codergen" model="gemini-2.0-flash" prompt="Verify correctness."]
+```
+
+From the CLI (all codergen nodes):
+
+```bash
+attractor run pipeline.dot --model claude-opus-4-6
+```
+
+### Step 3: Verify routing
+
+```python
+from attractor.llm.client import LLMClient
+
+client = LLMClient()
+
+# Test which adapter handles each model string
+for model in ["claude-opus-4-6", "gpt-4o", "gemini-2.0-flash"]:
+    try:
+        adapter = client._find_adapter(model)
+        print(f"{model} -> {adapter.provider_name()}")
+    except Exception as e:
+        print(f"{model} -> ERROR: {e}")
+```
+
+### Troubleshooting
+
+**Problem**: `No provider adapter found for model '...'`
+**Cause**: No loaded adapter's `detect_model()` matched the model string, or the provider SDK failed to import.
+**Solution**:
+1. Confirm the correct package is installed: `pip show anthropic openai google-genai`
+2. Check that the model string uses the correct prefix
+3. Enable debug logging to see which adapters loaded: `import logging; logging.basicConfig(level=logging.DEBUG)`
+
+**Problem**: Adapter loaded but API returns authentication error
+**Solution**: Verify the API key environment variable is set correctly. The variable names are case-sensitive.
+
+---
+
+## 11. How to Configure Shell Timeouts
+
+> **Goal**: Control how long the agent waits for shell commands to complete.
+> **Use case**: Allowing long-running test suites to finish, or cutting off hung processes quickly.
+> **Time required**: 5 minutes
+
+### How timeouts work
+
+Shell command timeouts are controlled at two levels:
+
+1. **Profile default**: Each provider profile sets a default `command_timeout_ms` used when no override is provided.
+2. **SessionConfig override**: Passed programmatically when creating a `Session`.
+
+**Profile default timeouts**:
+
+| Profile            | Default command timeout |
+|--------------------|-------------------------|
+| `AnthropicProfile` | 120,000 ms (120 s)      |
+| `OpenAIProfile`    | 10,000 ms (10 s)        |
+| `GeminiProfile`    | 10,000 ms (10 s)        |
+
+### Step 1: Override timeout in SessionConfig
+
+```python
+from attractor.agent.session import Session, SessionConfig
+from attractor.agent.environment import LocalExecutionEnvironment
+from attractor.agent.profiles.anthropic_profile import AnthropicProfile
+from attractor.llm.client import LLMClient
+
+config = SessionConfig(
+    model_id="claude-opus-4-6",
+    default_command_timeout_ms=300_000,  # 5 minutes for long test suites
+)
+
+session = Session(
+    profile=AnthropicProfile(),
+    environment=LocalExecutionEnvironment(working_dir="/path/to/project"),
+    config=config,
+    llm_client=LLMClient(),
+)
+```
+
+### Step 2: Set timeout at the node level
+
+For a specific pipeline node, set the `timeout` attribute in the DOT file. This value (in seconds) is passed to the handler and then to `SessionConfig`:
+
+```dot
+long_test [
+    type="codergen"
+    prompt="Run the full integration test suite: pytest tests/integration/ -v"
+    timeout="300"
+]
+```
+
+### Best Practices
+
+- Use short timeouts (10–30 s) for quick shell commands like `grep`, `ls`, or `git status`.
+- Use longer timeouts (120–600 s) for test suites, build steps, or package installations.
+- The `LocalExecutionEnvironment` uses signal handling to terminate hung processes cleanly.
+- Sensitive environment variables are filtered from subprocess environments automatically.
+
+### Troubleshooting
+
+**Problem**: Shell commands time out even with a long `timeout` set
+**Cause**: The `timeout` node attribute sets the session-level default, but individual shell invocations inside the agent loop use `default_command_timeout_ms` from `SessionConfig`.
+**Solution**: Set `default_command_timeout_ms` in `SessionConfig` programmatically. The node `timeout` attribute is the primary control when using the CLI.
+
+---
+
+## 12. How to Use the Agent Tools
+
+> **Goal**: Understand which tools the agent can call during its agentic loop and how output is handled.
+> **Use case**: Debugging why an agent is not reading or writing files as expected.
+> **Time required**: 10 minutes
+
+### Tool availability by provider
+
+Not all tools are available on all providers. The active `ProviderProfile` determines which tools are sent to the API.
+
+| Tool           | Anthropic | OpenAI | Gemini |
+|----------------|:---------:|:------:|:------:|
+| `read_file`    | Yes       | Yes    | Yes    |
+| `write_file`   | Yes       | Yes    | Yes    |
+| `edit_file`    | Yes       | Yes    | Yes    |
+| `shell`        | Yes       | Yes    | Yes    |
+| `grep`         | Yes       | Yes    | Yes    |
+| `glob`         | Yes       | Yes    | Yes    |
+| `list_dir`     | No        | No     | Yes    |
+| `apply_patch`  | Yes       | Yes    | No     |
+| `spawn_agent`  | Yes       | Yes    | No     |
+
+### Core tool reference
+
+**`read_file`** — Read the contents of a file.
+- Parameters: `path` (string, required)
+- Output: File contents, truncated if large (stage 1: char limit, stage 2: line limit; head + tail preserved with `...` in the middle)
+
+**`write_file`** — Write or overwrite a file.
+- Parameters: `path` (string, required), `content` (string, required)
+- Output: Confirmation message
+
+**`edit_file`** — Apply a targeted string replacement within a file.
+- Parameters: `path` (string, required), `old_string` (string, required), `new_string` (string, required)
+- Output: Confirmation or error if `old_string` not found
+
+**`shell`** — Execute a shell command in the working directory.
+- Parameters: `command` (string, required)
+- Output: Combined stdout + stderr, truncated if large
+- Timeout: `default_command_timeout_ms` from `SessionConfig`
+
+**`grep`** — Search file contents with a regex pattern.
+- Parameters: `pattern` (string, required), `path` (string, optional), `include` (glob pattern, optional)
+- Output: Matching lines with file and line number
+
+**`glob`** — Find files matching a glob pattern.
+- Parameters: `pattern` (string, required), `path` (string, optional)
+- Output: List of matching file paths
+
+**`list_dir`** (Gemini only) — List directory contents with file sizes.
+- Parameters: `path` (string, required)
+- Output: Directory listing with sizes
+
+**`apply_patch`** (Anthropic + OpenAI) — Apply a unified diff patch to files.
+- Parameters: `patch` (string, required, unified diff format)
+- Output: Confirmation or error details
+
+### How output truncation works
+
+Large tool outputs are truncated in two stages to fit within context windows:
+
+1. **Stage 1 — character limit**: If output exceeds the per-tool character limit, it is truncated.
+2. **Stage 2 — line limit**: Applied to the stage-1 result if it still exceeds the line limit.
+
+Both stages keep the head and tail of the output, inserting a `...` marker in the middle. The full untruncated output is stored separately and available via `TOOL_CALL_END` events as `full_output`.
+
+### Troubleshooting
+
+**Problem**: The agent does not call `list_dir` even when asked to list files
+**Cause**: `list_dir` is only available in `GeminiProfile`. Anthropic and OpenAI sessions do not expose it.
+**Solution**: Use `glob` with pattern `"**/*"` and a `path` argument as an equivalent on Anthropic and OpenAI sessions.
+
+**Problem**: `edit_file` returns an error saying `old_string` was not found
+**Cause**: The string to replace does not appear verbatim in the file, or whitespace/line ending differences.
+**Solution**: Have the agent call `read_file` first to confirm the exact content, then retry `edit_file` with the exact matching string.
+
+**Problem**: Shell command output is truncated and important information is in the middle
+**Cause**: Two-stage truncation keeps head and tail and removes the middle.
+**Solution**: Either pipe the command output through `grep` or `tail` to retrieve specific sections, or split the command into smaller targeted invocations.
+
+---
+
+## 13. How to Add a Custom Node Handler
+
+> **Goal**: Register a new handler type so it can be used in DOT files via `type="my_type"`.
+> **Use case**: Adding a Slack notification step, a database write step, or a human approval gate.
 > **Time required**: 15 minutes
+
+### Prerequisites
+
+- Attractor installed as an editable package (`pip install -e .`)
+- Understanding of `PipelineContext` as a key-value blackboard
 
 ### Step 1: Implement the NodeHandler protocol
 
@@ -237,7 +1116,6 @@ A handler is any object with an `async execute(node, context) -> NodeResult` met
 # my_handlers.py
 from __future__ import annotations
 
-import asyncio
 from attractor.pipeline.models import NodeResult, PipelineContext, PipelineNode
 
 
@@ -274,19 +1152,19 @@ class SlackNotifyHandler:
         return NodeResult(
             success=True,
             output="Notification sent",
-            context_updates={"slack_notified": True},
+            context_updates={"slack_notified": "true"},
         )
 ```
 
 **NodeResult fields**:
 
-| Field             | Purpose                                                   |
-|-------------------|-----------------------------------------------------------|
-| `success`         | Whether the handler succeeded                             |
-| `output`          | Arbitrary output payload (stored in context if needed)    |
-| `error`           | Error description when `success=False`                    |
+| Field             | Purpose                                                     |
+|-------------------|-------------------------------------------------------------|
+| `success`         | Whether the handler succeeded                               |
+| `output`          | Arbitrary output payload                                    |
+| `error`           | Error description when `success=False`                      |
 | `next_node`       | Force routing to a specific node, bypassing edge conditions |
-| `context_updates` | Dict merged into `PipelineContext` after execution        |
+| `context_updates` | Dict merged into `PipelineContext` after execution          |
 
 ### Step 2: Register the handler
 
@@ -300,9 +1178,11 @@ from attractor.pipeline.parser import parse_dot_file
 
 pipeline = parse_dot_file("notify.dot")
 
-# Start with the default registry, then add yours
 registry = create_default_registry(pipeline=pipeline)
-registry.register("slack_notify", SlackNotifyHandler(webhook_url="https://hooks.slack.com/..."))
+registry.register(
+    "slack_notify",
+    SlackNotifyHandler(webhook_url="https://hooks.slack.com/..."),
+)
 
 engine = PipelineEngine(registry=registry)
 ctx = asyncio.run(engine.run(pipeline))
@@ -310,17 +1190,14 @@ ctx = asyncio.run(engine.run(pipeline))
 
 ### Step 3: Add the handler type to the validator
 
-The static validator checks handler types against `_KNOWN_HANDLERS`. Add your type there to suppress validation errors:
+The static validator checks handler types against `_KNOWN_HANDLERS`. Add your type to suppress validation errors:
 
 ```python
 # src/attractor/pipeline/validator.py
 _KNOWN_HANDLERS = {
     "codergen",
-    "human_gate",
-    "conditional",
-    "parallel",
-    "tool",
-    "supervisor",
+    "start",
+    "exit",
     "slack_notify",   # add your type here
 }
 ```
@@ -329,11 +1206,13 @@ _KNOWN_HANDLERS = {
 
 ```dot
 digraph with_notifications {
-    start  [handler="codergen" prompt="Deploy the release." start=true]
-    notify [handler="slack_notify" message="Release deployed by Attractor. Last output: {last_codergen_output}"]
-    done   [terminal=true]
+    start  [shape=Mdiamond]
+    deploy [type="codergen" prompt="Deploy the release to staging."]
+    notify [type="slack_notify" message="Release deployed. Last status: {deploy_status}"]
+    done   [shape=Msquare]
 
-    start  -> notify
+    start  -> deploy
+    deploy -> notify
     notify -> done
 }
 ```
@@ -341,17 +1220,27 @@ digraph with_notifications {
 ### Troubleshooting
 
 **Problem**: Handler executes but context values are not available in the next node
-**Solution**: Return them in `context_updates`, not as attributes on the node. Context updates are merged into the shared `PipelineContext` blackboard after each node executes.
+**Cause**: Context values must be returned in `context_updates`, not set on the node object.
+**Solution**: Return `NodeResult(context_updates={"my_key": "my_value"})`. The engine merges this dict into `PipelineContext` after each node execution.
 
 **Problem**: Handler needs access to the full pipeline graph
-**Solution**: Accept `pipeline: Pipeline` in the constructor. The engine passes pipeline-aware arguments when calling `create_default_registry(pipeline=pipeline)`, so pattern your handler like `ConditionalHandler` or `ParallelHandler`.
+**Solution**: Accept `pipeline: Pipeline` in the constructor. The engine passes pipeline-aware arguments when calling `create_default_registry(pipeline=pipeline)`, so pattern your handler similarly to how `CodergenHandler` accepts a pipeline reference.
+
+**Problem**: `attractor validate` reports `Unknown handler type 'slack_notify'`
+**Solution**: The validator runs before your custom handler is registered at runtime. Add your type string to `_KNOWN_HANDLERS` in `src/attractor/pipeline/validator.py`.
 
 ---
 
-## 4. How to Add a New LLM Provider
+## 14. How to Add a New LLM Provider Adapter
 
-> **Goal**: Integrate a new LLM provider API so the agent and pipeline can route requests to it.
+> **Goal**: Integrate a new LLM provider API so the agent and pipeline can route requests to it by model name.
+> **Use case**: Adding a self-hosted model, a fine-tuned model endpoint, or a new commercial provider.
 > **Time required**: 30 minutes
+
+### Prerequisites
+
+- The provider's Python SDK installed
+- Understanding of `LLMClient`'s adapter detection mechanism
 
 ### Step 1: Create the adapter file
 
@@ -391,7 +1280,6 @@ class MyProviderAdapter:
 
         client = myprovider_sdk.Client()
 
-        # Map attractor's Request to the provider's format
         sdk_messages = [
             {"role": msg.role.value, "content": msg.text()}
             for msg in request.messages
@@ -404,7 +1292,6 @@ class MyProviderAdapter:
             max_tokens=request.max_tokens,
         )
 
-        # Map the provider's response back to attractor's Response
         text = raw.choices[0].message.content or ""
         return Response(
             message=Message(
@@ -420,8 +1307,7 @@ class MyProviderAdapter:
         )
 
     async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
-        # Implement streaming; yield StreamEvent objects
-        # Minimum: yield TEXT_DELTA events, then a FINISH event
+        # Minimum: yield STREAM_START, TEXT_DELTA events, then FINISH
         yield StreamEvent(type=StreamEventType.STREAM_START)
         # ... streaming implementation ...
         yield StreamEvent(type=StreamEventType.FINISH, finish_reason=FinishReason.STOP)
@@ -441,18 +1327,17 @@ def _default_adapters() -> list[Any]:
         from attractor.llm.adapters.myprovider_adapter import MyProviderAdapter
         adapters.append(MyProviderAdapter())
     except Exception:
-        logger.debug("MyProvider adapter unavailable")
+        pass  # SDK not installed; skip silently
     return adapters
 ```
 
-### Step 3: Add a provider profile (optional, for agent use)
+### Step 3: Add a ProviderProfile for agent use (optional)
 
-If the new provider needs a distinct tool set or system prompt, create `src/attractor/agent/profiles/myprovider_profile.py`:
+If the provider needs a distinct tool set or system prompt, create `src/attractor/agent/profiles/myprovider_profile.py`:
 
 ```python
 from __future__ import annotations
 
-from attractor.agent.profiles.base import ProviderProfile
 from attractor.agent.tools.core_tools import (
     EDIT_FILE_DEF, GLOB_DEF, GREP_DEF, READ_FILE_DEF, SHELL_DEF, WRITE_FILE_DEF,
 )
@@ -464,7 +1349,7 @@ You are a coding assistant. Working directory: {working_dir}
 """
 
 
-class MyProviderProfile(ProviderProfile):
+class MyProviderProfile:
 
     @property
     def provider_name(self) -> str:
@@ -477,10 +1362,6 @@ class MyProviderProfile(ProviderProfile):
     @property
     def system_prompt_template(self) -> str:
         return _SYSTEM_PROMPT
-
-    @property
-    def context_window_size(self) -> int:
-        return 128_000
 ```
 
 ### Step 4: Verify routing
@@ -489,449 +1370,32 @@ class MyProviderProfile(ProviderProfile):
 from attractor.llm.client import LLMClient
 
 client = LLMClient()
-adapter = client.detect_provider("myprovider-large")
+# Should not raise — confirms the adapter loaded and detected the model
+adapter = client._find_adapter("myprovider-large")
 print(adapter.provider_name())  # "myprovider"
 ```
 
 ### Troubleshooting
 
-**Problem**: `No provider adapter found for model '...'`
-**Cause**: `detect_model()` returned `False` for that string, or the import in `_default_adapters()` raised an exception.
-**Solution**: Add `logging.basicConfig(level=logging.DEBUG)` — the client logs a debug message when an adapter fails to load. Fix the import or the `detect_model()` prefix check.
+**Problem**: `No provider adapter found for model 'myprovider-large'`
+**Cause**: `detect_model()` returned `False`, or the import in `_default_adapters()` raised an exception.
+**Solution**: Enable debug logging — the client logs when adapters fail to load. Fix the import or the `detect_model()` prefix check.
 
-**Problem**: Anthropic API raises `400 Bad Request` about message alternation
-**Cause**: The Anthropic API requires strict `user / assistant / user / assistant` alternation. The `AnthropicAdapter` inserts synthetic placeholder messages, but this only applies to the built-in adapter.
-**Solution**: In your adapter's `complete()`, check for consecutive same-role messages and insert placeholders before sending.
+```python
+import logging
+logging.basicConfig(level=logging.DEBUG)
+```
+
+**Problem**: Anthropic API raises `400 Bad Request` about message alternation after adding a new adapter
+**Cause**: Unrelated — the Anthropic adapter inserts synthetic placeholder messages to enforce strict user/assistant alternation. Your new adapter does not need to do this for Anthropic; the built-in adapter handles it.
+**Solution**: If your provider also requires alternation, add the same placeholder insertion logic in your adapter's `complete()` method before sending to the API.
 
 ---
 
-## 5. How to Add a New Tool to the Agent
+## 15. How to Add Middleware
 
-> **Goal**: Make a new capability available to the LLM as a callable tool.
-> **Time required**: 20 minutes
-
-### Step 1: Write the handler function
-
-Tool handlers are plain async functions with the signature:
-
-```python
-async def my_tool(
-    arguments: dict[str, Any],
-    environment: ExecutionEnvironment,
-) -> ToolResult: ...
-```
-
-```python
-# src/attractor/agent/tools/core_tools.py  (or a new file)
-from __future__ import annotations
-
-import json
-from typing import Any
-
-import httpx
-
-from attractor.agent.environment import ExecutionEnvironment
-from attractor.agent.tools.registry import ToolResult
-from attractor.llm.models import ToolDefinition
-
-
-async def fetch_url(
-    arguments: dict[str, Any],
-    environment: ExecutionEnvironment,
-) -> ToolResult:
-    """Fetch a URL and return the response body."""
-    url: str = arguments["url"]
-    timeout = arguments.get("timeout_ms", 10_000) / 1000
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=timeout, follow_redirects=True)
-        output = f"Status: {resp.status_code}\n\n{resp.text}"
-        is_error = resp.status_code >= 400
-    except Exception as exc:
-        output = f"Error fetching {url}: {exc}"
-        is_error = True
-
-    return ToolResult(output=output, is_error=is_error, full_output=output)
-
-
-FETCH_URL_DEF = ToolDefinition(
-    name="fetch_url",
-    description="Fetch the contents of a URL. Returns status code and response body.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "url": {
-                "type": "string",
-                "description": "The URL to fetch.",
-            },
-            "timeout_ms": {
-                "type": "integer",
-                "description": "Request timeout in milliseconds (default 10000).",
-            },
-        },
-        "required": ["url"],
-    },
-)
-```
-
-### Step 2: Register the tool in Session._build_registry
-
-Add the handler and definition to the `_tool_map` dict inside `Session._build_registry()`:
-
-```python
-# src/attractor/agent/session.py — inside _build_registry()
-from attractor.agent.tools.core_tools import fetch_url, FETCH_URL_DEF
-
-_tool_map = {
-    # ... existing entries ...
-    "fetch_url": (fetch_url, FETCH_URL_DEF),
-}
-```
-
-### Step 3: Expose the tool in provider profiles
-
-Add the definition to each profile that should expose it:
-
-```python
-# src/attractor/agent/profiles/anthropic_profile.py
-from attractor.agent.tools.core_tools import FETCH_URL_DEF
-
-class AnthropicProfile(ProviderProfile):
-    @property
-    def tool_definitions(self) -> list[ToolDefinition]:
-        return [
-            EDIT_FILE_DEF,
-            READ_FILE_DEF,
-            WRITE_FILE_DEF,
-            SHELL_DEF,
-            GREP_DEF,
-            GLOB_DEF,
-            SPAWN_AGENT_DEF,
-            FETCH_URL_DEF,   # add here
-        ]
-```
-
-### Step 4: Add truncation limits (if output can be large)
-
-If the tool produces potentially large output, add limits in `TruncationConfig`:
-
-```python
-# src/attractor/agent/truncation.py — inside TruncationConfig defaults
-char_limits: dict[str, int] = field(default_factory=lambda: {
-    # ... existing ...
-    "fetch_url": 50_000,  # add here
-})
-```
-
-### Troubleshooting
-
-**Problem**: The LLM never calls the new tool
-**Cause**: The tool was not added to the active `ProviderProfile.tool_definitions`, so it was never sent to the API.
-**Solution**: Confirm the tool name appears in `session._registry.tool_names()` at runtime.
-
-**Problem**: `Error: unknown tool 'fetch_url'`
-**Cause**: The definition is in the profile but the handler was not added to `_tool_map` in `_build_registry`.
-**Solution**: The `ToolRegistry.dispatch()` returns an error `ToolResult` rather than raising — inspect `TOOL_CALL_END` events for `is_error=True`.
-
----
-
-## 6. How to Use Model Stylesheets
-
-> **Goal**: Apply default model, temperature, and token settings to classes of nodes without repeating attributes on every node.
-> **Time required**: 10 minutes
-
-### How stylesheets work
-
-A `ModelStylesheet` holds an ordered list of `StyleRule` entries. When the engine processes a node, it evaluates all rules top-to-bottom, collecting matching defaults. Later rules override earlier ones. Node-specific attributes in the DOT file always override everything.
-
-Rules match nodes by any combination of:
-- `handler_type` — exact match (e.g., `"codergen"`)
-- `name_pattern` — glob pattern matched against the node name (e.g., `"review_*"`)
-- `match_attributes` — dict of attributes that must be present on the node
-
-### Step 1: Build a stylesheet programmatically
-
-```python
-from attractor.pipeline.stylesheet import ModelStylesheet, StyleRule
-
-stylesheet = ModelStylesheet(rules=[
-    # All codergen nodes default to claude-opus-4-6 with precise settings
-    StyleRule(
-        handler_type="codergen",
-        model="claude-opus-4-6",
-        temperature=0.2,
-        max_tokens=8192,
-    ),
-    # Nodes whose names match "review_*" get a higher temperature
-    StyleRule(
-        name_pattern="review_*",
-        temperature=0.7,
-    ),
-    # A specific node override via attribute presence
-    StyleRule(
-        match_attributes={"role": "draft"},
-        model="claude-sonnet-4-6",
-        temperature=0.9,
-        max_tokens=4096,
-    ),
-])
-```
-
-### Step 2: Build from a dict (e.g., loaded from YAML)
-
-```python
-import yaml
-from attractor.pipeline.stylesheet import ModelStylesheet
-
-with open("stylesheet.yaml") as f:
-    data = yaml.safe_load(f)
-
-stylesheet = ModelStylesheet.from_dict(data)
-```
-
-Example `stylesheet.yaml`:
-
-```yaml
-rules:
-  - handler_type: codergen
-    model: claude-opus-4-6
-    temperature: 0.2
-    max_tokens: 8192
-
-  - name_pattern: "test_*"
-    timeout: 120
-    retry_count: 3
-
-  - handler_type: tool
-    timeout: 60
-```
-
-### Step 3: Pass the stylesheet to PipelineEngine
-
-```python
-from attractor.pipeline.engine import PipelineEngine
-
-engine = PipelineEngine(
-    registry=registry,
-    stylesheet=stylesheet,
-    checkpoint_dir=".attractor/checkpoints",
-)
-```
-
-From the CLI, the `--model` flag applies a stylesheet rule that sets `model` for all `codergen` nodes:
-
-```bash
-attractor run pipeline.dot --model gpt-4o
-```
-
-### Rule precedence (highest to lowest)
-
-1. Node attribute in the DOT file
-2. Last matching stylesheet rule (later rules win over earlier)
-3. First matching stylesheet rule
-4. Handler defaults
-
-### Troubleshooting
-
-**Problem**: A node ignores the stylesheet model and uses a different one
-**Cause**: The node has an explicit `model` attribute in the DOT file, which always wins.
-**Solution**: Remove the `model` attribute from the node definition and let the stylesheet supply it.
-
-**Problem**: A stylesheet rule applies to more nodes than intended
-**Solution**: Add a `name_pattern` or `match_attributes` constraint to narrow the match.
-
----
-
-## 7. How to Resume a Failed Pipeline
-
-> **Goal**: Continue a pipeline from the point of failure after fixing the underlying issue.
-> **Time required**: 5 minutes
-
-### How checkpoints work
-
-The engine writes a checkpoint file after every successfully completed node. Files are named `checkpoint_{timestamp_ms}.json` and saved in the configured checkpoint directory (default: `.attractor/checkpoints/`). Each checkpoint captures:
-
-- The pipeline name
-- The node that was about to execute next
-- The full `PipelineContext` (all key-value pairs)
-- The list of completed node names
-
-### Step 1: Identify the latest checkpoint
-
-```bash
-ls -lt .attractor/checkpoints/
-```
-
-Or use the Python helper:
-
-```python
-from attractor.pipeline.state import latest_checkpoint
-
-cp = latest_checkpoint(".attractor/checkpoints")
-print(f"Pipeline: {cp.pipeline_name}")
-print(f"Resume from: {cp.current_node}")
-print(f"Completed: {cp.completed_nodes}")
-```
-
-### Step 2: Resume from the CLI
-
-```bash
-attractor resume .attractor/checkpoints/checkpoint_1712345678000.json \
-    --pipeline-dot pipeline.dot \
-    --verbose
-```
-
-The `--pipeline-dot` flag is required. The engine restores the saved context and begins execution from the checkpointed node.
-
-To auto-select the most recent checkpoint:
-
-```bash
-# Find the newest checkpoint
-CHECKPOINT=$(ls -t .attractor/checkpoints/checkpoint_*.json | head -1)
-attractor resume "$CHECKPOINT" --pipeline-dot pipeline.dot
-```
-
-### Step 3: Resume programmatically
-
-```python
-import asyncio
-from attractor.pipeline.engine import PipelineEngine
-from attractor.pipeline.models import Checkpoint
-from attractor.pipeline.parser import parse_dot_file
-from attractor.pipeline.handlers import create_default_registry
-from attractor.pipeline.state import latest_checkpoint
-
-pipeline = parse_dot_file("pipeline.dot")
-cp = latest_checkpoint(".attractor/checkpoints")
-
-registry = create_default_registry(pipeline=pipeline)
-engine = PipelineEngine(registry=registry)
-
-ctx = asyncio.run(engine.run(pipeline, checkpoint=cp))
-```
-
-### Controlling checkpoint frequency
-
-Disable checkpointing (not recommended for long pipelines):
-
-```python
-engine = PipelineEngine(registry=registry, checkpoint_dir=None)
-```
-
-Use a custom directory:
-
-```python
-engine = PipelineEngine(registry=registry, checkpoint_dir="/tmp/my_checkpoints")
-```
-
-### Troubleshooting
-
-**Problem**: `Failed to load checkpoint: KeyError`
-**Cause**: The checkpoint JSON schema is incompatible with the current code (after an upgrade).
-**Solution**: Checkpoints are plain JSON — open the file, inspect the structure, and compare with `Checkpoint.from_dict()`. Manually edit the JSON or start the pipeline fresh.
-
-**Problem**: Pipeline resumes at the wrong node
-**Cause**: `current_node` in the checkpoint is the node that was executing when the checkpoint was written, not the node that failed. The failed node will re-execute on resume.
-**Solution**: This is expected behavior. The pipeline re-runs the node that checkpointed; if that node is idempotent, this is safe.
-
-**Problem**: `Start node '...' not found in pipeline` on resume
-**Cause**: The DOT file was modified and a node name changed between the original run and the resume.
-**Solution**: Restore the original node name in the DOT file, or manually edit `current_node` in the checkpoint JSON.
-
----
-
-## 8. How to Use Goal Gates
-
-> **Goal**: Prevent the pipeline from exiting through a terminal node unless required work has been completed.
-> **Time required**: 10 minutes
-
-### What goal gates do
-
-A `GoalGate` checks two things before the engine accepts a terminal exit:
-
-1. **Required nodes**: A set of node names that must all appear in the `completed_nodes` list.
-2. **Context conditions**: Boolean expressions that must hold against the final `PipelineContext`.
-
-If the gate is not satisfied, the engine logs a warning and sets `_goal_gate_unmet` in the context. Execution still stops — the gate does not force re-routing. Use it to detect incomplete runs in post-run checks or CI.
-
-### Step 1: Define a goal gate
-
-```python
-from attractor.pipeline.goals import GoalGate
-
-gate = GoalGate(
-    required_nodes=["test", "security_scan", "approve"],
-    context_conditions=[
-        "exit_code == 0",
-        "approved == true",
-    ],
-)
-```
-
-### Step 2: Pass it to PipelineEngine
-
-```python
-from attractor.pipeline.engine import PipelineEngine
-
-engine = PipelineEngine(
-    registry=registry,
-    goal_gate=gate,
-)
-
-ctx = asyncio.run(engine.run(pipeline))
-
-# Check if the gate was satisfied
-if ctx.has("_goal_gate_unmet"):
-    unmet = ctx.get("_goal_gate_unmet")
-    print("Pipeline completed without meeting all goals:")
-    for issue in unmet:
-        print(f"  - {issue}")
-    raise SystemExit(1)
-```
-
-### Step 3: Check gate status in CI
-
-```python
-import asyncio
-import sys
-from attractor.pipeline.engine import PipelineEngine
-from attractor.pipeline.goals import GoalGate
-from attractor.pipeline.handlers import create_default_registry
-from attractor.pipeline.parser import parse_dot_file
-
-pipeline = parse_dot_file("release.dot")
-registry = create_default_registry(pipeline=pipeline)
-
-gate = GoalGate(
-    required_nodes=["build", "test", "security_scan"],
-    context_conditions=["exit_code == 0"],
-)
-
-engine = PipelineEngine(registry=registry, goal_gate=gate)
-ctx = asyncio.run(engine.run(pipeline))
-
-if ctx.has("_goal_gate_unmet"):
-    for issue in ctx.get("_goal_gate_unmet", []):
-        print(f"UNMET: {issue}", file=sys.stderr)
-    sys.exit(1)
-```
-
-### Troubleshooting
-
-**Problem**: Gate reports a required node as unmet even though the DOT file includes it
-**Cause**: The pipeline took a conditional branch that skipped the node.
-**Solution**: Ensure all branches of the pipeline lead through the required nodes, or restructure the graph so required nodes are on the critical path.
-
-**Problem**: `_goal_gate_unmet` is set but execution continued to the terminal node
-**Cause**: The gate logs a warning but does not halt execution. This is by design — the gate enforces post-run checking, not mid-pipeline blocking.
-**Solution**: Check `_goal_gate_unmet` after `engine.run()` returns and raise a non-zero exit code accordingly.
-
----
-
-## 9. How to Configure Middleware
-
-> **Goal**: Intercept and transform LLM requests and responses for logging, token tracking, or content modification.
+> **Goal**: Intercept and transform LLM requests and responses for logging, token tracking, caching, or content modification.
+> **Use case**: Tracking token usage across a pipeline run, or redacting PII from prompts before sending.
 > **Time required**: 15 minutes
 
 ### How middleware works
@@ -943,28 +1407,9 @@ Middleware forms a pipeline around every `LLMClient.complete()` call:
 
 This mirrors standard middleware stack semantics (first-in, last-out on the response side).
 
-### Built-in middleware
+### Step 1: Implement the Middleware protocol
 
-```python
-from attractor.llm.middleware import LoggingMiddleware, TokenTrackingMiddleware
-from attractor.llm.client import LLMClient
-import logging
-
-tracker = TokenTrackingMiddleware()
-
-client = LLMClient(middleware=[
-    LoggingMiddleware(log_level=logging.DEBUG),
-    tracker,
-])
-
-# After running requests:
-print(f"Total input tokens: {tracker.total_usage.input_tokens}")
-print(f"Total output tokens: {tracker.total_usage.output_tokens}")
-```
-
-### Write a custom middleware
-
-Implement `before_request` and `after_response`. Both must be `async` and return the (potentially modified) request or response:
+Both methods must be `async` and must return the (potentially modified) request or response:
 
 ```python
 from __future__ import annotations
@@ -973,422 +1418,254 @@ import time
 from attractor.llm.models import Request, Response
 
 
-class LatencyBudgetMiddleware:
-    """Abort requests that take longer than a budget."""
+class LatencyTrackingMiddleware:
+    """Log wall-clock time for each LLM call."""
 
-    def __init__(self, max_latency_ms: float = 30_000) -> None:
-        self._max_ms = max_latency_ms
+    def __init__(self) -> None:
         self._start: float = 0.0
+        self.latencies: list[float] = []
 
     async def before_request(self, request: Request) -> Request:
         self._start = time.monotonic()
-        return request
+        return request  # always return the request
 
     async def after_response(self, response: Response) -> Response:
         elapsed_ms = (time.monotonic() - self._start) * 1000
-        if elapsed_ms > self._max_ms:
-            import warnings
-            warnings.warn(
-                f"LLM call exceeded latency budget: {elapsed_ms:.0f}ms > {self._max_ms:.0f}ms"
-            )
-        return response
-
-
-class ContentRedactionMiddleware:
-    """Strip PII patterns from request messages before sending."""
-
-    import re
-    _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-
-    async def before_request(self, request: Request) -> Request:
-        from attractor.llm.models import TextContent
-        for msg in request.messages:
-            for part in msg.content:
-                if isinstance(part, TextContent):
-                    part.text = self._EMAIL_RE.sub("[REDACTED_EMAIL]", part.text)
-        return request
-
-    async def after_response(self, response: Response) -> Response:
-        return response
+        self.latencies.append(elapsed_ms)
+        print(f"LLM call: {elapsed_ms:.0f}ms | model={response.model}")
+        return response  # always return the response
 ```
 
-Register alongside built-in middleware:
+### Step 2: Register middleware with LLMClient
 
 ```python
+from attractor.llm.client import LLMClient
+
+tracker = LatencyTrackingMiddleware()
+
 client = LLMClient(middleware=[
-    LoggingMiddleware(),
-    LatencyBudgetMiddleware(max_latency_ms=20_000),
-    ContentRedactionMiddleware(),
     tracker,
 ])
+
+# After running requests:
+avg = sum(tracker.latencies) / len(tracker.latencies)
+print(f"Average latency: {avg:.0f}ms over {len(tracker.latencies)} calls")
 ```
 
-### Caching middleware example
+### Step 3: Chain multiple middleware
 
 ```python
-import hashlib
-import json
-from attractor.llm.models import Request, Response
+from attractor.llm.middleware import LoggingMiddleware, TokenTrackingMiddleware
+import logging
 
+token_tracker = TokenTrackingMiddleware()
 
-class SimpleCacheMiddleware:
-    """In-memory response cache keyed on request content."""
+client = LLMClient(middleware=[
+    LoggingMiddleware(log_level=logging.DEBUG),  # runs first on request
+    LatencyTrackingMiddleware(),
+    token_tracker,                                # runs last on request
+    # On response: token_tracker -> LatencyTrackingMiddleware -> LoggingMiddleware
+])
 
-    def __init__(self) -> None:
-        self._cache: dict[str, Response] = {}
-        self._pending_key: str = ""
-
-    def _key(self, request: Request) -> str:
-        payload = {
-            "model": request.model,
-            "messages": [
-                {"role": m.role.value, "text": m.text()}
-                for m in request.messages
-            ],
-        }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-
-    async def before_request(self, request: Request) -> Request:
-        self._pending_key = self._key(request)
-        return request
-
-    async def after_response(self, response: Response) -> Response:
-        self._cache[self._pending_key] = response
-        return response
-
-    def get_cached(self, request: Request) -> Response | None:
-        return self._cache.get(self._key(request))
+# After running:
+print(f"Total input tokens:  {token_tracker.total_usage.input_tokens}")
+print(f"Total output tokens: {token_tracker.total_usage.output_tokens}")
 ```
+
+### Best Practices
+
+- Always `return request` at the end of `before_request`, even if the request is unmodified.
+- Always `return response` at the end of `after_response`, even if the response is unmodified.
+- Keep middleware stateless where possible. Stateful middleware (like `LatencyTrackingMiddleware` above) must handle concurrent calls carefully if `LLMClient` is shared across async tasks.
 
 ### Troubleshooting
 
 **Problem**: `before_request` modifies the request but the change is not visible to the adapter
-**Cause**: The middleware did not return the modified request object.
-**Solution**: Always `return request` at the end of `before_request`, even if unchanged.
+**Cause**: The middleware returned the original request object instead of the modified one, or forgot to return at all.
+**Solution**: Ensure `before_request` always returns the (modified) request at the end of the method.
 
 **Problem**: Middleware order produces unexpected results
-**Solution**: Log in both hooks to trace execution order. Remember: `before_request` runs A→B→C, `after_response` runs C→B→A.
+**Solution**: Log in both hooks to trace execution order. Remember: given middleware `[A, B, C]`, `before_request` runs A → B → C, `after_response` runs C → B → A.
 
 ---
 
-## 10. How to Use the Agent Programmatically
+## 16. How to Debug Edge Routing
 
-> **Goal**: Drive the agent from Python code, consuming events as they stream in.
-> **Time required**: 15 minutes
-
-### Prerequisites
-
-- A provider API key in the environment
-- The `anthropic` or `openai` package installed
-
-### Step 1: Assemble a Session
-
-```python
-from attractor.agent.session import Session, SessionConfig
-from attractor.agent.environment import LocalExecutionEnvironment
-from attractor.agent.profiles.anthropic_profile import AnthropicProfile
-from attractor.llm.client import LLMClient
-
-profile = AnthropicProfile()
-env = LocalExecutionEnvironment(working_dir="/path/to/your/project")
-config = SessionConfig(
-    model_id="claude-opus-4-6",
-    max_turns=50,
-    default_command_timeout_ms=30_000,
-    enable_loop_detection=True,
-)
-llm_client = LLMClient()
-
-session = Session(
-    profile=profile,
-    environment=env,
-    config=config,
-    llm_client=llm_client,
-)
-```
-
-### Step 2: Submit a prompt and consume events
-
-`Session.submit()` is an async generator — iterate it to receive `AgentEvent` objects as the agent works.
-
-```python
-import asyncio
-from attractor.agent.events import AgentEventType
-
-async def run_agent(session: Session, prompt: str) -> str:
-    final_text = ""
-
-    async for event in session.submit(prompt):
-        match event.type:
-            case AgentEventType.TOOL_CALL_START:
-                print(f"  [tool] {event.data['tool_name']}({event.data['arguments']})")
-
-            case AgentEventType.TOOL_CALL_END:
-                status = "error" if event.data.get("is_error") else "ok"
-                print(f"  [tool done] {event.data['tool_name']} -> {status}")
-
-            case AgentEventType.ASSISTANT_TEXT_DELTA:
-                print(event.data["text"], end="", flush=True)
-
-            case AgentEventType.ASSISTANT_TEXT_END:
-                final_text = event.data["text"]
-
-            case AgentEventType.ERROR:
-                print(f"  [error] {event.data['error']}")
-
-            case AgentEventType.LOOP_DETECTION:
-                print(f"  [warning] {event.data['warning']}")
-
-    return final_text
-
-
-asyncio.run(run_agent(session, "Refactor the database module to use connection pooling."))
-```
-
-### AgentEvent types reference
-
-| Event type             | When it fires                                    | Key `data` fields                            |
-|------------------------|--------------------------------------------------|----------------------------------------------|
-| `SESSION_START`        | Begin of `submit()`                              | `state`                                      |
-| `USER_INPUT`           | User message appended to history                 | `text`                                       |
-| `TOOL_CALL_START`      | Before a tool executes                           | `tool_name`, `tool_call_id`, `arguments`     |
-| `TOOL_CALL_OUTPUT_DELTA` | Tool output available (truncated)              | `tool_call_id`, `output`                     |
-| `TOOL_CALL_END`        | After a tool executes                            | `tool_name`, `output`, `full_output`, `is_error` |
-| `ASSISTANT_TEXT_START` | Model produced a text-only response              |                                              |
-| `ASSISTANT_TEXT_DELTA` | Text content                                     | `text`                                       |
-| `ASSISTANT_TEXT_END`   | All text delivered                               | `text`                                       |
-| `TURN_LIMIT`           | Max turns or tool rounds reached                 | `turns`, `limit`                             |
-| `LOOP_DETECTION`       | Repeated tool call pattern detected              | `warning`                                    |
-| `STEERING_INJECTED`    | Steering message injected mid-loop               | `text`                                       |
-| `ERROR`                | Unhandled exception in session or LLM call       | `error`, `phase`                             |
-| `SESSION_END`          | End of `submit()`                                | `state`                                      |
-
-### Sending follow-up prompts
-
-The session maintains conversation history across multiple `submit()` calls:
-
-```python
-async def multi_turn() -> None:
-    async for _ in session.submit("Add type annotations to utils.py"):
-        pass  # consume first task
-
-    # Session history is preserved; this is a continuation
-    async for event in session.submit("Now write tests for the same file"):
-        if event.type == AgentEventType.ASSISTANT_TEXT_END:
-            print(event.data["text"])
-```
-
-### Step 3: Shut down the session
-
-```python
-await session.shutdown()
-```
-
-This marks the session as `CLOSED` and calls `environment.cleanup()`.
-
-### Troubleshooting
-
-**Problem**: `RuntimeError: Session is closed`
-**Solution**: Create a new `Session` instance. Sessions cannot be reused after `shutdown()`.
-
-**Problem**: The agent loops on the same tool call repeatedly
-**Cause**: Loop detection fires after 3 repetitions of the same tool call fingerprint.
-**Solution**: `LOOP_DETECTION` events carry a `warning` message that is injected into the conversation as a system warning. If the agent still loops, lower `max_turns` in `SessionConfig` or increase `max_tool_rounds_per_input`.
-
----
-
-## 11. How to Use Structured Output
-
-> **Goal**: Have the LLM return a JSON object conforming to a schema rather than free text.
+> **Goal**: Diagnose why the pipeline is taking the wrong branch, getting stuck, or failing with "no matching edge".
+> **Use case**: A condition never evaluates to `true` even though you expect it to.
 > **Time required**: 10 minutes
 
-### When to use this
+### How edge evaluation works (detailed)
 
-Use `generate_object()` when you need a machine-readable result from the LLM — for example, a structured analysis report, a list of extracted items, or a classification with confidence scores.
+After a node completes:
+1. The engine collects all outgoing edges from the completed node.
+2. Edges are sorted by `weight` descending (higher weight = evaluated first).
+3. The engine evaluates each edge's `condition` expression against the current `PipelineContext`.
+4. The first edge whose condition evaluates to `true` wins.
+5. Edges with no `condition` attribute match unconditionally and act as the fallback.
+6. If no edge matches and the node is not terminal, execution fails with an error.
 
-### Step 1: Define a JSON Schema
+### Step 1: Print the context after each node
 
-```python
-schema = {
-    "type": "object",
-    "properties": {
-        "severity": {
-            "type": "string",
-            "enum": ["low", "medium", "high", "critical"],
-        },
-        "affected_files": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "summary": {
-            "type": "string",
-        },
-        "estimated_fix_hours": {
-            "type": "number",
-        },
-    },
-    "required": ["severity", "affected_files", "summary"],
-}
+Run with `--verbose` to see the context table after each node completes:
+
+```bash
+attractor run pipeline.dot --verbose
 ```
 
-### Step 2: Call generate_object
+Look for your expected context key in the printed table. If it is missing or has an unexpected value, the upstream node did not set it correctly.
 
-```python
-import asyncio
+### Step 2: Check condition syntax
+
+The condition parser supports only `=`, `!=`, and `&&`. Common mistakes:
+
+```dot
+# WRONG — == is not supported
+review -> done [condition="approved == true"]
+
+# WRONG — and is not supported
+review -> done [condition="approved = true and score = high"]
+
+# WRONG — > is not supported
+review -> retry [condition="retries > 3"]
+
+# CORRECT
+review -> done  [condition="approved = true"]
+review -> done  [condition="approved = true && score = high"]
+```
+
+### Step 3: Check weight ordering
+
+Higher weight is evaluated first. If two edges match, only the higher-weight one executes:
+
+```dot
+# Edge with weight=2 is evaluated before weight=1
+node -> fast_path [condition="status = done"  weight=2]
+node -> slow_path [condition="status != done" weight=1]
+node -> fallback                               # weight=0 (default), unconditional
+```
+
+**Common mistake**: Setting all edges to the same weight (or leaving all at the default `0`). When weights are equal, evaluation order is undefined. Use distinct weights to make priority explicit.
+
+### Step 4: Verify variable names match context keys
+
+Condition variables resolve from `PipelineContext` by exact bare name. There is no `$` prefix or `{}` wrapper in conditions (those are for prompt interpolation only).
+
+```dot
+# Context key set by handler: "tests_passed"
+# Condition variable: tests_passed (bare name, no prefix)
+verify -> done [condition="tests_passed = true"]
+```
+
+### Troubleshooting
+
+**Problem**: Pipeline halts with "no matching edge" error
+**Solution**: Add an unconditional fallback edge (no `condition` attribute) as the lowest-weight exit:
+
+```dot
+some_node -> error_handler  # no condition = always matches if nothing else did
+```
+
+**Problem**: Edge condition uses a value that was set by an earlier node but is now stale
+**Cause**: `PipelineContext` is cumulative — values set in earlier nodes persist unless overwritten.
+**Solution**: Upstream nodes should explicitly reset or overwrite context keys if you need fresh values on each iteration. Design loops so the classification node always overwrites the routing key.
+
+**Problem**: `condition="severity = \"high\""` causes a DOT parse error
+**Cause**: Escaped quotes inside DOT attribute values can be finicky depending on the DOT writer.
+**Solution**: Use single-quoted DOT attribute values to avoid escaping: `condition='severity = "high"'`.
+
+---
+
+## 17. How to Handle Common Errors
+
+> **Goal**: Diagnose and resolve the most frequently encountered errors in Attractor.
+> **Time required**: Varies by error
+
+### Error: `No provider adapter found for model '...'`
+
+**Symptoms**: `attractor run` fails immediately or a pipeline node fails with this message.
+**Cause**: No loaded adapter's `detect_model()` matched the model string, or the provider SDK is not installed.
+
+**Solution**:
+```bash
+# Verify SDK is installed
+pip show anthropic openai google-genai
+
+# Verify API key is set
+echo $ANTHROPIC_API_KEY   # for Claude models
+echo $OPENAI_API_KEY      # for GPT/o-series models
+echo $GOOGLE_API_KEY      # for Gemini models
+
+# Enable debug logging to see which adapters loaded
+python -c "
+import logging
+logging.basicConfig(level=logging.DEBUG)
 from attractor.llm.client import LLMClient
-
-client = LLMClient()
-
-result = asyncio.run(client.generate_object(
-    prompt="Analyze this Python traceback and classify the bug:\n\n" + traceback_text,
-    model="gpt-4o",
-    schema=schema,
-    schema_name="bug_report",
-    strict=True,
-))
-
-print(result["severity"])           # "high"
-print(result["affected_files"])     # ["src/auth.py", "src/db.py"]
-print(result["summary"])            # "Token expiry not checked..."
+LLMClient()
+"
 ```
 
-### Step 3: Use a list of messages for multi-turn context
+### Error: `No start node found`
 
-```python
-from attractor.llm.models import Message
+**Symptoms**: Validation or run fails immediately.
+**Cause**: No node has `shape=Mdiamond` and no node is named `"start"` (case-insensitive).
 
-messages = [
-    Message.user("Here is the codebase structure:\n" + structure),
-    Message.assistant("Understood. I've analyzed the structure."),
-    Message.user("Now classify the bug severity from this traceback:\n" + traceback_text),
-]
+**Solution**: Add `shape=Mdiamond` to your entry node, or rename it to `start`:
 
-result = asyncio.run(client.generate_object(
-    prompt=messages,
-    model="claude-opus-4-6",
-    schema=schema,
-    schema_name="bug_report",
-))
+```dot
+start [shape=Mdiamond]
+# OR
+start []  # name "start" is detected case-insensitively
 ```
 
-### Troubleshooting
+### Error: `Invalid condition syntax` on an edge
 
-**Problem**: `ValueError: Model output is not valid JSON`
-**Cause**: The model produced text that could not be parsed as JSON — often a preamble before the JSON object.
-**Solution**: Use `strict=True` (the default). If the provider does not support strict structured output, add explicit instructions to the prompt: `"Respond only with a valid JSON object. No prose, no markdown."`.
+**Symptoms**: Validation fails and reports a specific edge.
+**Cause**: Using unsupported operators or syntax in a condition expression.
 
-**Problem**: Provider returns `400 Bad Request` for `response_format`
-**Cause**: Not all models and providers support JSON schema-constrained output (e.g., some Gemini model versions).
-**Solution**: Check the provider's documentation for structured output support. Fall back to prompt-based JSON extraction with a regular `generate()` call and manual `json.loads()`.
+**Solution**: Check the condition for:
+- `==` (use `=` instead)
+- `and` / `or` / `not` (use `&&` for AND; restructure for OR/NOT)
+- `<`, `>`, `<=`, `>=` (not supported — use categorical context values instead)
+
+### Error: Agent tool call returns `is_error=True`
+
+**Symptoms**: A tool call event shows an error. The agent may retry or halt.
+**Cause**: The tool execution failed (file not found, shell command failed, etc.).
+
+**Solution**: Inspect the `output` field of the `TOOL_CALL_END` event for the specific error message. Common causes:
+- `read_file`: File path does not exist. Have the agent call `glob` first to find the file.
+- `edit_file`: The `old_string` does not appear verbatim. Have the agent call `read_file` first.
+- `shell`: Command not found or permission denied. Check that the command is available in the working directory.
+
+### Error: `CodergenHandler fallback: agent.Session could not be imported`
+
+**Symptoms**: Pipeline nodes complete instantly with no LLM output.
+**Cause**: `agent.Session` import failed (missing dependency). The handler falls back to an echo stub.
+**Solution**: Ensure the full Attractor package is installed, not just the pipeline submodule:
+
+```bash
+pip install -e ".[full]"
+# or
+bash .claude/scripts/install.sh
+```
+
+### Error: Anthropic `400 Bad Request` about message alternation
+
+**Symptoms**: API request to Anthropic fails with a 400 error mentioning "message alternation" or "consecutive messages".
+**Cause**: The Anthropic API requires strict `user/assistant/user/assistant` alternation. The built-in adapter inserts synthetic placeholder messages, but something bypassed it.
+**Solution**: If you are calling `LLMClient` directly with a hand-constructed `Request`, ensure messages alternate between `Role.USER` and `Role.ASSISTANT`. The `AnthropicAdapter` will insert placeholders for consecutive same-role messages automatically, but verify you are routing through the adapter (not calling the Anthropic SDK directly).
 
 ---
 
-## 12. How to Manage Subagents
+## Related Tasks
 
-> **Goal**: Delegate parallel subtasks to child agent sessions from within the main agent's tool loop.
-> **Time required**: 20 minutes
+- [How to Create a Basic Pipeline](#1-how-to-create-a-basic-pipeline) — Start here if you are new to writing DOT pipelines
+- [How to Add Conditional Branching](#2-how-to-add-conditional-branching) — Add routing logic to your pipeline
+- [How to Add a Custom Node Handler](#13-how-to-add-a-custom-node-handler) — Extend Attractor with new handler types
 
-### How subagents work
+## Further Reading
 
-Four tools expose multi-agent coordination to the LLM:
-
-| Tool          | Purpose                                                   |
-|---------------|-----------------------------------------------------------|
-| `spawn_agent` | Create a new subagent working on a delegated task         |
-| `send_input`  | Send a follow-up message to a running subagent            |
-| `wait`        | Block until a subagent completes and return its result    |
-| `close_agent` | Terminate a subagent and free its resources               |
-
-The `spawn_agent` tool is included in `AnthropicProfile` and `OpenAIProfile` by default. Subagent depth is capped by `SessionConfig.max_subagent_depth` (default: 1 level).
-
-### Enabling subagents in a session
-
-```python
-from attractor.agent.session import Session, SessionConfig
-
-config = SessionConfig(
-    model_id="claude-opus-4-6",
-    max_subagent_depth=2,   # allow up to 2 levels of nesting
-)
-```
-
-### What the LLM sees
-
-When the agent calls `spawn_agent`, it receives an `agent_id` back. It can then call `wait(agent_id=...)` to block until the subagent finishes, or `send_input(agent_id=..., message=...)` to steer it mid-run. Finally, `close_agent(agent_id=...)` releases the handle.
-
-A typical LLM-driven multi-agent flow in natural language prompts looks like:
-
-```
-1. spawn_agent(task="Write unit tests for src/auth.py", model="claude-opus-4-6")
-   -> returns agent_id="subagent_a1b2c3d4"
-
-2. spawn_agent(task="Write unit tests for src/db.py", model="claude-opus-4-6")
-   -> returns agent_id="subagent_e5f6a7b8"
-
-3. wait(agent_id="subagent_a1b2c3d4")   -> test output for auth.py
-4. wait(agent_id="subagent_e5f6a7b8")   -> test output for db.py
-
-5. close_agent(agent_id="subagent_a1b2c3d4")
-6. close_agent(agent_id="subagent_e5f6a7b8")
-```
-
-### Monitoring active subagents
-
-```python
-from attractor.agent.tools.subagent import get_active_subagents
-
-active = get_active_subagents()
-for agent_id, handle in active.items():
-    status = "closed" if handle.closed else "running"
-    print(f"{agent_id}: {status}")
-```
-
-### Invoking spawn_agent from Python (bypassing the LLM)
-
-For programmatic use, call the tool function directly:
-
-```python
-import asyncio
-from attractor.agent.tools.subagent import spawn_agent, wait_agent, close_agent
-
-async def delegate_task() -> str:
-    # Spawn
-    spawn_result = await spawn_agent(
-        arguments={"task": "Audit src/ for unused imports", "model": "claude-opus-4-6"},
-        environment=None,
-    )
-    # Extract agent_id from the output message
-    agent_id = spawn_result.output.split("'")[1]
-
-    # Wait for result
-    wait_result = await wait_agent(arguments={"agent_id": agent_id}, environment=None)
-
-    # Close
-    await close_agent(arguments={"agent_id": agent_id}, environment=None)
-
-    return wait_result.output
-
-result = asyncio.run(delegate_task())
-```
-
-### Troubleshooting
-
-**Problem**: `Error: no subagent with id '...'`
-**Cause**: `close_agent` was called before `wait`, or the `agent_id` was mistyped.
-**Solution**: Always `wait()` before `close_agent()` to ensure results are captured. The LLM may concatenate or truncate `agent_id` values — use the exact string returned by `spawn_agent`.
-
-**Problem**: Subagent depth limit exceeded
-**Cause**: `max_subagent_depth` in `SessionConfig` defaults to 1, preventing a subagent from spawning its own subagents.
-**Solution**: Increase `max_subagent_depth` in the parent `SessionConfig`. Be aware that deeper nesting multiplies API costs and increases the chance of runaway loops.
-
-**Problem**: Spawned subagent produces no result (empty `wait()` response)
-**Cause**: The subagent `handle.task` is `None` in the current implementation — `spawn_agent` registers the handle but does not wire an actual `asyncio.Task` unless the `Session` injects one.
-**Solution**: The current `spawn_agent` implementation is a coordination scaffold. For full execution, wire the parent `Session` to create a child `Session` and assign its coroutine to `handle.task` after spawning.
-
----
-
-## Cross-References
-
-- New to Attractor? Start with the [Tutorial](../tutorials/getting-started.md)
-- For complete API details, see [Reference](../reference/api-reference.md)
-- To understand design decisions, read [Explanation](../explanation/architecture.md)
+- **New to Attractor?** Start with the [Getting Started Tutorial](../tutorials/getting-started.md)
+- **Need complete API details?** Check the [API Reference](../reference/api-reference.md)
+- **Want to understand design decisions?** Read the [Architecture Explanation](../explanation/architecture.md)

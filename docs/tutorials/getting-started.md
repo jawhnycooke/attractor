@@ -15,10 +15,10 @@ for at least one provider (Anthropic, OpenAI, or Google Gemini).
 
 You'll define and run three pipelines, each more capable than the last:
 
-1. A single-node pipeline that asks an LLM to write a "Hello, World" Python script.
+1. A single-node pipeline that asks an LLM to write a Python script and save it to disk.
 2. A validated pipeline, so you understand what Attractor checks before it executes.
-3. A three-node pipeline that generates code, reviews it, and finalizes the output —
-   with automatic routing based on whether the review passes.
+3. A three-node pipeline that generates code, reviews it, and routes based on whether
+   the review passes — demonstrating real conditional branching.
 
 Every pipeline is a plain-text `.dot` file. Attractor reads it, walks the graph node
 by node, and sends each node's `prompt` to the LLM through the coding agent. The
@@ -29,7 +29,7 @@ mock work.
 
 ## Before We Start
 
-### Step 0: Check your Python version
+### Check Your Python Version
 
 ```bash
 python3 --version
@@ -39,7 +39,7 @@ python3 --version
 If you see `Python 3.10` or earlier, install a newer version with
 `brew install python@3.13` (macOS) or your system package manager, then come back.
 
-### Step 0b: Set your API key
+### Set Your API Key
 
 Attractor reads API keys from environment variables. Export the key for whichever
 provider you have access to:
@@ -60,7 +60,8 @@ permanent, or place it in a `.env` file in your project directory (Attractor loa
 `.env` automatically).
 
 **Checkpoint**: Run `echo $ANTHROPIC_API_KEY` (or whichever key you set). You should
-see a non-empty string. If you see nothing, the export did not take effect.
+see a non-empty string. If you see nothing, the export did not take effect — close and
+reopen your terminal, then re-run the export command.
 
 ---
 
@@ -113,37 +114,43 @@ Commands:
 
 **Checkpoint**: You see the three subcommands listed above. If you see
 `command not found: attractor`, make sure the virtual environment is activated
-(`source .venv/bin/activate`).
+(`source .venv/bin/activate`) and try again.
 
 ---
 
 ## Step 2: Your First Pipeline — One Node
 
 A pipeline is a GraphViz DOT file. Each node in the graph becomes a step that
-Attractor executes. The simplest possible pipeline has one node and no edges.
+Attractor executes. The simplest possible pipeline has one start node and one exit
+node connected by an edge.
 
 Create a file called `hello.dot`:
 
 ```dot
 digraph hello_pipeline {
-    start [
-        handler="codergen"
+    start [shape=Mdiamond]
+    write_script [
+        type="codergen"
         prompt="Write a Python script named hello.py that prints 'Hello, Attractor!' and save it to disk."
-        start=true
-        terminal=true
     ]
+    done [shape=Msquare]
+
+    start -> write_script
+    write_script -> done
 }
 ```
 
 What this file says:
 
 - `digraph hello_pipeline` — the pipeline is named `hello_pipeline`.
-- `start` — the node name. Because it is also named `"start"`, Attractor recognizes
-  it as the entry point automatically (or you can use the `start=true` attribute
-  explicitly, as shown here).
-- `handler="codergen"` — use the built-in coding agent to execute this node.
+- `start [shape=Mdiamond]` — the diamond shape marks this as the entry point. Attractor
+  detects the start node either by `shape=Mdiamond` or by the node being named `start`
+  (case-insensitive). Both are true here, which is fine.
+- `type="codergen"` — use the built-in coding agent to execute this node. This is the
+  attribute name the parser recognizes. Do not use `handler=` — it will be ignored.
 - `prompt="..."` — the instruction passed to the LLM.
-- `terminal=true` — this is the last node; stop the pipeline here.
+- `done [shape=Msquare]` — the square shape marks this as a terminal node. Attractor
+  stops after completing a terminal node.
 
 Run the pipeline. Replace `claude-opus-4-6` with a model name that matches your API
 key:
@@ -160,24 +167,28 @@ attractor run hello.dot --model gemini-2.0-flash --verbose
 ```
 
 You will see structured log output as the agent works. When it finishes, Attractor
-prints a "Final Context" table:
+prints a summary:
 
 ```
 Running pipeline: hello_pipeline
-INFO  Executing node 'start' (handler: codergen)
+INFO  Executing node 'start' (handler: start)
+INFO  Executing node 'write_script' (handler: codergen)
 ...
 Pipeline completed.
               Final Context
 ┌──────────────────────────┬─────────────────────────────┐
 │ Key                      │ Value                       │
 ├──────────────────────────┼─────────────────────────────┤
-│ _completed_nodes         │ ['start']                   │
+│ _completed_nodes         │ ['start', 'write_script',   │
+│                          │  'done']                    │
 │ last_codergen_output     │ I've created hello.py ...   │
 └──────────────────────────┴─────────────────────────────┘
 ```
 
-**What just happened**: Attractor parsed `hello.dot`, sent the prompt to the LLM via
-the coding agent, and the agent wrote `hello.py` to your working directory.
+**What just happened**: Attractor parsed `hello.dot`, walked from `start` to
+`write_script`, sent the prompt to the LLM via the coding agent, and the agent wrote
+`hello.py` to your working directory. Then the engine advanced to `done`, recognized
+it as terminal, and stopped.
 
 **Checkpoint**: Run `python3 hello.py`. You should see:
 
@@ -186,7 +197,7 @@ Hello, Attractor!
 ```
 
 If `hello.py` does not exist, check the terminal output for errors. The most common
-cause is a missing or invalid API key.
+cause is a missing or invalid API key (see Troubleshooting at the end of this tutorial).
 
 ---
 
@@ -211,16 +222,18 @@ Now try the strict flag, which also treats warnings as errors:
 attractor validate hello.dot --strict
 ```
 
-If the pipeline passes both checks, you'll see the same green message and exit code
-zero. Let's deliberately introduce a problem so you can see what validation failure
-looks like. Create a broken file called `broken.dot`:
+If the pipeline passes both checks, you'll see the same message and exit code zero.
+Let's deliberately introduce a problem so you can see what a validation failure looks
+like. Create a broken file called `broken.dot`:
 
 ```dot
 digraph broken {
-    generate [handler="codergen" prompt="Do something." start=true]
-    review   [handler="badhandler"  prompt="Review it."]
-    orphan   [handler="codergen"  prompt="Nobody reaches me." terminal=true]
+    start [shape=Mdiamond]
+    generate [type="codergen" prompt="Do something."]
+    review   [type="badhandler" prompt="Review it."]
+    orphan   [type="codergen" prompt="Nobody reaches me." shape=Msquare]
 
+    start -> generate
     generate -> review
     review -> nonexistent_node
 }
@@ -228,7 +241,7 @@ digraph broken {
 
 This pipeline has three problems: `review` uses an unknown handler type
 (`badhandler`), an edge targets a node that does not exist (`nonexistent_node`),
-and `orphan` is unreachable from the start.
+and `orphan` is unreachable from `start`.
 
 ```bash
 attractor validate broken.dot
@@ -255,10 +268,44 @@ with `echo $?` immediately after — it should print `0`.
 
 ---
 
-## Step 4: A Multi-Node Pipeline with Condition Routing
+## Step 4: Understanding the Context (the Blackboard)
 
-Real workflows have multiple steps. This pipeline generates a Python script, asks the
-LLM to review it, and then routes based on whether the review passed:
+Before building a branching pipeline, you need to understand how Attractor passes
+information between nodes.
+
+Every pipeline has a shared **context** — a key-value store that all nodes can read
+from and write to. Think of it as a whiteboard in the room where all the nodes meet.
+When a node finishes, it can write values to the context. The next node can read those
+values via prompt interpolation, and edges can read those values in their conditions.
+
+Here is a quick reference for the keys you'll see most often:
+
+| Key | Set by | Meaning |
+|---|---|---|
+| `last_codergen_output` | `codergen` handler | The text response from the LLM at the most recent `codergen` node. |
+| `_completed_nodes` | Engine | Ordered list of node names that finished successfully. |
+| `_last_error` | Engine | The error message from the most recent failed node, if any. |
+| `_failed_node` | Engine | The name of the node that last failed, if any. |
+
+Keys starting with `_` are internal engine keys. Your pipeline conditions and prompts
+reference the non-underscore keys by their bare names.
+
+**Prompt interpolation**: Within a node's `prompt` attribute, use `{key}` to insert a
+context value. For example, `prompt="The previous result was: {last_codergen_output}"`
+will have the value substituted at execution time.
+
+**Edge conditions**: Conditions reference context keys by bare name with no `$` or `{}`
+wrapping. The condition language supports only `=`, `!=`, and `&&`. It does not
+support `==`, `<`, `>`, `<=`, `>=`, `and`, `or`, or `not`. This is intentional —
+conditions are kept deliberately simple.
+
+---
+
+## Step 5: A Multi-Node Pipeline with Condition Routing
+
+Real workflows have multiple steps and make decisions. This pipeline generates a Python
+function, asks the LLM to review it, and then routes based on whether the review
+passed:
 
 - If the review passes, execution moves to a `finalize` node.
 - If the review fails, execution loops back to `generate` for another attempt.
@@ -268,38 +315,45 @@ Create `review_pipeline.dot`:
 ```dot
 digraph review_pipeline {
 
+    start [shape=Mdiamond]
+
     generate [
-        handler="codergen"
+        type="codergen"
         prompt="Write a Python function named add(a, b) that returns the sum of two numbers. Save it to add.py."
-        start=true
     ]
 
     review [
-        handler="codergen"
-        prompt="Read add.py and check that it has a function named add() with correct logic. If it looks correct, respond ONLY with the word: PASS. If there is a problem, respond ONLY with the word: FAIL."
+        type="codergen"
+        prompt="Read add.py and check that it has a function named add() with correct logic. If it looks correct, respond ONLY with the single word: PASS. If there is a problem, respond ONLY with the single word: FAIL. No punctuation, no explanation — just the word."
     ]
 
     finalize [
-        handler="codergen"
+        type="codergen"
         prompt="The code review passed. Write a short summary to summary.txt confirming that add.py is correct."
-        terminal=true
+        shape=Msquare
     ]
 
+    start -> generate
     generate -> review
-    review -> finalize  [condition="last_codergen_output == 'PASS'" priority=1]
-    review -> generate  [condition="last_codergen_output == 'FAIL'" priority=2]
+    review -> finalize  [condition="last_codergen_output = PASS" weight=1]
+    review -> generate  [condition="last_codergen_output = FAIL" weight=2]
 }
 ```
 
 Key things to notice:
 
 - Each node has its own `prompt`.
-- Edges have `condition` attributes. Attractor evaluates them against the shared
-  pipeline context. The `last_codergen_output` key is automatically set by the
-  `codergen` handler after each node completes.
-- `priority=1` means that edge is evaluated first. The first condition that evaluates
-  to `true` wins.
-- The `finalize` node has `terminal=true`, so the pipeline stops there.
+- The `review` node instructs the LLM to respond with a single word so that the
+  condition check is reliable.
+- Edges have `condition` attributes. Attractor evaluates them against the pipeline
+  context. `last_codergen_output` is automatically set by the `codergen` handler.
+- The condition operator is `=` (single equals), not `==`. Using `==` will cause a
+  parse error.
+- `weight=2` means that edge has higher priority. Outgoing edges are sorted by weight
+  (higher number = evaluated first). When no weight is set, edges have equal priority
+  and Attractor picks the first matching one.
+- `finalize` uses both `type="codergen"` and `shape=Msquare` to be both a codergen
+  node and a terminal node.
 
 Run it:
 
@@ -307,56 +361,33 @@ Run it:
 attractor run review_pipeline.dot --model claude-opus-4-6 --verbose
 ```
 
-Watch the log output. You will see the engine move from `generate` to `review`, then
-evaluate the condition on the outgoing edges, and route to `finalize` or back to
-`generate` depending on the LLM's response.
+Watch the log output. You will see the engine move from `start` to `generate` to
+`review`, evaluate the conditions on the outgoing edges, and route to `finalize` or
+back to `generate` depending on the LLM's response.
 
 Expected final output when the review passes on the first try:
 
 ```
 Pipeline completed.
               Final Context
-┌──────────────────────────┬──────────────────────────────────────┐
-│ Key                      │ Value                                │
-├──────────────────────────┼──────────────────────────────────────┤
-│ _completed_nodes         │ ['generate', 'review', 'finalize']  │
-│ last_codergen_output     │ I've written a short summary to ...  │
-└──────────────────────────┴──────────────────────────────────────┘
+┌──────────────────────────┬──────────────────────────────────────────────┐
+│ Key                      │ Value                                        │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ _completed_nodes         │ ['start', 'generate', 'review', 'finalize'] │
+│ last_codergen_output     │ I've written a short summary to ...          │
+└──────────────────────────┴──────────────────────────────────────────────┘
 ```
 
-**Checkpoint**: `add.py` and `summary.txt` both exist in your working directory. Open
-them to confirm the LLM did real work.
-
----
-
-## Step 5: Understanding the Final Context Table
-
-Every time a pipeline completes, Attractor prints the Final Context table. This is
-the shared "blackboard" that all nodes read from and write to during execution.
-
-Here is what the keys mean:
-
-| Key | Set by | Meaning |
-|---|---|---|
-| `last_codergen_output` | `codergen` handler | The text response from the LLM at the most recent `codergen` node. |
-| `_completed_nodes` | Engine | Ordered list of node names that finished successfully. |
-| `_last_error` | Engine | The error message from the most recent failed node (if any). |
-| `_failed_node` | Engine | The name of the node that last failed (if any). |
-
-Keys starting with `_` are internal engine keys. Your own pipeline conditions and
-prompts should reference the non-underscore keys by their bare names (for example,
-`last_codergen_output == 'PASS'`).
-
-The table is truncated at 200 characters per value to keep it readable. Long outputs
-from the agent are stored in full in the checkpoint file.
+**Checkpoint**: Both `add.py` and `summary.txt` exist in your working directory. Open
+them to confirm the LLM did real work. Run `python3 -c "from add import add; print(add(2, 3))"` — it should print `5`.
 
 ---
 
 ## Step 6: Resuming from a Checkpoint
 
 Attractor saves a checkpoint file after each node completes. If a pipeline is
-interrupted — by a network error, a rate limit, or you pressing Ctrl+C — you can
-resume from where it left off instead of starting over.
+interrupted — by a network error, a rate limit, or pressing Ctrl+C — you can resume
+from where it left off instead of starting over.
 
 Checkpoints are saved to `.attractor/checkpoints/` by default. Each file is named
 `checkpoint_{timestamp_ms}.json`.
@@ -365,13 +396,12 @@ Checkpoints are saved to `.attractor/checkpoints/` by default. Each file is name
 ls .attractor/checkpoints/
 # checkpoint_1708432100123.json
 # checkpoint_1708432115456.json
-# ...
 ```
 
 Each file captures the pipeline name, the node that was current when the checkpoint
 was written, the full context, and the list of completed nodes.
 
-To resume from the latest checkpoint:
+To resume from a checkpoint:
 
 ```bash
 attractor resume .attractor/checkpoints/checkpoint_1708432115456.json \
@@ -381,7 +411,7 @@ attractor resume .attractor/checkpoints/checkpoint_1708432115456.json \
 
 Replace the filename with an actual file from your checkpoints directory.
 
-Attractor will print:
+Attractor will pick up from the last completed node:
 
 ```
 Resuming pipeline: review_pipeline from node 'review'
@@ -400,18 +430,88 @@ your checkpoints.
 
 ---
 
+## Step 7: A Complete Branching Pipeline — Putting It All Together
+
+Now that you know all the pieces, here is a more complete pipeline that combines
+everything: start/exit nodes, codergen nodes, prompt interpolation, and conditional
+routing with weighted edges.
+
+This pipeline writes a utility script, runs a self-check, and then either finalizes
+or retries based on the outcome.
+
+Create `full_pipeline.dot`:
+
+```dot
+digraph full_pipeline {
+
+    start [shape=Mdiamond]
+
+    write_code [
+        type="codergen"
+        prompt="Write a Python script named calculator.py that defines add(a, b), subtract(a, b), multiply(a, b), and divide(a, b). The divide function should raise ValueError if b is zero. Save the file."
+    ]
+
+    self_check [
+        type="codergen"
+        prompt="Read calculator.py. Run it with: python3 -c \"from calculator import add, subtract, multiply, divide; print(add(2,3)); print(subtract(5,1)); print(multiply(3,4)); print(divide(10,2))\". If all four functions work correctly and the output is 5, 4, 12, 5.0 then respond ONLY with: PASS. Otherwise respond ONLY with: FAIL."
+    ]
+
+    fix_code [
+        type="codergen"
+        prompt="The self-check found a problem. Read calculator.py and fix whatever is wrong. The previous check output was: {last_codergen_output}"
+    ]
+
+    write_docs [
+        type="codergen"
+        prompt="Write a README.md documenting the four functions in calculator.py with example usage."
+        shape=Msquare
+    ]
+
+    start -> write_code
+    write_code -> self_check
+    self_check -> write_docs [condition="last_codergen_output = PASS" weight=2]
+    self_check -> fix_code   [condition="last_codergen_output = FAIL" weight=1]
+    fix_code -> self_check
+}
+```
+
+New things in this pipeline:
+
+- `fix_code` uses prompt interpolation: `{last_codergen_output}` will be replaced with
+  the actual output from the `self_check` node at runtime, so the LLM knows what went
+  wrong.
+- The edge from `self_check` to `write_docs` has `weight=2` (higher priority), so it
+  is evaluated first. The edge to `fix_code` has `weight=1`.
+- `fix_code` loops back to `self_check`, creating a retry cycle. The pipeline only
+  exits when the self-check passes.
+
+Validate it first, then run it:
+
+```bash
+attractor validate full_pipeline.dot --strict
+attractor run full_pipeline.dot --model claude-opus-4-6 --verbose
+```
+
+**Checkpoint**: When the pipeline completes, `calculator.py` and `README.md` both
+exist. The `_completed_nodes` list in the Final Context includes `write_docs`.
+
+---
+
 ## What You've Accomplished
 
-You have:
-
 - Installed Attractor and verified the CLI works.
-- Defined a single-node pipeline as a GraphViz DOT file and ran it against a real
-  LLM, producing an actual file on disk.
-- Used `attractor validate` to check a pipeline for structural errors before running
-  it.
-- Built a three-node pipeline with condition-based routing between nodes.
-- Read and interpreted the Final Context table that Attractor prints after every run.
+- Defined a single-node pipeline as a GraphViz DOT file and ran it against a real LLM,
+  producing an actual file on disk.
+- Used `attractor validate` to check a pipeline for structural errors before running it,
+  and saw what failure output looks like.
+- Learned the DOT attribute names the parser actually recognizes: `type="codergen"`,
+  `shape=Mdiamond` (start), `shape=Msquare` (terminal), `weight=` (edge priority), and
+  `condition=` with the `=` operator.
+- Understood the context (blackboard) and how nodes share information through it.
+- Built a multi-node pipeline with condition-based routing and weighted edges.
 - Used `attractor resume` to pick up a pipeline from its last checkpoint.
+- Built a complete pipeline that combines prompt interpolation, retry loops, and exit
+  conditions.
 
 ---
 
@@ -420,16 +520,17 @@ You have:
 You now have the foundation to build real automation pipelines. Here is where to go
 from here:
 
-- **Solve specific problems**: See [How-to Guides](../how-to/common-tasks.md) for
-  tasks like adding a custom handler, using the `tool` handler to run shell commands,
-  using context interpolation in prompts, and configuring retry policies.
+- **Solve specific problems**: See [How-to Guides](../how-to/common-tasks.md) for tasks
+  like adding a custom handler, using context interpolation in prompts, and configuring
+  retry policies.
 - **Look up CLI flags and DOT attributes**: Browse the
   [Reference Documentation](../reference/api-reference.md) for the complete list of
-  node attributes, edge attributes, handler types, and CLI options.
+  node attributes (`model`, `temperature`, `max_tokens`, `max_retries`, `timeout`),
+  edge attributes, handler types, and CLI options.
 - **Understand how Attractor works inside**: Read
-  [Explanation: Architecture](../explanation/architecture.md) to learn why the
-  pipeline is a DAG, how the agent loop operates, and how the LLM client routes
-  between providers.
+  [Explanation: Architecture](../explanation/architecture.md) to learn why the pipeline
+  is a DAG, how the agentic loop operates, and how the LLM client routes between
+  providers.
 
 ---
 
@@ -437,12 +538,12 @@ from here:
 
 **Problem**: `attractor: command not found`
 **Solution**: The virtual environment is not active. Run `source .venv/bin/activate`
-and try again.
+and try again. You need to activate the environment in every new terminal session.
 
 **Problem**: `No provider adapter found for model 'claude-opus-4-6'`
 **Solution**: The environment variable for that provider is not set. Run
 `echo $ANTHROPIC_API_KEY` to confirm it is exported. If it is empty, re-export it in
-the current shell session.
+the current shell session and try again.
 
 **Problem**: The pipeline completes but `hello.py` (or `add.py`) does not exist.
 **Solution**: The agent may have encountered a permission error or interpreted the
@@ -450,16 +551,22 @@ prompt differently. Run with `--verbose` and look for error lines in the output.
 Check the `_last_error` key in the Final Context table.
 
 **Problem**: The `review` node always routes back to `generate` in an infinite loop.
-**Solution**: The LLM is not responding with exactly `PASS` or `FAIL`. Add
-`--verbose` to see the raw output. Refine the review prompt to make the required
-response format more explicit — for example, add the instruction "Your entire
-response must be a single word with no punctuation or extra text." Condition
-expressions support `==`, `!=`, `<`, `>`, `<=`, `>=`, `and`, `or`, and `not`. There
-is no `in` operator; conditions must use exact equality (`== 'PASS'`).
+**Solution**: The LLM is not responding with exactly `PASS` or `FAIL`. Add `--verbose`
+to see the raw output. Refine the review prompt to make the required response format
+more explicit — for example: "Your entire response must be a single word with no
+punctuation, no explanation, and no extra text. The word must be either PASS or FAIL."
+Condition expressions only support `=`, `!=`, and `&&`. There is no fuzzy matching;
+conditions require exact equality.
+
+**Problem**: `ParseError: unexpected token '=='` or similar condition parse error.
+**Solution**: The condition language uses single `=`, not `==`. Change `condition="x == y"`
+to `condition="x = y"`. The operators `<`, `>`, `<=`, `>=`, `and`, `or`, and `not` are
+also not supported — use only `=`, `!=`, and `&&`.
 
 **Problem**: `Failed to parse pipeline: No start node found`
-**Solution**: Either add `start=true` to one node's attributes, or name one of your
-nodes `start`. Both methods work.
+**Solution**: Add `shape=Mdiamond` to one node's attributes, or name one of your nodes
+`start` (case-insensitive). Both methods work. Do not use `start=true` — that attribute
+is not recognized by the parser.
 
 **Problem**: `Failed to load checkpoint`
 **Solution**: The checkpoint file may be from a different pipeline version. Pass the
