@@ -167,7 +167,10 @@ class OpenAIAdapter:
 
         # User / developer messages
         content = self._map_content_parts(msg.content)
-        role = msg.role.value
+        if msg.role == Role.DEVELOPER:
+            role = "developer"
+        else:
+            role = "user"
         return {"role": role, "content": content}
 
     def _map_content_parts(

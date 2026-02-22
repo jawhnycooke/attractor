@@ -203,12 +203,14 @@ class QueueInterviewer:
         self.messages: list[str] = []
 
     async def ask(self, question: Question) -> Answer:
-        """Return the next pre-queued answer."""
+        """Return the next pre-queued answer, or SKIPPED if the queue is empty."""
+        if self.responses.empty():
+            return Answer(value=AnswerValue.SKIPPED)
         return await self.responses.get()
 
     async def ask_multiple(self, questions: list[Question]) -> list[Answer]:
-        """Return N pre-queued answers."""
-        return [await self.responses.get() for _ in questions]
+        """Return pre-queued answers; SKIPPED for any that exceed the queue."""
+        return [await self.ask(q) for q in questions]
 
     async def inform(self, message: str, stage: str = "") -> None:
         """Record the informational message."""

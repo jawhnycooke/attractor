@@ -216,16 +216,14 @@ class TestCodergenHandler:
 
         assert result.status == OutcomeStatus.SUCCESS
 
-        # Check that prompt.md, response.md, and status.json were written
+        # Check that prompt.md and response.md were written
+        # (status.json is now centralized in the engine per P-P03)
         stage_dir = tmp_path / "test_node"
         assert stage_dir.exists()
         assert (stage_dir / "prompt.md").exists()
         assert (stage_dir / "prompt.md").read_text() == "do stuff"
         assert (stage_dir / "response.md").exists()
         assert "[Simulated]" in (stage_dir / "response.md").read_text()
-        assert (stage_dir / "status.json").exists()
-        status = json.loads((stage_dir / "status.json").read_text())
-        assert status["status"] == "success"
 
     @pytest.mark.asyncio
     async def test_codergen_sets_last_response_context_key(self) -> None:
@@ -405,38 +403,27 @@ class TestToolHandler:
         assert "No tool_command" in (result.failure_reason or "")
 
     @pytest.mark.asyncio
-    async def test_tool_handler_writes_status_file_on_success(self, tmp_path) -> None:
-        """#12: ToolHandler writes status.json on success."""
+    async def test_tool_handler_returns_success_result(self, tmp_path) -> None:
+        """#12: ToolHandler returns correct NodeResult on success (status.json centralized in engine)."""
         handler = ToolHandler()
         node = _make_node(handler_type="tool", tool_command="echo ok")
         ctx = PipelineContext()
 
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.success is True
-
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "success"
-        assert status["node"] == "test_node"
-        assert status["handler"] == "tool"
+        assert result.status == OutcomeStatus.SUCCESS
 
     @pytest.mark.asyncio
-    async def test_tool_handler_writes_status_file_on_failure(self, tmp_path) -> None:
-        """#12: ToolHandler writes status.json on failure."""
+    async def test_tool_handler_returns_failure_result(self, tmp_path) -> None:
+        """#12: ToolHandler returns correct NodeResult on failure (status.json centralized in engine)."""
         handler = ToolHandler()
         node = _make_node(handler_type="tool", tool_command="exit 1")
         ctx = PipelineContext()
 
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.success is False
-
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "fail"
-        assert status["node"] == "test_node"
-        assert status["handler"] == "tool"
+        assert result.status == OutcomeStatus.FAIL
+        assert result.failure_reason is not None
 
     @pytest.mark.asyncio
     async def test_tool_handler_no_status_file_without_logs_root(self) -> None:
@@ -1083,8 +1070,8 @@ class TestManagerLoopHandler:
         assert iteration == 4  # All 4 iterations ran (no early termination)
 
     @pytest.mark.asyncio
-    async def test_manager_loop_writes_status_file_on_success(self, tmp_path) -> None:
-        """#12: ManagerLoopHandler writes status.json on success."""
+    async def test_manager_loop_returns_success_result(self, tmp_path) -> None:
+        """#12: ManagerLoopHandler returns correct NodeResult on success (status.json centralized in engine)."""
         engine = AsyncMock()
         engine.run_sub_pipeline = AsyncMock()
 
@@ -1098,17 +1085,11 @@ class TestManagerLoopHandler:
 
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.success is True
-
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "success"
-        assert status["node"] == "test_node"
-        assert status["handler"] == "stack.manager_loop"
+        assert result.status == OutcomeStatus.SUCCESS
 
     @pytest.mark.asyncio
-    async def test_manager_loop_writes_status_file_on_failure(self, tmp_path) -> None:
-        """#12: ManagerLoopHandler writes status.json on consecutive failure."""
+    async def test_manager_loop_returns_failure_result(self, tmp_path) -> None:
+        """#12: ManagerLoopHandler returns correct NodeResult on consecutive failure (status.json centralized in engine)."""
         engine = AsyncMock()
 
         async def mock_run_sub(name, context):
@@ -1127,13 +1108,9 @@ class TestManagerLoopHandler:
 
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.success is False
-
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "fail"
-        assert "reason" in status
-        assert "consecutive" in status["reason"]
+        assert result.status == OutcomeStatus.FAIL
+        assert result.failure_reason is not None
+        assert "consecutive" in result.failure_reason
 
 
 # ---------------------------------------------------------------------------
@@ -1448,7 +1425,7 @@ class TestCodergenSimulationMode:
 
     @pytest.mark.asyncio
     async def test_simulation_mode_writes_logs(self, tmp_path) -> None:
-        """P-C02: Simulation mode writes prompt.md, response.md, status.json."""
+        """P-C02: Simulation mode writes prompt.md and response.md (status.json centralized in engine)."""
         handler = CodergenHandler(backend=None)
         node = _make_node(
             handler_type="codergen", prompt="build feature", model="gpt-4o"
@@ -1458,16 +1435,13 @@ class TestCodergenSimulationMode:
         result = await handler.execute(node, ctx, logs_root=tmp_path)
 
         assert result.success is True
+        assert result.notes == "simulation mode"
         stage_dir = tmp_path / "test_node"
         assert stage_dir.exists()
         assert (stage_dir / "prompt.md").read_text() == "build feature"
         assert (stage_dir / "response.md").read_text() == (
             "[Simulated] Response for stage: test_node"
         )
-        status = json.loads((stage_dir / "status.json").read_text())
-        assert status["status"] == "success"
-        assert status["node"] == "test_node"
-        assert status["notes"] == "simulation mode"
 
     @pytest.mark.asyncio
     async def test_simulation_mode_no_logs_without_logs_root(self) -> None:
@@ -2873,14 +2847,10 @@ class TestManagerLoopChildPipeline:
         ctx = PipelineContext()
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.status == OutcomeStatus.SUCCESS
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "success"
 
     @pytest.mark.asyncio
-    async def test_child_pipeline_writes_status_on_failure(self, tmp_path) -> None:
-        """P-C11: Status file written on child failure."""
+    async def test_child_pipeline_returns_failure_result(self, tmp_path) -> None:
+        """P-C11: Handler returns FAIL on child failure (status.json centralized in engine)."""
         engine = AsyncMock()
         engine.start_child_pipeline = AsyncMock()
 
@@ -2903,10 +2873,7 @@ class TestManagerLoopChildPipeline:
         ctx = PipelineContext()
         result = await handler.execute(node, ctx, logs_root=tmp_path)
         assert result.status == OutcomeStatus.FAIL
-        status_path = tmp_path / "test_node" / "status.json"
-        assert status_path.exists()
-        status = json.loads(status_path.read_text())
-        assert status["status"] == "fail"
+        assert result.failure_reason is not None
 
     @pytest.mark.asyncio
     async def test_legacy_mode_still_works(self) -> None:

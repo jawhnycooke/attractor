@@ -404,10 +404,6 @@ class CodergenHandler:
             result_text = f"[Simulated] Response for stage: {node.name}"
             if stage_dir is not None:
                 (stage_dir / "response.md").write_text(result_text)
-                (stage_dir / "status.json").write_text(
-                    json.dumps({"status": "success", "node": node.name,
-                                "notes": "simulation mode"})
-                )
             return NodeResult(
                 status=OutcomeStatus.SUCCESS,
                 output=result_text,
@@ -418,12 +414,9 @@ class CodergenHandler:
         try:
             result_text = await backend.run(node, prompt, context)
 
-            # H2: Write response.md and status.json
+            # H2: Write response.md
             if stage_dir is not None:
                 (stage_dir / "response.md").write_text(result_text)
-                (stage_dir / "status.json").write_text(
-                    json.dumps({"status": "success", "node": node.name})
-                )
 
             # H5: Set last_response context key (not last_codergen_output)
             return NodeResult(
@@ -433,11 +426,6 @@ class CodergenHandler:
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
-            if stage_dir is not None:
-                (stage_dir / "status.json").write_text(
-                    json.dumps({"status": "fail", "node": node.name,
-                                "reason": str(exc)})
-                )
             return NodeResult(status=OutcomeStatus.FAIL, failure_reason=str(exc))
 
 
@@ -1197,7 +1185,7 @@ class ToolHandler:
                 timeout=float(node.attributes.get("timeout", 300)),
             )
             success = proc.returncode == 0
-            result = NodeResult(
+            return NodeResult(
                 status=OutcomeStatus.SUCCESS if success else OutcomeStatus.FAIL,
                 output=proc.stdout,
                 failure_reason=proc.stderr if not success else None,
@@ -1208,19 +1196,8 @@ class ToolHandler:
                     "stderr": proc.stderr,
                 },
             )
-            # #12: Write status file
-            if logs_root is not None:
-                _write_status_file(
-                    logs_root,
-                    node,
-                    "success" if success else "fail",
-                    proc.stderr if not success else None,
-                )
-            return result
         except subprocess.TimeoutExpired:
             reason = f"Command timed out: {command}"
-            if logs_root is not None:
-                _write_status_file(logs_root, node, "fail", reason)
             return NodeResult(
                 status=OutcomeStatus.FAIL,
                 failure_reason=reason,
@@ -1228,11 +1205,8 @@ class ToolHandler:
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
-            reason = str(exc)
-            if logs_root is not None:
-                _write_status_file(logs_root, node, "fail", reason)
             return NodeResult(
-                status=OutcomeStatus.FAIL, failure_reason=reason
+                status=OutcomeStatus.FAIL, failure_reason=str(exc)
             )
 
 
@@ -1359,8 +1333,6 @@ class ManagerLoopHandler:
                 if child_outcome == "success" or (
                     child_status == "completed" and child_outcome != "fail"
                 ):
-                    if logs_root is not None:
-                        _write_status_file(logs_root, node, "success")
                     return NodeResult(
                         status=OutcomeStatus.SUCCESS,
                         output=(
@@ -1371,8 +1343,6 @@ class ManagerLoopHandler:
                     )
                 if child_status == "failed":
                     reason = "Child pipeline failed"
-                    if logs_root is not None:
-                        _write_status_file(logs_root, node, "fail", reason)
                     return NodeResult(
                         status=OutcomeStatus.FAIL,
                         failure_reason=reason,
@@ -1383,8 +1353,6 @@ class ManagerLoopHandler:
             if stop_condition and evaluate_condition(
                 stop_condition, context
             ):
-                if logs_root is not None:
-                    _write_status_file(logs_root, node, "success")
                 return NodeResult(
                     status=OutcomeStatus.SUCCESS,
                     output=(
@@ -1399,8 +1367,6 @@ class ManagerLoopHandler:
                 await asyncio.sleep(poll_interval)
 
         reason = f"Max cycles exceeded ({max_cycles})"
-        if logs_root is not None:
-            _write_status_file(logs_root, node, "fail", reason)
         return NodeResult(
             status=OutcomeStatus.FAIL,
             failure_reason=reason,
@@ -1488,8 +1454,6 @@ class ManagerLoopHandler:
                     f"Sub-pipeline failed {consecutive_failures} "
                     f"consecutive times"
                 )
-                if logs_root is not None:
-                    _write_status_file(logs_root, node, "fail", reason)
                 return NodeResult(
                     status=OutcomeStatus.FAIL,
                     failure_reason=reason,
@@ -1497,16 +1461,12 @@ class ManagerLoopHandler:
                 )
 
             if done_condition and evaluate_condition(done_condition, context):
-                if logs_root is not None:
-                    _write_status_file(logs_root, node, "success")
                 return NodeResult(
                     status=OutcomeStatus.SUCCESS,
                     output=f"Manager loop done after {i + 1} iterations",
                     context_updates={"_supervisor_iterations": i + 1},
                 )
 
-        if logs_root is not None:
-            _write_status_file(logs_root, node, "success")
         return NodeResult(
             status=OutcomeStatus.SUCCESS,
             output=f"Manager loop reached max iterations ({max_iterations})",

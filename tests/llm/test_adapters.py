@@ -864,3 +864,235 @@ class TestGeminiRoundTrip:
         fr = contents[2]["parts"][0]["function_response"]
         assert fr["name"] == "grep"
         assert fr["response"] == {"result": "src/main.py:42: # TODO fix this"}
+
+
+# ===============================================================
+# DEVELOPER role mapping (L-P01)
+# ===============================================================
+
+
+class TestOpenAIDeveloperRole:
+    """OpenAI maps DEVELOPER role to 'developer'."""
+
+    def test_developer_role_maps_to_developer(self) -> None:
+        adapter = _make_openai_adapter()
+        msg = Message(role=Role.DEVELOPER, content=[])
+        from attractor.llm.models import TextContent
+        msg.content = [TextContent(text="You are a code reviewer.")]
+        result = adapter._map_message(msg)
+        assert result is not None
+        assert result["role"] == "developer"
+        assert result["content"] == "You are a code reviewer."
+
+    def test_user_role_maps_to_user(self) -> None:
+        adapter = _make_openai_adapter()
+        msg = Message.user("Hello")
+        result = adapter._map_message(msg)
+        assert result is not None
+        assert result["role"] == "user"
+
+
+class TestAnthropicDeveloperRole:
+    """Anthropic maps DEVELOPER role to 'user' (no native developer role)."""
+
+    def test_developer_role_maps_to_user(self) -> None:
+        adapter = _make_anthropic_adapter()
+        from attractor.llm.models import TextContent
+        msg = Message(role=Role.DEVELOPER, content=[TextContent(text="system instructions")])
+        result = adapter._map_message(msg)
+        assert result is not None
+        assert result["role"] == "user"
+
+    def test_user_role_maps_to_user(self) -> None:
+        adapter = _make_anthropic_adapter()
+        msg = Message.user("Hello")
+        result = adapter._map_message(msg)
+        assert result is not None
+        assert result["role"] == "user"
+
+
+class TestGeminiDeveloperRole:
+    """Gemini maps DEVELOPER role to 'user' (no native developer role)."""
+
+    def test_developer_role_maps_to_user(self) -> None:
+        adapter = _make_gemini_adapter()
+        from attractor.llm.models import TextContent
+        msg = Message(role=Role.DEVELOPER, content=[TextContent(text="system instructions")])
+        result = adapter._map_message(msg)
+        assert result is not None
+        assert result["role"] == "user"
+
+    def test_user_role_maps_to_user(self) -> None:
+        adapter = _make_gemini_adapter()
+        msg = Message.user("Hello")
+        result = adapter._map_message(msg)
+        assert result is not None
+        assert result["role"] == "user"
+
+    def test_assistant_role_maps_to_model(self) -> None:
+        adapter = _make_gemini_adapter()
+        msg = Message.assistant("Hi there")
+        result = adapter._map_message(msg)
+        assert result is not None
+        assert result["role"] == "model"
+
+
+# ===============================================================
+# Gemini image URL support (L-P03)
+# ===============================================================
+
+
+class TestGeminiImageURLSupport:
+    """L-P03: Gemini adapter downloads URL images and converts to base64."""
+
+    @pytest.mark.asyncio
+    async def test_url_image_resolved_to_base64(self) -> None:
+        """An ImageContent with a URL is downloaded and sent as inline_data."""
+        from unittest.mock import AsyncMock, patch
+
+        from attractor.llm.models import ImageContent
+
+        adapter = _make_gemini_adapter()
+
+        png_bytes = b"\x89PNG\r\n\x1a\nfake-image-data"
+        import base64
+
+        expected_b64 = base64.b64encode(png_bytes).decode("ascii")
+
+        mock_response = AsyncMock()
+        mock_response.content = png_bytes
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "image/png"}
+        mock_response.raise_for_status = MagicMock()
+
+        msg = Message(
+            role=Role.USER,
+            content=[
+                ImageContent(url="https://example.com/image.png"),
+            ],
+        )
+        request = _simple_request(model="gemini-2.0-flash", messages=[msg])
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            resolved = await adapter._resolve_image_urls(request)
+
+        # The resolved request should have base64_data, not url
+        img_part = resolved.messages[0].content[0]
+        assert isinstance(img_part, ImageContent)
+        assert img_part.base64_data == expected_b64
+        assert img_part.url is None
+        assert img_part.media_type == "image/png"
+
+        # Verify it maps correctly to Gemini format
+        kwargs = adapter._build_kwargs(resolved)
+        parts = kwargs["contents"][0]["parts"]
+        assert len(parts) == 1
+        assert "inline_data" in parts[0]
+        assert parts[0]["inline_data"]["data"] == expected_b64
+        assert parts[0]["inline_data"]["mime_type"] == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_url_download_failure_skips_image(self) -> None:
+        """When URL download fails, the image is gracefully skipped."""
+        from unittest.mock import AsyncMock, patch
+
+        from attractor.llm.models import ImageContent, TextContent
+
+        adapter = _make_gemini_adapter()
+
+        msg = Message(
+            role=Role.USER,
+            content=[
+                TextContent(text="Describe this image"),
+                ImageContent(url="https://example.com/broken.png"),
+            ],
+        )
+        request = _simple_request(model="gemini-2.0-flash", messages=[msg])
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(
+                side_effect=Exception("Connection refused")
+            )
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            resolved = await adapter._resolve_image_urls(request)
+
+        # Original request returned unchanged (download failed)
+        assert resolved is request
+
+    @pytest.mark.asyncio
+    async def test_base64_image_unchanged(self) -> None:
+        """ImageContent with base64_data already set is not re-downloaded."""
+        from attractor.llm.models import ImageContent
+
+        adapter = _make_gemini_adapter()
+
+        msg = Message(
+            role=Role.USER,
+            content=[
+                ImageContent(base64_data="aGVsbG8=", media_type="image/jpeg"),
+            ],
+        )
+        request = _simple_request(model="gemini-2.0-flash", messages=[msg])
+
+        # No httpx patching needed — should return request unchanged
+        resolved = await adapter._resolve_image_urls(request)
+
+        assert resolved is request
+        img = resolved.messages[0].content[0]
+        assert isinstance(img, ImageContent)
+        assert img.base64_data == "aGVsbG8="
+
+    @pytest.mark.asyncio
+    async def test_content_type_from_response_header(self) -> None:
+        """Media type is derived from the response Content-Type header."""
+        from unittest.mock import AsyncMock, patch
+
+        from attractor.llm.models import ImageContent
+
+        adapter = _make_gemini_adapter()
+
+        mock_response = AsyncMock()
+        mock_response.content = b"fake-jpeg"
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "image/jpeg; charset=utf-8"}
+        mock_response.raise_for_status = MagicMock()
+
+        msg = Message(
+            role=Role.USER,
+            content=[
+                ImageContent(url="https://example.com/photo.jpg"),
+            ],
+        )
+        request = _simple_request(model="gemini-2.0-flash", messages=[msg])
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            resolved = await adapter._resolve_image_urls(request)
+
+        img = resolved.messages[0].content[0]
+        assert isinstance(img, ImageContent)
+        # charset should be stripped
+        assert img.media_type == "image/jpeg"
+
+    @pytest.mark.asyncio
+    async def test_no_images_returns_request_unchanged(self) -> None:
+        """Requests without images pass through without modification."""
+        adapter = _make_gemini_adapter()
+        request = _simple_request(model="gemini-2.0-flash")
+        resolved = await adapter._resolve_image_urls(request)
+        assert resolved is request

@@ -12,7 +12,7 @@ import pytest
 
 import attractor.llm as llm_module
 from attractor.llm.client import LLMClient
-from attractor.llm.errors import AbortError, NoObjectGeneratedError, RequestTimeoutError
+from attractor.llm.errors import AbortError, ConfigurationError, NoObjectGeneratedError, RequestTimeoutError
 from attractor.llm.middleware import (
     LoggingMiddleware,
     TokenTrackingMiddleware,
@@ -91,7 +91,7 @@ class TestProviderDetection:
     def test_detect_unknown_model_raises(self) -> None:
         adapter = MockAdapter(name="mock", prefixes=("mock-",))
         client = LLMClient(adapters=[adapter])
-        with pytest.raises(ValueError, match="No provider adapter found"):
+        with pytest.raises(ConfigurationError, match="No provider adapter found"):
             client.detect_provider("unknown-model")
 
     def test_first_match_wins(self) -> None:
@@ -106,6 +106,17 @@ class TestProviderDetection:
         client = LLMClient(adapters=[openai_mock, anthropic_mock])
         assert client.detect_provider("gpt-4o").provider_name() == "openai"
         assert client.detect_provider("claude-3-opus").provider_name() == "anthropic"
+
+    def test_configuration_error_is_sdk_error(self) -> None:
+        """ConfigurationError should be a subclass of SDKError per §8.1."""
+        from attractor.llm.errors import SDKError
+        assert issubclass(ConfigurationError, SDKError)
+
+    def test_no_adapters_raises_configuration_error(self) -> None:
+        """Client with empty adapter list raises ConfigurationError."""
+        client = LLMClient(adapters=[])
+        with pytest.raises(ConfigurationError, match="No provider adapter found"):
+            client.detect_provider("gpt-4o")
 
 
 # ---------------------------------------------------------------------------
@@ -1539,8 +1550,8 @@ class TestProviderBasedRouting:
         resolved = client._resolve_adapter(request)
         assert resolved is anthropic_adapter
 
-    def test_unknown_provider_raises_value_error(self) -> None:
-        """Specifying a provider that isn't registered should raise ValueError."""
+    def test_unknown_provider_raises_configuration_error(self) -> None:
+        """Specifying a provider that isn't registered should raise ConfigurationError."""
         adapter = MockAdapter(name="openai", prefixes=("gpt-",))
         client = LLMClient(adapters=[adapter])
 
@@ -1549,7 +1560,7 @@ class TestProviderBasedRouting:
             model="gpt-4o",
             provider="nonexistent",
         )
-        with pytest.raises(ValueError, match="Provider 'nonexistent' is not registered"):
+        with pytest.raises(ConfigurationError, match="Provider 'nonexistent' is not registered"):
             client._resolve_adapter(request)
 
     def test_provider_field_is_optional_and_backward_compatible(self) -> None:

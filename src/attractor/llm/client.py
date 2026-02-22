@@ -11,6 +11,7 @@ from typing import Any
 
 from attractor.llm.errors import (
     AbortError,
+    ConfigurationError,
     NoObjectGeneratedError,
     ProviderError,
     RequestTimeoutError,
@@ -134,7 +135,7 @@ class LLMClient:
         for adapter in self._adapters:
             if adapter.detect_model(model):
                 return adapter
-        raise ValueError(
+        raise ConfigurationError(
             f"No provider adapter found for model '{model}'. "
             f"Available adapters: {[a.provider_name() for a in self._adapters]}"
         )
@@ -153,14 +154,14 @@ class LLMClient:
             The matched provider adapter.
 
         Raises:
-            ValueError: If the specified provider is not registered or
+            ConfigurationError: If the specified provider is not registered or
                 no adapter matches the model string.
         """
         if request.provider:
             for adapter in self._adapters:
                 if adapter.provider_name() == request.provider:
                     return adapter
-            raise ValueError(
+            raise ConfigurationError(
                 f"Provider '{request.provider}' is not registered. "
                 f"Available providers: {[a.provider_name() for a in self._adapters]}"
             )

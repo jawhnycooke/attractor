@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import base64 as base64_mod
 import json
 import logging
 import os
 import time
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
+
+import httpx
 
 from attractor.llm.errors import (
     NetworkError,
@@ -184,7 +188,13 @@ class GeminiAdapter:
                     }
                 )
 
-        role = "model" if msg.role == Role.ASSISTANT else "user"
+        if msg.role == Role.ASSISTANT:
+            role = "model"
+        elif msg.role == Role.DEVELOPER:
+            # Gemini has no developer role; map to user
+            role = "user"
+        else:
+            role = "user"
         return {"role": role, "parts": parts} if parts else None
 
     def _map_tools(self, tools: list[ToolDefinition]) -> list[dict[str, Any]] | None:
@@ -201,6 +211,78 @@ class GeminiAdapter:
                 decl["parameters"] = schema
             declarations.append(decl)
         return [{"function_declarations": declarations}]
+
+    async def _resolve_image_urls(self, request: Request) -> Request:
+        """Download URL-based images and convert to base64 inline data.
+
+        The Gemini API does not accept arbitrary HTTP image URLs.  This
+        method scans the request messages for ``ImageContent`` parts that
+        carry a ``url`` but no ``base64_data``, downloads them via
+        ``httpx``, and returns a **new** ``Request`` with those parts
+        replaced by base64-encoded equivalents.
+
+        Args:
+            request: The original provider-agnostic request.
+
+        Returns:
+            A (possibly new) Request with URL images resolved to base64.
+        """
+        # Collect unique URLs that need fetching
+        urls: set[str] = set()
+        for msg in request.messages:
+            for part in msg.content:
+                if isinstance(part, ImageContent) and part.url and not part.base64_data:
+                    urls.add(part.url)
+
+        if not urls:
+            return request
+
+        # Download each URL
+        url_data: dict[str, tuple[str, str]] = {}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for url in urls:
+                try:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    b64 = base64_mod.b64encode(resp.content).decode("ascii")
+                    content_type = (
+                        resp.headers.get("content-type", "image/png").split(";")[0]
+                    )
+                    url_data[url] = (b64, content_type)
+                except Exception as exc:
+                    logger.warning("Failed to download image from %s: %s", url, exc)
+
+        if not url_data:
+            return request
+
+        # Rebuild messages, replacing resolved ImageContent parts
+        new_messages: list[Message] = []
+        for msg in request.messages:
+            new_parts: list[ContentPart] = []
+            changed = False
+            for part in msg.content:
+                if (
+                    isinstance(part, ImageContent)
+                    and part.url
+                    and part.url in url_data
+                ):
+                    b64, media_type = url_data[part.url]
+                    new_parts.append(
+                        ImageContent(
+                            base64_data=b64,
+                            media_type=media_type,
+                            detail=part.detail,
+                        )
+                    )
+                    changed = True
+                else:
+                    new_parts.append(part)
+            if changed:
+                new_messages.append(Message(role=msg.role, content=new_parts))
+            else:
+                new_messages.append(msg)
+
+        return replace(request, messages=new_messages)
 
     def _build_kwargs(self, request: Request) -> dict[str, Any]:
         contents, system_instruction = self._map_contents(request)
@@ -369,6 +451,7 @@ class GeminiAdapter:
         Raises:
             ProviderError: Translated from raw Gemini SDK exceptions.
         """
+        request = await self._resolve_image_urls(request)
         kwargs = self._build_kwargs(request)
         t0 = time.monotonic()
         try:
@@ -433,6 +516,7 @@ class GeminiAdapter:
         Raises:
             ProviderError: Translated from raw Gemini SDK exceptions.
         """
+        request = await self._resolve_image_urls(request)
         kwargs = self._build_kwargs(request)
 
         t0 = time.monotonic()

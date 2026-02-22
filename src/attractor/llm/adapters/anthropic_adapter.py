@@ -153,7 +153,13 @@ class AnthropicAdapter:
             return {"role": "user", "content": results}
 
         content = self._map_content_parts(msg)
-        role = "assistant" if msg.role == Role.ASSISTANT else "user"
+        if msg.role == Role.ASSISTANT:
+            role = "assistant"
+        elif msg.role == Role.DEVELOPER:
+            # Anthropic has no developer role; map to user
+            role = "user"
+        else:
+            role = "user"
         return {"role": role, "content": content}
 
     def _map_content_parts(self, msg: Message) -> list[dict[str, Any]]:
