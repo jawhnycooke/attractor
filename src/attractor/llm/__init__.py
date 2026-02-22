@@ -27,16 +27,19 @@ from attractor.llm.errors import (
 )
 from attractor.llm.models import (
     ContentPart,
+    GenerateResult,
     ImageContent,
     Message,
     RateLimitInfo,
     Request,
     Response,
     Role,
+    StepResult,
     StreamEvent,
     StreamEventType,
     TextContent,
     ThinkingContent,
+    TokenUsage,
     ToolCallContent,
     ToolDefinition,
     ToolResultContent,
@@ -74,7 +77,7 @@ async def generate(
     max_tool_rounds: int = 10,
     client: LLMClient | None = None,
     **kwargs: Any,
-) -> Response:
+) -> GenerateResult:
     """Module-level generate using the default client."""
     c = client or get_default_client()
     return await c.generate(
@@ -158,16 +161,19 @@ __all__ = [
     "StreamError",
     # Models
     "ContentPart",
+    "GenerateResult",
     "ImageContent",
     "Message",
     "RateLimitInfo",
     "Request",
     "Response",
     "Role",
+    "StepResult",
     "StreamEvent",
     "StreamEventType",
     "TextContent",
     "ThinkingContent",
+    "TokenUsage",
     "ToolCallContent",
     "ToolDefinition",
     "ToolResultContent",

@@ -9,6 +9,12 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
+from attractor.llm.errors import (
+    NetworkError,
+    RequestTimeoutError,
+    StreamError,
+    error_from_status,
+)
 from attractor.llm.models import (
     ContentPart,
     FinishReason,
@@ -24,6 +30,7 @@ from attractor.llm.models import (
     ThinkingContent,
     RedactedThinkingContent,
     ToolCallContent,
+    ToolChoice,
     ToolDefinition,
     ToolResultContent,
     TokenUsage,
@@ -43,6 +50,23 @@ _THINKING_BUDGET = {
     ReasoningEffort.MEDIUM: 8192,
     ReasoningEffort.HIGH: 32768,
 }
+
+
+def _extract_retry_after(exc: Any) -> float | None:
+    """Extract Retry-After header from an SDK exception's response."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    retry_str = headers.get("retry-after")
+    if retry_str is None:
+        return None
+    try:
+        return float(retry_str)
+    except (ValueError, TypeError):
+        return None
 
 
 class AnthropicAdapter:
@@ -273,10 +297,71 @@ class AnthropicAdapter:
                 if thinking_override and isinstance(thinking_override, dict):
                     kwargs["thinking"] = thinking_override
 
+        # Tool choice mapping
+        if request.tool_choice and kwargs.get("tools"):
+            normalized = self._normalize_tool_choice(request.tool_choice)
+            if normalized and normalized.mode == "none":
+                kwargs.pop("tools", None)
+            else:
+                tc_mapped = self._map_tool_choice(request.tool_choice)
+                if tc_mapped is not None:
+                    kwargs["tool_choice"] = tc_mapped
+
         # Auto-inject cache_control for prompt caching
         self._inject_cache_control(kwargs, request)
 
         return kwargs
+
+    @staticmethod
+    def _normalize_tool_choice(
+        choice: ToolChoice | str | dict[str, Any] | None,
+    ) -> ToolChoice | None:
+        """Normalize tool choice to a ToolChoice instance."""
+        if choice is None:
+            return None
+        if isinstance(choice, ToolChoice):
+            return choice
+        if isinstance(choice, str):
+            return ToolChoice(mode=choice)
+        if isinstance(choice, dict):
+            return ToolChoice(
+                mode=choice.get("mode", "auto"),
+                tool_name=choice.get("tool_name"),
+            )
+        return None
+
+    @staticmethod
+    def _map_tool_choice(
+        choice: ToolChoice | str | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Map a unified ToolChoice to Anthropic's tool_choice format.
+
+        Args:
+            choice: Unified tool choice specification.
+
+        Returns:
+            Anthropic-native tool_choice dict, or None to omit.
+        """
+        if choice is None:
+            return None
+
+        if isinstance(choice, str):
+            choice = ToolChoice(mode=choice)
+        elif isinstance(choice, dict):
+            choice = ToolChoice(
+                mode=choice.get("mode", "auto"),
+                tool_name=choice.get("tool_name"),
+            )
+
+        if choice.mode == "auto":
+            return {"type": "auto"}
+        elif choice.mode == "none":
+            return None  # Anthropic: remove tools entirely handled by caller
+        elif choice.mode == "required":
+            return {"type": "any"}
+        elif choice.mode == "named":
+            return {"type": "tool", "name": choice.tool_name}
+        return None
 
     # -----------------------------------------------------------------
     # Response mapping
@@ -352,10 +437,30 @@ class AnthropicAdapter:
 
         Returns:
             Mapped Response with content, usage, and finish reason.
+
+        Raises:
+            ProviderError: Translated from raw Anthropic SDK exceptions.
         """
+        import anthropic
+
         kwargs = self._build_kwargs(request)
         t0 = time.monotonic()
-        raw = await self._client.messages.create(**kwargs)
+        try:
+            raw = await self._client.messages.create(**kwargs)
+        except anthropic.APIStatusError as exc:
+            retry_after = _extract_retry_after(exc)
+            raise error_from_status(
+                exc.status_code,
+                str(exc),
+                provider="anthropic",
+                retry_after=retry_after,
+            ) from exc
+        except anthropic.APITimeoutError as exc:
+            raise RequestTimeoutError(
+                str(exc), provider="anthropic", retryable=True
+            ) from exc
+        except anthropic.APIConnectionError as exc:
+            raise NetworkError(str(exc)) from exc
         latency = (time.monotonic() - t0) * 1000
         return self._map_response(raw, latency)
 
@@ -367,100 +472,135 @@ class AnthropicAdapter:
 
         Yields:
             StreamEvent instances as they arrive from the API.
+
+        Raises:
+            ProviderError: Translated from raw Anthropic SDK exceptions.
         """
+        import anthropic
+
         kwargs = self._build_kwargs(request)
         kwargs["stream"] = True
 
         t0 = time.monotonic()
-        raw_stream = await self._client.messages.create(**kwargs)
+        try:
+            raw_stream = await self._client.messages.create(**kwargs)
+        except anthropic.APIStatusError as exc:
+            retry_after = _extract_retry_after(exc)
+            raise error_from_status(
+                exc.status_code,
+                str(exc),
+                provider="anthropic",
+                retry_after=retry_after,
+            ) from exc
+        except anthropic.APITimeoutError as exc:
+            raise RequestTimeoutError(
+                str(exc), provider="anthropic", retryable=True
+            ) from exc
+        except anthropic.APIConnectionError as exc:
+            raise NetworkError(str(exc)) from exc
 
         yield StreamEvent(type=StreamEventType.STREAM_START)
 
         current_tool: ToolCallContent | None = None
 
-        async for event in raw_stream:
-            event_type = event.type
+        try:
+            async for event in raw_stream:
+                event_type = event.type
 
-            if event_type == "content_block_start":
-                block = event.content_block
-                if block.type == "text":
-                    pass  # text comes via deltas
-                elif block.type == "tool_use":
-                    current_tool = ToolCallContent(
-                        tool_call_id=block.id,
-                        tool_name=block.name,
-                    )
-                    yield StreamEvent(
-                        type=StreamEventType.TOOL_CALL_START,
-                        tool_call=current_tool,
-                    )
-                elif block.type == "thinking":
-                    pass  # thinking comes via deltas
-
-            elif event_type == "content_block_delta":
-                delta = event.delta
-                if delta.type == "text_delta":
-                    yield StreamEvent(
-                        type=StreamEventType.TEXT_DELTA,
-                        text=delta.text,
-                    )
-                elif delta.type == "input_json_delta":
-                    if current_tool:
-                        current_tool.arguments_json += delta.partial_json
+                if event_type == "content_block_start":
+                    block = event.content_block
+                    if block.type == "text":
+                        pass  # text comes via deltas
+                    elif block.type == "tool_use":
+                        current_tool = ToolCallContent(
+                            tool_call_id=block.id,
+                            tool_name=block.name,
+                        )
                         yield StreamEvent(
-                            type=StreamEventType.TOOL_CALL_DELTA,
-                            text=delta.partial_json,
+                            type=StreamEventType.TOOL_CALL_START,
                             tool_call=current_tool,
                         )
-                elif delta.type == "thinking_delta":
-                    yield StreamEvent(
-                        type=StreamEventType.REASONING_DELTA,
-                        text=delta.thinking,
-                    )
+                    elif block.type == "thinking":
+                        pass  # thinking comes via deltas
 
-            elif event_type == "content_block_stop":
-                if current_tool:
-                    if current_tool.arguments_json:
-                        try:
-                            current_tool.arguments = json.loads(
-                                current_tool.arguments_json
+                elif event_type == "content_block_delta":
+                    delta = event.delta
+                    if delta.type == "text_delta":
+                        yield StreamEvent(
+                            type=StreamEventType.TEXT_DELTA,
+                            text=delta.text,
+                        )
+                    elif delta.type == "input_json_delta":
+                        if current_tool:
+                            current_tool.arguments_json += delta.partial_json
+                            yield StreamEvent(
+                                type=StreamEventType.TOOL_CALL_DELTA,
+                                text=delta.partial_json,
+                                tool_call=current_tool,
                             )
-                        except json.JSONDecodeError as exc:
-                            logger.warning(
-                                "Failed to parse tool call arguments: %s",
-                                exc,
-                            )
-                    yield StreamEvent(
-                        type=StreamEventType.TOOL_CALL_END,
-                        tool_call=current_tool,
-                    )
-                    current_tool = None
+                    elif delta.type == "thinking_delta":
+                        yield StreamEvent(
+                            type=StreamEventType.REASONING_DELTA,
+                            text=delta.thinking,
+                        )
 
-            elif event_type == "message_delta":
-                raw_sr = getattr(event.delta, "stop_reason", None) or "end_turn"
-                finish = _FINISH_MAP.get(
-                    raw_sr,
-                    FinishReason("stop", raw=raw_sr),
-                )
-                usage_data = getattr(event, "usage", None)
-                usage = None
-                if usage_data:
-                    usage = TokenUsage(
-                        output_tokens=getattr(usage_data, "output_tokens", 0),
-                    )
-                yield StreamEvent(
-                    type=StreamEventType.FINISH,
-                    finish_reason=finish,
-                    usage=usage,
-                    metadata={"latency_ms": (time.monotonic() - t0) * 1000},
-                )
+                elif event_type == "content_block_stop":
+                    if current_tool:
+                        if current_tool.arguments_json:
+                            try:
+                                current_tool.arguments = json.loads(
+                                    current_tool.arguments_json
+                                )
+                            except json.JSONDecodeError as exc:
+                                logger.warning(
+                                    "Failed to parse tool call arguments: %s",
+                                    exc,
+                                )
+                        yield StreamEvent(
+                            type=StreamEventType.TOOL_CALL_END,
+                            tool_call=current_tool,
+                        )
+                        current_tool = None
 
-            elif event_type == "message_start":
-                msg = getattr(event, "message", None)
-                if msg and hasattr(msg, "usage"):
-                    yield StreamEvent(
-                        type=StreamEventType.STREAM_START,
-                        usage=TokenUsage(
-                            input_tokens=msg.usage.input_tokens,
-                        ),
+                elif event_type == "message_delta":
+                    raw_sr = getattr(event.delta, "stop_reason", None) or "end_turn"
+                    finish = _FINISH_MAP.get(
+                        raw_sr,
+                        FinishReason("stop", raw=raw_sr),
                     )
+                    usage_data = getattr(event, "usage", None)
+                    usage = None
+                    if usage_data:
+                        usage = TokenUsage(
+                            output_tokens=getattr(usage_data, "output_tokens", 0),
+                        )
+                    yield StreamEvent(
+                        type=StreamEventType.FINISH,
+                        finish_reason=finish,
+                        usage=usage,
+                        metadata={"latency_ms": (time.monotonic() - t0) * 1000},
+                    )
+
+                elif event_type == "message_start":
+                    msg = getattr(event, "message", None)
+                    if msg and hasattr(msg, "usage"):
+                        yield StreamEvent(
+                            type=StreamEventType.STREAM_START,
+                            usage=TokenUsage(
+                                input_tokens=msg.usage.input_tokens,
+                            ),
+                        )
+        except anthropic.APIStatusError as exc:
+            retry_after = _extract_retry_after(exc)
+            raise error_from_status(
+                exc.status_code,
+                str(exc),
+                provider="anthropic",
+                retry_after=retry_after,
+            ) from exc
+        except anthropic.APITimeoutError as exc:
+            raise RequestTimeoutError(
+                str(exc), provider="anthropic", retryable=True
+            ) from exc
+        except anthropic.APIConnectionError as exc:
+            raise NetworkError(str(exc)) from exc

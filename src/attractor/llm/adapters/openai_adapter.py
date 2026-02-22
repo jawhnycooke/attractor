@@ -9,6 +9,12 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
+from attractor.llm.errors import (
+    NetworkError,
+    RequestTimeoutError,
+    StreamError,
+    error_from_status,
+)
 from attractor.llm.models import (
     ContentPart,
     FinishReason,
@@ -22,12 +28,30 @@ from attractor.llm.models import (
     TextContent,
     ThinkingContent,
     ToolCallContent,
+    ToolChoice,
     ToolDefinition,
     ToolResultContent,
     TokenUsage,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_retry_after(exc: Any) -> float | None:
+    """Extract Retry-After header from an SDK exception's response."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    retry_str = headers.get("retry-after")
+    if retry_str is None:
+        return None
+    try:
+        return float(retry_str)
+    except (ValueError, TypeError):
+        return None
 
 
 class OpenAIAdapter:
@@ -205,6 +229,15 @@ class OpenAIAdapter:
         if request.response_format:
             kwargs["text"] = {"format": request.response_format}
 
+        # Tool choice mapping
+        if request.tool_choice and kwargs.get("tools"):
+            tc_mapped = self._map_tool_choice(request.tool_choice)
+            if tc_mapped is not None:
+                if tc_mapped == "__none__":
+                    kwargs.pop("tools", None)
+                else:
+                    kwargs["tool_choice"] = tc_mapped
+
         # Read provider_options
         if request.provider_options:
             openai_opts = request.provider_options.get("openai", {})
@@ -219,6 +252,38 @@ class OpenAIAdapter:
                     kwargs["extra_headers"] = extra_headers
 
         return kwargs
+
+    @staticmethod
+    def _map_tool_choice(
+        choice: ToolChoice | str | dict[str, Any] | None,
+    ) -> str | dict[str, Any] | None:
+        """Map a unified ToolChoice to OpenAI's tool_choice format.
+
+        Returns ``"__none__"`` sentinel when tools should be removed.
+        """
+        if choice is None:
+            return None
+
+        if isinstance(choice, str):
+            choice = ToolChoice(mode=choice)
+        elif isinstance(choice, dict):
+            choice = ToolChoice(
+                mode=choice.get("mode", "auto"),
+                tool_name=choice.get("tool_name"),
+            )
+
+        if choice.mode == "auto":
+            return "auto"
+        elif choice.mode == "none":
+            return "__none__"
+        elif choice.mode == "required":
+            return "required"
+        elif choice.mode == "named":
+            return {
+                "type": "function",
+                "function": {"name": choice.tool_name},
+            }
+        return None
 
     # -----------------------------------------------------------------
     # Response mapping
@@ -309,10 +374,30 @@ class OpenAIAdapter:
 
         Returns:
             Mapped Response with content, usage, and finish reason.
+
+        Raises:
+            ProviderError: Translated from raw OpenAI SDK exceptions.
         """
+        import openai
+
         kwargs = self._build_kwargs(request)
         t0 = time.monotonic()
-        raw = await self._client.responses.create(**kwargs)
+        try:
+            raw = await self._client.responses.create(**kwargs)
+        except openai.APIStatusError as exc:
+            retry_after = _extract_retry_after(exc)
+            raise error_from_status(
+                exc.status_code,
+                str(exc),
+                provider="openai",
+                retry_after=retry_after,
+            ) from exc
+        except openai.APITimeoutError as exc:
+            raise RequestTimeoutError(
+                str(exc), provider="openai", retryable=True
+            ) from exc
+        except openai.APIConnectionError as exc:
+            raise NetworkError(str(exc)) from exc
         latency = (time.monotonic() - t0) * 1000
         return self._map_response(raw, latency)
 
@@ -324,12 +409,32 @@ class OpenAIAdapter:
 
         Yields:
             StreamEvent instances as they arrive from the API.
+
+        Raises:
+            ProviderError: Translated from raw OpenAI SDK exceptions.
         """
+        import openai
+
         kwargs = self._build_kwargs(request)
         kwargs["stream"] = True
 
         t0 = time.monotonic()
-        raw_stream = await self._client.responses.create(**kwargs)
+        try:
+            raw_stream = await self._client.responses.create(**kwargs)
+        except openai.APIStatusError as exc:
+            retry_after = _extract_retry_after(exc)
+            raise error_from_status(
+                exc.status_code,
+                str(exc),
+                provider="openai",
+                retry_after=retry_after,
+            ) from exc
+        except openai.APITimeoutError as exc:
+            raise RequestTimeoutError(
+                str(exc), provider="openai", retryable=True
+            ) from exc
+        except openai.APIConnectionError as exc:
+            raise NetworkError(str(exc)) from exc
 
         yield StreamEvent(type=StreamEventType.STREAM_START)
 

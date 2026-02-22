@@ -1768,3 +1768,81 @@ class TestPipelineEvents:
         assert event.pipeline_name == ""
         assert isinstance(event.timestamp, float)
         assert event.data == {}
+
+
+class TestLogsRootPassthrough:
+    """Tests for P-C12: engine passes logs_root to handlers."""
+
+    async def test_engine_passes_logs_root_to_handler(self, tmp_path: Path) -> None:
+        """Engine with logs_root passes it through to handler.execute()."""
+        received_logs_root: list[Path | None] = []
+
+        class CapturingHandler:
+            async def execute(self, node, context, graph=None, logs_root=None):
+                received_logs_root.append(logs_root)
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    context_updates={f"{node.name}_done": True},
+                )
+
+        registry = HandlerRegistry()
+        registry.register("capture", CapturingHandler())
+
+        pipeline = Pipeline(
+            name="logs_root_test",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="capture", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="capture", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, logs_root=tmp_path)
+        ctx = await engine.run(pipeline)
+
+        assert ctx.get("start_done") is True
+        assert ctx.get("end_done") is True
+        # Both handlers should have received the logs_root path
+        assert len(received_logs_root) == 2
+        assert all(lr == tmp_path for lr in received_logs_root)
+
+    async def test_engine_without_logs_root_passes_none(self) -> None:
+        """Engine without logs_root passes None to handler.execute()."""
+        received_logs_root: list[Path | None] = []
+
+        class CapturingHandler:
+            async def execute(self, node, context, graph=None, logs_root=None):
+                received_logs_root.append(logs_root)
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    context_updates={f"{node.name}_done": True},
+                )
+
+        registry = HandlerRegistry()
+        registry.register("capture", CapturingHandler())
+
+        pipeline = Pipeline(
+            name="no_logs_root",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="capture", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="capture", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+
+        assert ctx.get("end_done") is True
+        assert len(received_logs_root) == 2
+        assert all(lr is None for lr in received_logs_root)

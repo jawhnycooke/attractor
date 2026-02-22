@@ -12,14 +12,18 @@ from typing import Any
 from attractor.llm.errors import AbortError, ProviderError, RequestTimeoutError, SDKError
 from attractor.llm.models import (
     FinishReason,
+    GenerateResult,
     Message,
     Request,
     Response,
     RetryPolicy,
+    StepResult,
     StreamEvent,
     StreamEventType,
+    TokenUsage,
     ToolCallContent,
     ToolDefinition,
+    ToolResultContent,
 )
 from attractor.llm.middleware import Middleware
 
@@ -281,13 +285,16 @@ class LLMClient:
         timeout: float | None = None,
         abort_signal: asyncio.Event | None = None,
         **kwargs: Any,
-    ) -> Response:
+    ) -> GenerateResult:
         """High-level API that handles tool auto-execution loops.
 
         When the model returns tool calls and a ``tool_executor`` is provided,
         all tool calls in a single round are executed **concurrently** using
         ``asyncio.gather``, and the results are fed back to the model for
         the next round.
+
+        Returns a :class:`GenerateResult` that includes per-step history
+        and aggregated token usage in addition to the final response.
 
         Args:
             prompt: A string (converted to a user message) or list of Messages.
@@ -316,8 +323,11 @@ class LLMClient:
         )
 
         if max_tool_rounds <= 0:
-            return await self.complete(request)
+            response = await self.complete(request)
+            step = self._build_step(response, [])
+            return self._build_result(response, [step])
 
+        steps: list[StepResult] = []
         response: Response | None = None
         for _ in range(max_tool_rounds):
             # Check abort signal before each round
@@ -340,13 +350,18 @@ class LLMClient:
                 )
 
             if response.finish_reason != FinishReason.TOOL_CALLS:
-                return response
+                steps.append(self._build_step(response, []))
+                return self._build_result(response, steps)
 
             tool_calls = response.message.tool_calls()
             if not tool_calls or tool_executor is None:
-                return response
+                steps.append(self._build_step(response, []))
+                return self._build_result(response, steps)
 
             request.messages.append(response.message)
+
+            # Collect tool results for step tracking
+            round_tool_results: list[ToolResultContent] = []
 
             # Validate tool arguments before execution
             if request.tools:
@@ -361,8 +376,10 @@ class LLMClient:
 
                 # Send validation errors back as tool results
                 for tc, error in validation_errors:
-                    request.messages.append(
-                        Message.tool_result(tc.tool_call_id, error, is_error=True)
+                    error_msg = Message.tool_result(tc.tool_call_id, error, is_error=True)
+                    request.messages.append(error_msg)
+                    round_tool_results.extend(
+                        p for p in error_msg.content if isinstance(p, ToolResultContent)
                     )
 
                 # Execute validated calls
@@ -371,14 +388,65 @@ class LLMClient:
                         tool_executor, validated_calls
                     )
                     request.messages.extend(result_messages)
+                    for msg in result_messages:
+                        round_tool_results.extend(
+                            p for p in msg.content if isinstance(p, ToolResultContent)
+                        )
             else:
                 result_messages = await self._execute_tools_concurrently(
                     tool_executor, tool_calls
                 )
                 request.messages.extend(result_messages)
+                for msg in result_messages:
+                    round_tool_results.extend(
+                        p for p in msg.content if isinstance(p, ToolResultContent)
+                    )
+
+            steps.append(self._build_step(response, round_tool_results))
 
         assert response is not None
-        return response
+        steps.append(self._build_step(response, []))
+        return self._build_result(response, steps)
+
+    @staticmethod
+    def _build_step(
+        response: Response, tool_results: list[ToolResultContent]
+    ) -> StepResult:
+        """Build a StepResult from a response and its tool results."""
+        return StepResult(
+            text=response.message.text() or "",
+            reasoning=response.reasoning,
+            tool_calls=response.message.tool_calls(),
+            tool_results=tool_results,
+            finish_reason=response.finish_reason or FinishReason.STOP,
+            usage=response.usage or TokenUsage(),
+            response=response,
+        )
+
+    @staticmethod
+    def _build_result(
+        response: Response, steps: list[StepResult]
+    ) -> GenerateResult:
+        """Build a GenerateResult from the final response and all steps."""
+        total_usage = TokenUsage()
+        all_tool_calls: list[ToolCallContent] = []
+        all_tool_results: list[ToolResultContent] = []
+        for step in steps:
+            total_usage = total_usage + step.usage
+            all_tool_calls.extend(step.tool_calls)
+            all_tool_results.extend(step.tool_results)
+
+        return GenerateResult(
+            text=response.message.text() or "",
+            reasoning=response.reasoning,
+            tool_calls=all_tool_calls,
+            tool_results=all_tool_results,
+            finish_reason=response.finish_reason or FinishReason.STOP,
+            usage=response.usage or TokenUsage(),
+            total_usage=total_usage,
+            steps=steps,
+            response=response,
+        )
 
     async def stream_generate(
         self,

@@ -10,6 +10,12 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+from attractor.llm.errors import (
+    NetworkError,
+    RequestTimeoutError,
+    StreamError,
+    error_from_status,
+)
 from attractor.llm.models import (
     ContentPart,
     FinishReason,
@@ -22,6 +28,7 @@ from attractor.llm.models import (
     StreamEventType,
     TextContent,
     ToolCallContent,
+    ToolChoice,
     ToolDefinition,
     ToolResultContent,
     TokenUsage,
@@ -39,6 +46,24 @@ _FINISH_MAP: dict[str, FinishReason] = {
 
 def _synth_tool_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:12]}"
+
+
+def _extract_retry_after(exc: Any) -> float | None:
+    """Extract Retry-After from a Gemini SDK exception."""
+    # Gemini SDK exceptions may have different structures
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    retry_str = headers.get("retry-after")
+    if retry_str is None:
+        return None
+    try:
+        return float(retry_str)
+    except (ValueError, TypeError):
+        return None
 
 
 class GeminiAdapter:
@@ -178,6 +203,15 @@ class GeminiAdapter:
         if tools:
             config["tools"] = tools
 
+        # Tool choice mapping
+        if request.tool_choice and tools:
+            tc_mapped = self._map_tool_choice(request.tool_choice)
+            if tc_mapped is not None:
+                if tc_mapped == "__none__":
+                    config.pop("tools", None)
+                else:
+                    config["tool_config"] = {"function_calling_config": tc_mapped}
+
         # Read provider_options
         if request.provider_options:
             gemini_opts = request.provider_options.get("gemini", {})
@@ -199,6 +233,38 @@ class GeminiAdapter:
             kwargs["config"] = config
 
         return kwargs
+
+    @staticmethod
+    def _map_tool_choice(
+        choice: ToolChoice | str | dict[str, Any] | None,
+    ) -> dict[str, Any] | str | None:
+        """Map a unified ToolChoice to Gemini's tool_config format.
+
+        Returns ``"__none__"`` sentinel when tools should be removed.
+        """
+        if choice is None:
+            return None
+
+        if isinstance(choice, str):
+            choice = ToolChoice(mode=choice)
+        elif isinstance(choice, dict):
+            choice = ToolChoice(
+                mode=choice.get("mode", "auto"),
+                tool_name=choice.get("tool_name"),
+            )
+
+        if choice.mode == "auto":
+            return {"mode": "AUTO"}
+        elif choice.mode == "none":
+            return "__none__"
+        elif choice.mode == "required":
+            return {"mode": "ANY"}
+        elif choice.mode == "named":
+            return {
+                "mode": "ANY",
+                "allowed_function_names": [choice.tool_name],
+            }
+        return None
 
     # -----------------------------------------------------------------
     # Response mapping
@@ -271,12 +337,61 @@ class GeminiAdapter:
 
         Returns:
             Mapped Response with content, usage, and finish reason.
+
+        Raises:
+            ProviderError: Translated from raw Gemini SDK exceptions.
         """
         kwargs = self._build_kwargs(request)
         t0 = time.monotonic()
-        raw = await self._client.aio.models.generate_content(**kwargs)
+        try:
+            raw = await self._client.aio.models.generate_content(**kwargs)
+        except Exception as exc:
+            self._translate_error(exc)
+            raise  # unreachable if _translate_error raises
         latency = (time.monotonic() - t0) * 1000
         return self._map_response(raw, latency)
+
+    @staticmethod
+    def _translate_error(exc: Exception) -> None:
+        """Translate Gemini SDK exceptions to attractor error types.
+
+        Raises the translated error, or returns if the exception
+        isn't a recognized Gemini error (allowing re-raise by caller).
+        """
+        try:
+            from google.genai import errors as genai_errors
+        except ImportError:
+            return  # Can't translate without SDK
+
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+
+        if isinstance(exc, genai_errors.ClientError):
+            code = status_code or 400
+            retry_after = _extract_retry_after(exc)
+            raise error_from_status(
+                code, str(exc), provider="gemini", retry_after=retry_after
+            ) from exc
+        elif isinstance(exc, genai_errors.ServerError):
+            code = status_code or 500
+            retry_after = _extract_retry_after(exc)
+            raise error_from_status(
+                code, str(exc), provider="gemini", retry_after=retry_after
+            ) from exc
+        elif isinstance(exc, genai_errors.APIError):
+            code = status_code or 500
+            retry_after = _extract_retry_after(exc)
+            raise error_from_status(
+                code, str(exc), provider="gemini", retry_after=retry_after
+            ) from exc
+
+        # Check for connection/timeout errors via exception name/type
+        exc_name = type(exc).__name__.lower()
+        if "timeout" in exc_name:
+            raise RequestTimeoutError(
+                str(exc), provider="gemini", retryable=True
+            ) from exc
+        if "connection" in exc_name:
+            raise NetworkError(str(exc)) from exc
 
     async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
         """Send a streaming request to the Google Gemini API.
@@ -286,57 +401,68 @@ class GeminiAdapter:
 
         Yields:
             StreamEvent instances as they arrive from the API.
+
+        Raises:
+            ProviderError: Translated from raw Gemini SDK exceptions.
         """
         kwargs = self._build_kwargs(request)
 
         t0 = time.monotonic()
-        raw_stream = await self._client.aio.models.generate_content_stream(**kwargs)
+        try:
+            raw_stream = await self._client.aio.models.generate_content_stream(**kwargs)
+        except Exception as exc:
+            self._translate_error(exc)
+            raise
 
         yield StreamEvent(type=StreamEventType.STREAM_START)
 
-        async for chunk in raw_stream:
-            candidate = chunk.candidates[0] if chunk.candidates else None
-            if not candidate:
-                continue
+        try:
+            async for chunk in raw_stream:
+                candidate = chunk.candidates[0] if chunk.candidates else None
+                if not candidate:
+                    continue
 
-            for part in candidate.content.parts:
-                if hasattr(part, "function_call") and part.function_call:
-                    fc = part.function_call
-                    args = dict(fc.args) if fc.args else {}
-                    tc = ToolCallContent(
-                        tool_call_id=_synth_tool_call_id(),
-                        tool_name=fc.name,
-                        arguments=args,
-                        arguments_json=json.dumps(args),
-                    )
-                    yield StreamEvent(
-                        type=StreamEventType.TOOL_CALL_START,
-                        tool_call=tc,
-                    )
-                    yield StreamEvent(
-                        type=StreamEventType.TOOL_CALL_END,
-                        tool_call=tc,
-                    )
-                elif hasattr(part, "text") and part.text:
-                    yield StreamEvent(
-                        type=StreamEventType.TEXT_DELTA,
-                        text=part.text,
-                    )
+                for part in candidate.content.parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                        fc = part.function_call
+                        args = dict(fc.args) if fc.args else {}
+                        tc = ToolCallContent(
+                            tool_call_id=_synth_tool_call_id(),
+                            tool_name=fc.name,
+                            arguments=args,
+                            arguments_json=json.dumps(args),
+                        )
+                        yield StreamEvent(
+                            type=StreamEventType.TOOL_CALL_START,
+                            tool_call=tc,
+                        )
+                        yield StreamEvent(
+                            type=StreamEventType.TOOL_CALL_END,
+                            tool_call=tc,
+                        )
+                    elif hasattr(part, "text") and part.text:
+                        yield StreamEvent(
+                            type=StreamEventType.TEXT_DELTA,
+                            text=part.text,
+                        )
 
-            finish_reason = getattr(candidate, "finish_reason", None)
-            if finish_reason:
-                fr_str = str(finish_reason).split(".")[-1]
-                usage_meta = getattr(chunk, "usage_metadata", None)
-                usage = None
-                if usage_meta:
-                    usage = TokenUsage(
-                        input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
-                        output_tokens=getattr(usage_meta, "candidates_token_count", 0)
-                        or 0,
+                finish_reason = getattr(candidate, "finish_reason", None)
+                if finish_reason:
+                    fr_str = str(finish_reason).split(".")[-1]
+                    usage_meta = getattr(chunk, "usage_metadata", None)
+                    usage = None
+                    if usage_meta:
+                        usage = TokenUsage(
+                            input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
+                            output_tokens=getattr(usage_meta, "candidates_token_count", 0)
+                            or 0,
+                        )
+                    yield StreamEvent(
+                        type=StreamEventType.FINISH,
+                        finish_reason=_FINISH_MAP.get(fr_str, FinishReason("stop", raw=fr_str)),
+                        usage=usage,
+                        metadata={"latency_ms": (time.monotonic() - t0) * 1000},
                     )
-                yield StreamEvent(
-                    type=StreamEventType.FINISH,
-                    finish_reason=_FINISH_MAP.get(fr_str, FinishReason("stop", raw=fr_str)),
-                    usage=usage,
-                    metadata={"latency_ms": (time.monotonic() - t0) * 1000},
-                )
+        except Exception as exc:
+            self._translate_error(exc)
+            raise

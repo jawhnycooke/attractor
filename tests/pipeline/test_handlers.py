@@ -4,12 +4,14 @@ import asyncio
 import builtins
 import json
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from attractor.pipeline.handlers import (
+    CodergenBackend,
     CodergenHandler,
     ConditionalHandler,
     ExitHandler,
@@ -97,29 +99,37 @@ class TestExitHandler:
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _simulate_agent_import_error(error_cls: type[Exception] = ImportError, message: str = "no agent"):
+    """Patch imports so attractor.agent.* modules raise on import."""
+    real_import = builtins.__import__
+
+    def selective_import(name, *args, **kwargs):
+        if name.startswith("attractor.agent"):
+            raise error_cls(message)
+        return real_import(name, *args, **kwargs)
+
+    with patch.dict("sys.modules", {"attractor.agent.events": None}):
+        with patch("builtins.__import__", side_effect=selective_import):
+            yield
+
+
 class TestCodergenHandler:
     @pytest.mark.asyncio
-    async def test_codergen_stub_returns_failure_not_success(self) -> None:
-        """Regression for A5: ImportError fallback should return success=False."""
+    async def test_codergen_simulation_mode_on_import_error(self) -> None:
+        """P-C01: ImportError fallback enters simulation mode (SUCCESS)."""
         handler = CodergenHandler()
         node = _make_node(handler_type="codergen", prompt="do stuff", model="gpt-4o")
         ctx = PipelineContext()
 
-        # Mock the import to fail only for attractor.agent.* modules
-        real_import = builtins.__import__
+        with _simulate_agent_import_error():
+            result = await handler.execute(node, ctx)
 
-        def selective_import(name, *args, **kwargs):
-            if name.startswith("attractor.agent"):
-                raise ImportError("no agent")
-            return real_import(name, *args, **kwargs)
-
-        with patch.dict("sys.modules", {"attractor.agent.events": None}):
-            with patch("builtins.__import__", side_effect=selective_import):
-                result = await handler.execute(node, ctx)
-
-        assert result.success is False
-        assert result.status == OutcomeStatus.FAIL
-        assert "not available" in (result.failure_reason or "")
+        assert result.success is True
+        assert result.status == OutcomeStatus.SUCCESS
+        assert "Simulated response for stage: test_node" in result.output
+        assert "simulation mode" in (result.notes or "")
+        assert result.context_updates["last_response"] == result.output
 
     @pytest.mark.asyncio
     async def test_handler_exception_is_logged(self, caplog) -> None:
@@ -128,22 +138,15 @@ class TestCodergenHandler:
         node = _make_node(handler_type="codergen", prompt="fail", model="gpt-4o")
         ctx = PipelineContext()
 
-        real_import = builtins.__import__
-
-        def selective_import(name, *args, **kwargs):
-            if name.startswith("attractor.agent"):
-                raise RuntimeError("unexpected failure")
-            return real_import(name, *args, **kwargs)
-
-        with patch.dict("sys.modules", {"attractor.agent.events": None}):
-            with patch("builtins.__import__", side_effect=selective_import):
-                with caplog.at_level(
-                    logging.ERROR, logger="attractor.pipeline.handlers"
-                ):
-                    result = await handler.execute(node, ctx)
+        with _simulate_agent_import_error(RuntimeError, "unexpected failure"):
+            with caplog.at_level(
+                logging.ERROR, logger="attractor.pipeline.handlers"
+            ):
+                result = await handler.execute(node, ctx)
 
         assert result.success is False
         assert result.status == OutcomeStatus.FAIL
+        assert "Handler failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_codergen_falls_back_to_node_label(self, tmp_path) -> None:
@@ -157,16 +160,8 @@ class TestCodergenHandler:
         )
         ctx = PipelineContext()
 
-        real_import = builtins.__import__
-
-        def selective_import(name, *args, **kwargs):
-            if name.startswith("attractor.agent"):
-                raise ImportError("no agent")
-            return real_import(name, *args, **kwargs)
-
-        with patch.dict("sys.modules", {"attractor.agent.events": None}):
-            with patch("builtins.__import__", side_effect=selective_import):
-                await handler.execute(node, ctx, logs_root=tmp_path)
+        with _simulate_agent_import_error():
+            await handler.execute(node, ctx, logs_root=tmp_path)
 
         # Prompt resolution happens BEFORE the import attempt, so we can
         # verify via the written prompt.md that the label was used.
@@ -188,18 +183,10 @@ class TestCodergenHandler:
             metadata={"goal": "fix all bugs"},
         )
 
-        real_import = builtins.__import__
-
-        def selective_import(name, *args, **kwargs):
-            if name.startswith("attractor.agent"):
-                raise ImportError("no agent")
-            return real_import(name, *args, **kwargs)
-
-        with patch.dict("sys.modules", {"attractor.agent.events": None}):
-            with patch("builtins.__import__", side_effect=selective_import):
-                await handler.execute(
-                    node, ctx, graph=pipeline, logs_root=tmp_path
-                )
+        with _simulate_agent_import_error():
+            await handler.execute(
+                node, ctx, graph=pipeline, logs_root=tmp_path
+            )
 
         # Prompt expansion happens BEFORE the import attempt, so we can
         # verify via prompt.md that $goal was replaced.
@@ -216,27 +203,21 @@ class TestCodergenHandler:
         )
         ctx = PipelineContext()
 
-        real_import = builtins.__import__
+        with _simulate_agent_import_error():
+            result = await handler.execute(node, ctx, logs_root=tmp_path)
 
-        def selective_import(name, *args, **kwargs):
-            if name.startswith("attractor.agent"):
-                raise ImportError("no agent")
-            return real_import(name, *args, **kwargs)
+        assert result.status == OutcomeStatus.SUCCESS
 
-        with patch.dict("sys.modules", {"attractor.agent.events": None}):
-            with patch("builtins.__import__", side_effect=selective_import):
-                result = await handler.execute(node, ctx, logs_root=tmp_path)
-
-        assert result.status == OutcomeStatus.FAIL
-
-        # Check that prompt.md and status.json were written
+        # Check that prompt.md, response.md, and status.json were written
         stage_dir = tmp_path / "test_node"
         assert stage_dir.exists()
         assert (stage_dir / "prompt.md").exists()
         assert (stage_dir / "prompt.md").read_text() == "do stuff"
+        assert (stage_dir / "response.md").exists()
+        assert "Simulated response" in (stage_dir / "response.md").read_text()
         assert (stage_dir / "status.json").exists()
         status = json.loads((stage_dir / "status.json").read_text())
-        assert status["status"] == "fail"
+        assert status["status"] == "success"
 
     @pytest.mark.asyncio
     async def test_codergen_sets_last_response_context_key(self) -> None:
@@ -268,6 +249,92 @@ class TestCodergenHandler:
         assert "last_response" in result.context_updates
         assert result.context_updates["last_response"] == "agent output"
         assert "last_codergen_output" not in result.context_updates
+
+
+# ---------------------------------------------------------------------------
+# CodergenBackend protocol
+# ---------------------------------------------------------------------------
+
+
+class TestCodergenBackendProtocol:
+    """Tests for the P-C01 CodergenBackend protocol."""
+
+    def test_protocol_is_runtime_checkable(self) -> None:
+        """CodergenBackend should be a runtime_checkable Protocol."""
+
+        class MyBackend:
+            async def run(self, node, prompt, context):
+                return "output"
+
+        assert isinstance(MyBackend(), CodergenBackend)
+
+    def test_non_backend_is_not_instance(self) -> None:
+        """Classes missing run() should not satisfy the protocol."""
+
+        class NotABackend:
+            pass
+
+        assert not isinstance(NotABackend(), CodergenBackend)
+
+    @pytest.mark.asyncio
+    async def test_custom_backend_receives_correct_args(self) -> None:
+        """Custom backend receives node, prompt, and context."""
+        received: dict[str, object] = {}
+
+        class CapturingBackend:
+            async def run(self, node, prompt, context):
+                received["node"] = node
+                received["prompt"] = prompt
+                received["context"] = context
+                return "custom output"
+
+        backend = CapturingBackend()
+        handler = CodergenHandler(backend=backend)
+        node = _make_node(handler_type="codergen", prompt="do stuff", model="gpt-4o")
+        ctx = PipelineContext.from_dict({"key": "value"})
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.output == "custom output"
+        assert result.context_updates["last_response"] == "custom output"
+        assert received["node"] is node
+        assert received["prompt"] == "do stuff"
+        assert received["context"] is ctx
+
+    @pytest.mark.asyncio
+    async def test_failing_backend_returns_fail(self) -> None:
+        """Backend exception → FAIL result."""
+
+        class FailingBackend:
+            async def run(self, node, prompt, context):
+                raise RuntimeError("backend broke")
+
+        handler = CodergenHandler(backend=FailingBackend())
+        node = _make_node(handler_type="codergen", prompt="go", model="gpt-4o")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+
+        assert result.success is False
+        assert result.status == OutcomeStatus.FAIL
+        assert "backend broke" in (result.failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_simulation_mode_output_contains_node_name(self) -> None:
+        """Simulation mode includes node name in output text."""
+        handler = CodergenHandler()
+        node = _make_node(
+            name="review_code", handler_type="codergen", prompt="review", model="gpt-4o"
+        )
+        ctx = PipelineContext()
+
+        with _simulate_agent_import_error():
+            result = await handler.execute(node, ctx)
+
+        assert result.success is True
+        assert "review_code" in result.output
 
 
 # ---------------------------------------------------------------------------

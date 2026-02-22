@@ -291,8 +291,12 @@ class TestGenerate:
     async def test_generate_simple_text(self) -> None:
         adapter = MockAdapter()
         client = LLMClient(adapters=[adapter])
-        response = await client.generate("hello", model="mock-v1")
-        assert response.message.text() == "mock reply"
+        result = await client.generate("hello", model="mock-v1")
+        assert result.text == "mock reply"
+        assert isinstance(result.steps, list)
+        assert len(result.steps) == 1
+        assert result.total_usage.input_tokens == 10
+        assert result.total_usage.output_tokens == 5
 
     @pytest.mark.asyncio
     async def test_generate_with_tool_loop(self) -> None:
@@ -333,14 +337,22 @@ class TestGenerate:
         adapter = ToolAdapter()
         client = LLMClient(adapters=[adapter])
         tools = [ToolDefinition(name="search", description="Search")]
-        response = await client.generate(
+        result = await client.generate(
             "find info",
             model="mock-v1",
             tools=tools,
             tool_executor=executor,
         )
-        assert response.message.text() == "final answer"
+        assert result.text == "final answer"
         assert call_count == 2
+        # Should have 2 steps: tool call round + final text
+        assert len(result.steps) == 2
+        # Total usage aggregated across steps
+        assert result.total_usage.input_tokens == 25  # 10 + 15
+        assert result.total_usage.output_tokens == 15  # 5 + 10
+        # All tool calls collected
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].tool_name == "search"
 
         # Verify tool results were included in the second request
         # Messages should be: user, assistant (tool call), tool result
@@ -355,7 +367,7 @@ class TestGenerate:
 
     @pytest.mark.asyncio
     async def test_generate_no_executor_returns_tool_response(self) -> None:
-        """Without a tool_executor, generate returns the tool_use response."""
+        """Without a tool_executor, generate returns the tool_use result."""
 
         class ToolAdapter(MockAdapter):
             async def complete(self, request: Request) -> Response:
@@ -376,16 +388,16 @@ class TestGenerate:
 
         adapter = ToolAdapter()
         client = LLMClient(adapters=[adapter])
-        response = await client.generate("do it", model="mock-v1")
-        assert response.finish_reason == FinishReason.TOOL_USE
+        result = await client.generate("do it", model="mock-v1")
+        assert result.finish_reason == FinishReason.TOOL_USE
 
     @pytest.mark.asyncio
     async def test_generate_with_message_list(self) -> None:
         adapter = MockAdapter()
         client = LLMClient(adapters=[adapter])
         messages = [Message.system("Be helpful"), Message.user("hi")]
-        response = await client.generate(messages, model="mock-v1")
-        assert response.message.text() == "mock reply"
+        result = await client.generate(messages, model="mock-v1")
+        assert result.text == "mock reply"
 
     @pytest.mark.asyncio
     async def test_generate_concurrent_tool_execution(self) -> None:
@@ -442,14 +454,14 @@ class TestGenerate:
             ToolDefinition(name="tool_b", description="B"),
             ToolDefinition(name="tool_c", description="C"),
         ]
-        response = await client.generate(
+        result = await client.generate(
             "multi",
             model="mock-v1",
             tools=tools,
             tool_executor=executor,
         )
 
-        assert response.message.text() == "done"
+        assert result.text == "done"
         assert call_count == 2
         assert len(execution_log) == 3
 
@@ -504,13 +516,13 @@ class TestGenerate:
 
         adapter = ToolAdapter()
         client = LLMClient(adapters=[adapter])
-        response = await client.generate(
+        result = await client.generate(
             "test",
             model="mock-v1",
             tools=[ToolDefinition(name="failing_tool", description="Fails")],
             tool_executor=executor,
         )
-        assert response.message.text() == "handled error"
+        assert result.text == "handled error"
 
 
 # ---------------------------------------------------------------------------
@@ -801,8 +813,8 @@ class TestModuleLevelFunctions:
         client = LLMClient(adapters=[adapter])
         llm_module.set_default_client(client)
 
-        response = await llm_module.generate("hello", model="mock-v1")
-        assert response.message.text() == "mock reply"
+        result = await llm_module.generate("hello", model="mock-v1")
+        assert result.text == "mock reply"
         assert len(adapter.complete_calls) == 1
 
     @pytest.mark.asyncio
@@ -825,8 +837,8 @@ class TestModuleLevelFunctions:
         llm_module.set_default_client(LLMClient(adapters=[default_adapter]))
         explicit_client = LLMClient(adapters=[explicit_adapter])
 
-        response = await llm_module.generate("hi", model="mock-v1", client=explicit_client)
-        assert response.message.text() == "explicit"
+        result = await llm_module.generate("hi", model="mock-v1", client=explicit_client)
+        assert result.text == "explicit"
 
     @pytest.mark.asyncio
     async def test_stream_delegates_to_client(self) -> None:
@@ -1076,16 +1088,16 @@ class TestTimeout:
         """generate() without timeout should work normally."""
         adapter = MockAdapter()
         client = LLMClient(adapters=[adapter])
-        response = await client.generate("hello", model="mock-v1", timeout=None)
-        assert response.message.text() == "mock reply"
+        result = await client.generate("hello", model="mock-v1", timeout=None)
+        assert result.text == "mock reply"
 
     @pytest.mark.asyncio
     async def test_generate_with_timeout_succeeds_when_fast(self) -> None:
         """generate() with generous timeout should succeed for fast responses."""
         adapter = MockAdapter()
         client = LLMClient(adapters=[adapter])
-        response = await client.generate("hello", model="mock-v1", timeout=10.0)
-        assert response.message.text() == "mock reply"
+        result = await client.generate("hello", model="mock-v1", timeout=10.0)
+        assert result.text == "mock reply"
 
 
 class TestAbortSignal:
@@ -1150,8 +1162,8 @@ class TestAbortSignal:
         """generate() without abort_signal should work normally."""
         adapter = MockAdapter()
         client = LLMClient(adapters=[adapter])
-        response = await client.generate("hello", model="mock-v1", abort_signal=None)
-        assert response.message.text() == "mock reply"
+        result = await client.generate("hello", model="mock-v1", abort_signal=None)
+        assert result.text == "mock reply"
 
 
 # ---------------------------------------------------------------------------
@@ -1452,13 +1464,13 @@ class TestToolValidation:
                 },
             )
         ]
-        response = await client.generate(
+        result = await client.generate(
             "test",
             model="mock-v1",
             tools=tools,
             tool_executor=executor,
         )
-        assert response.message.text() == "recovered"
+        assert result.text == "recovered"
 
         # Check that a tool error result was sent back
         tool_msgs = [m for m in captured_messages if m.role == Role.TOOL]

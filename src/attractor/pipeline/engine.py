@@ -80,6 +80,7 @@ class PipelineEngine:
         goal_gate: GoalGate | None = None,
         max_steps: int = 1000,
         event_emitter: PipelineEventEmitter | None = None,
+        logs_root: str | Path | None = None,
     ) -> None:
         self._registry = registry
         self._stylesheet = stylesheet or ModelStylesheet()
@@ -87,6 +88,7 @@ class PipelineEngine:
         self._goal_gate = goal_gate
         self._max_steps = max_steps
         self._event_emitter = event_emitter
+        self._logs_root: Path | None = Path(logs_root) if logs_root else None
 
     async def _emit(self, event: PipelineEvent) -> None:
         """Emit a pipeline event if an emitter is configured."""
@@ -245,11 +247,11 @@ class PipelineEngine:
                 try:
                     if node.timeout is not None:
                         result = await asyncio.wait_for(
-                            handler.execute(node, ctx, pipeline, None),
+                            handler.execute(node, ctx, pipeline, self._logs_root),
                             timeout=node.timeout,
                         )
                     else:
-                        result = await handler.execute(node, ctx, pipeline, None)
+                        result = await handler.execute(node, ctx, pipeline, self._logs_root)
                 except asyncio.TimeoutError:
                     logger.error(
                         "Node '%s' timed out after %ss",

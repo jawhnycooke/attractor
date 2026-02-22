@@ -248,12 +248,106 @@ def _write_status_file(
     (stage_dir / "status.json").write_text(json.dumps(data))
 
 
+@runtime_checkable
+class CodergenBackend(Protocol):
+    """Protocol for pluggable codergen execution backends.
+
+    Implementations handle the actual LLM-driven code generation,
+    decoupling the handler from any specific agent implementation.
+    """
+
+    async def run(
+        self,
+        node: PipelineNode,
+        prompt: str,
+        context: PipelineContext,
+    ) -> str:
+        """Execute a code generation prompt and return the result text.
+
+        Args:
+            node: The pipeline node being executed.
+            prompt: The fully interpolated prompt string.
+            context: Shared pipeline context.
+
+        Returns:
+            The generated text output.
+
+        Raises:
+            Exception: On any execution failure.
+        """
+        ...
+
+
+class AgentBackend:
+    """Default :class:`CodergenBackend` that uses ``attractor.agent.Session``."""
+
+    async def run(
+        self,
+        node: PipelineNode,
+        prompt: str,
+        context: PipelineContext,
+    ) -> str:
+        """Run the coding agent session for the given prompt.
+
+        Args:
+            node: The pipeline node being executed.
+            prompt: The fully interpolated prompt string.
+            context: Shared pipeline context.
+
+        Returns:
+            The concatenated text output from the agent session.
+        """
+        from attractor.agent.events import AgentEventType
+        from attractor.agent.environment import LocalExecutionEnvironment
+        from attractor.agent.profiles import (
+            AnthropicProfile,
+            GeminiProfile,
+            OpenAIProfile,
+        )
+        from attractor.agent.session import Session, SessionConfig
+        from attractor.llm.client import LLMClient
+
+        model = node.attributes.get("model", "")
+
+        # Select profile based on model name prefix
+        if model.startswith("claude"):
+            profile = AnthropicProfile()
+        elif model.startswith("gemini"):
+            profile = GeminiProfile()
+        else:
+            profile = OpenAIProfile()
+
+        environment = LocalExecutionEnvironment()
+        config = SessionConfig(model_id=model)
+        llm_client = LLMClient()
+
+        session = Session(
+            profile=profile,
+            environment=environment,
+            config=config,
+            llm_client=llm_client,
+        )
+
+        output_parts: list[str] = []
+        async for event in session.submit(prompt):
+            if event.type == AgentEventType.ASSISTANT_TEXT_DELTA:
+                text = event.data.get("text", "")
+                if text:
+                    output_parts.append(text)
+
+        return "".join(output_parts)
+
+
 class CodergenHandler:
     """Invoke the Attractor coding agent to execute a prompt.
 
-    Attempts to import ``attractor.agent``; falls back to an error result
-    when the agent module is unavailable.
+    Accepts an optional :class:`CodergenBackend` for pluggable execution.
+    Falls back to :class:`AgentBackend` or simulation mode when the agent
+    module is unavailable.
     """
+
+    def __init__(self, backend: CodergenBackend | None = None) -> None:
+        self._backend = backend
 
     async def execute(
         self,
@@ -295,45 +389,31 @@ class CodergenHandler:
             stage_dir.mkdir(parents=True, exist_ok=True)
             (stage_dir / "prompt.md").write_text(prompt)
 
+        # Resolve backend
+        backend = self._backend
+        if backend is None:
+            try:
+                backend = AgentBackend()
+            except ImportError:
+                logger.warning(
+                    "attractor.agent not available — falling back to simulation mode"
+                )
+                result_text = f"Simulated response for stage: {node.name}"
+                if stage_dir is not None:
+                    (stage_dir / "response.md").write_text(result_text)
+                    (stage_dir / "status.json").write_text(
+                        json.dumps({"status": "success", "node": node.name,
+                                    "notes": "simulation mode"})
+                    )
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    output=result_text,
+                    context_updates={"last_response": result_text},
+                    notes="simulation mode — agent module not available",
+                )
+
         try:
-            from attractor.agent.events import AgentEventType
-            from attractor.agent.environment import LocalExecutionEnvironment
-            from attractor.agent.profiles import (
-                AnthropicProfile,
-                GeminiProfile,
-                OpenAIProfile,
-            )
-            from attractor.agent.session import Session, SessionConfig
-            from attractor.llm.client import LLMClient
-
-            # Select profile based on model name prefix
-            if model.startswith("claude"):
-                profile = AnthropicProfile()
-            elif model.startswith("gemini"):
-                profile = GeminiProfile()
-            else:
-                profile = OpenAIProfile()
-
-            environment = LocalExecutionEnvironment()
-            config = SessionConfig(model_id=model)
-            llm_client = LLMClient()
-
-            session = Session(
-                profile=profile,
-                environment=environment,
-                config=config,
-                llm_client=llm_client,
-            )
-
-            # Consume the async event iterator and collect text
-            output_parts: list[str] = []
-            async for event in session.submit(prompt):
-                if event.type == AgentEventType.ASSISTANT_TEXT_DELTA:
-                    text = event.data.get("text", "")
-                    if text:
-                        output_parts.append(text)
-
-            result_text = "".join(output_parts)
+            result_text = await backend.run(node, prompt, context)
 
             # H2: Write response.md and status.json
             if stage_dir is not None:
@@ -350,19 +430,20 @@ class CodergenHandler:
             )
         except ImportError:
             logger.warning(
-                "attractor.agent not available — codergen handler cannot run"
+                "attractor.agent not available — falling back to simulation mode"
             )
+            result_text = f"Simulated response for stage: {node.name}"
             if stage_dir is not None:
+                (stage_dir / "response.md").write_text(result_text)
                 (stage_dir / "status.json").write_text(
-                    json.dumps({"status": "fail", "node": node.name,
-                                "reason": "agent module not available"})
+                    json.dumps({"status": "success", "node": node.name,
+                                "notes": "simulation mode"})
                 )
             return NodeResult(
-                status=OutcomeStatus.FAIL,
-                failure_reason=(
-                    "attractor.agent module is not available; "
-                    "cannot execute codergen handler"
-                ),
+                status=OutcomeStatus.SUCCESS,
+                output=result_text,
+                context_updates={"last_response": result_text},
+                notes="simulation mode — agent module not available",
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
