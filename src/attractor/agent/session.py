@@ -356,9 +356,9 @@ class Session:
         if event.type == AgentEventType.TOOL_CALL_END:
             pending_tool_results.append(
                 ToolResult(
-                    output=event.data.get("output", ""),
+                    output=event.data.get("truncated_output", ""),
                     is_error=bool(event.data.get("is_error", False)),
-                    full_output=event.data.get("full_output", ""),
+                    full_output=event.data.get("output", ""),
                 )
             )
             return

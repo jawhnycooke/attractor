@@ -101,22 +101,45 @@ class AnthropicAdapter:
     # Request mapping
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def _is_tool_result_message(msg: dict[str, Any]) -> bool:
+        """Check if a mapped message contains only tool_result content blocks."""
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return False
+        return all(
+            isinstance(part, dict) and part.get("type") == "tool_result"
+            for part in content
+        )
+
     def _ensure_alternation(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Anthropic requires strict user/assistant alternation.
 
-        Insert synthetic placeholder messages where consecutive same-role
-        messages would otherwise violate the constraint.
+        Consecutive user messages containing only tool_result blocks are
+        merged into a single user message (the Anthropic API requires all
+        tool results for a given assistant turn to appear in one user
+        message).  For all other consecutive same-role messages a synthetic
+        placeholder is inserted to satisfy the alternation constraint.
         """
         if not messages:
             return messages
 
         result: list[dict[str, Any]] = [messages[0]]
         for msg in messages[1:]:
-            prev_role = result[-1]["role"]
+            prev = result[-1]
+            prev_role = prev["role"]
             curr_role = msg["role"]
             if curr_role == prev_role:
+                # Merge consecutive tool_result user messages
+                if (
+                    curr_role == "user"
+                    and self._is_tool_result_message(prev)
+                    and self._is_tool_result_message(msg)
+                ):
+                    prev["content"].extend(msg["content"])
+                    continue
                 filler_role = "user" if curr_role == "assistant" else "assistant"
                 result.append({"role": filler_role, "content": "..."})
             result.append(msg)
@@ -312,6 +335,17 @@ class AnthropicAdapter:
                 tc_mapped = self._map_tool_choice(request.tool_choice)
                 if tc_mapped is not None:
                     kwargs["tool_choice"] = tc_mapped
+
+        # Map response_format to Anthropic's output_config
+        if request.response_format:
+            json_schema_block = request.response_format.get("json_schema", {})
+            schema = json_schema_block.get("schema", {})
+            kwargs["output_config"] = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": schema,
+                }
+            }
 
         # Auto-inject cache_control for prompt caching
         self._inject_cache_control(kwargs, request)

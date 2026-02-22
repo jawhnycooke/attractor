@@ -52,6 +52,9 @@ testpaths = ["tests"]
 filterwarnings = [
     "ignore::pyparsing.exceptions.PyparsingDeprecationWarning",
 ]
+markers = [
+    "smoke: integration smoke tests requiring real API keys",
+]
 
 [tool.mypy]
 python_version = "3.11"
