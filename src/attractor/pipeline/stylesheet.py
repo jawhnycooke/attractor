@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from attractor.pipeline.models import PipelineNode
+from attractor.pipeline.models import Pipeline, PipelineNode
 
 
 @dataclass
@@ -224,19 +224,34 @@ def parse_stylesheet(css: str) -> ModelStylesheet:
 
 
 def apply_stylesheet(
-    stylesheet: ModelStylesheet, node: PipelineNode
+    stylesheet: ModelStylesheet,
+    node: PipelineNode,
+    pipeline: Pipeline | None = None,
 ) -> dict[str, Any]:
     """Resolve final attributes for *node* by layering stylesheet defaults.
 
     Evaluation order:
-    1. Sort rules by specificity (lower first, so higher overrides).
-    2. Collect matching defaults.
+    1. Graph-level defaults from ``pipeline.metadata`` (lowest priority).
+    2. Stylesheet rules sorted by specificity (lower first, so higher
+       specificity overrides).
     3. Node's own attributes override everything.
+
+    When the resolved attributes include ``llm_model``, ``llm_provider``,
+    or ``reasoning_effort``, the corresponding :class:`PipelineNode` field
+    is set directly — but only if the node doesn't already have it set.
+
+    Args:
+        stylesheet: The stylesheet to apply.
+        node: The node to resolve attributes for.
+        pipeline: Optional pipeline for graph-level default attributes.
 
     Returns:
         Merged attribute dict ready for handler consumption.
     """
     resolved: dict[str, Any] = {}
+    # Graph-level defaults (lowest priority)
+    if pipeline is not None:
+        resolved.update(pipeline.metadata)
     # Sort by specificity (lower first, so higher specificity overrides)
     sorted_rules = sorted(stylesheet.rules, key=lambda r: r.specificity)
     for rule in sorted_rules:
@@ -244,4 +259,11 @@ def apply_stylesheet(
             resolved.update(rule.defaults())
     # Node-specific attributes always win
     resolved.update(node.attributes)
+    # Set PipelineNode fields directly from resolved values
+    if node.llm_model is None and "llm_model" in resolved:
+        node.llm_model = resolved["llm_model"]
+    if node.llm_provider is None and "llm_provider" in resolved:
+        node.llm_provider = resolved["llm_provider"]
+    if "reasoning_effort" in resolved and "reasoning_effort" not in node.attributes:
+        node.reasoning_effort = resolved["reasoning_effort"]
     return resolved

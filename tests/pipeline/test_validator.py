@@ -323,6 +323,59 @@ class TestValidateOrRaise:
         assert any(f.rule == "type_known" for f in findings)
 
 
+class TestStylesheetAppliedBeforeValidation:
+    """S4: Stylesheet should be applied as a pre-validation transform."""
+
+    def test_stylesheet_applied_sets_node_fields(self) -> None:
+        """Validator should apply stylesheet to nodes before running checks."""
+        nodes = {
+            "start": PipelineNode(
+                name="start", handler_type="codergen", is_start=True
+            ),
+            "end": PipelineNode(
+                name="end", handler_type="conditional", is_terminal=True
+            ),
+        }
+        pipeline = _make_pipeline(
+            nodes=nodes,
+            model_stylesheet="* { llm_model: gpt-4o; }",
+        )
+        # Before validation, llm_model is not set
+        assert pipeline.nodes["start"].llm_model is None
+
+        validate_pipeline(pipeline)
+
+        # After validation, stylesheet should have been applied
+        assert pipeline.nodes["start"].llm_model == "gpt-4o"
+        assert pipeline.nodes["end"].llm_model == "gpt-4o"
+
+    def test_invalid_stylesheet_does_not_block_validation(self) -> None:
+        """Invalid stylesheet should not prevent other validation checks."""
+        pipeline = _make_pipeline(
+            model_stylesheet="not a valid stylesheet at all",
+        )
+        findings = validate_pipeline(pipeline)
+        # Should still report stylesheet_syntax error
+        assert any(f.rule == "stylesheet_syntax" for f in findings)
+        # But other checks should still have run (e.g., start_node is valid)
+        assert not any(f.rule == "start_node" for f in findings)
+
+    def test_no_stylesheet_skips_application(self) -> None:
+        """No stylesheet means no pre-validation step."""
+        nodes = {
+            "start": PipelineNode(
+                name="start", handler_type="codergen", is_start=True
+            ),
+            "end": PipelineNode(
+                name="end", handler_type="conditional", is_terminal=True
+            ),
+        }
+        pipeline = _make_pipeline(nodes=nodes)
+        validate_pipeline(pipeline)
+        # No stylesheet to apply, so llm_model stays None
+        assert pipeline.nodes["start"].llm_model is None
+
+
 class TestLintRuleName:
     """V8: LintRule protocol has name attribute."""
 

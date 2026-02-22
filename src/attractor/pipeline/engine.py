@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from attractor.pipeline.conditions import evaluate_condition
+from attractor.pipeline.events import PipelineEvent, PipelineEventEmitter, PipelineEventType
 from attractor.pipeline.goals import GoalGate
 from attractor.pipeline.handlers import (
     HandlerRegistry,
@@ -39,6 +40,24 @@ class EngineError(Exception):
     """Raised for unrecoverable engine failures."""
 
 
+def create_stage_dir(logs_root: Path, node_name: str) -> Path:
+    """Create a standardized stage directory for a pipeline node.
+
+    Creates ``{logs_root}/{node_name}/`` with the directory
+    structure required by the run directory spec.
+
+    Args:
+        logs_root: Root directory for pipeline run logs.
+        node_name: Name of the pipeline node.
+
+    Returns:
+        Path to the created stage directory.
+    """
+    stage_dir = logs_root / node_name
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    return stage_dir
+
+
 class PipelineEngine:
     """Single-threaded pipeline execution engine.
 
@@ -60,12 +79,19 @@ class PipelineEngine:
         checkpoint_dir: str | Path | None = None,
         goal_gate: GoalGate | None = None,
         max_steps: int = 1000,
+        event_emitter: PipelineEventEmitter | None = None,
     ) -> None:
         self._registry = registry
         self._stylesheet = stylesheet or ModelStylesheet()
         self._checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self._goal_gate = goal_gate
         self._max_steps = max_steps
+        self._event_emitter = event_emitter
+
+    async def _emit(self, event: PipelineEvent) -> None:
+        """Emit a pipeline event if an emitter is configured."""
+        if self._event_emitter is not None:
+            await self._event_emitter.emit(event)
 
     async def run(
         self,
@@ -114,6 +140,12 @@ class PipelineEngine:
         if not ctx.has("graph.goal"):
             ctx.set("graph.goal", pipeline.goal)
 
+        # Emit pipeline start event
+        await self._emit(PipelineEvent(
+            type=PipelineEventType.PIPELINE_START,
+            pipeline_name=pipeline.name,
+        ))
+
         steps = 0
         while steps < self._max_steps:
             steps += 1
@@ -122,6 +154,10 @@ class PipelineEngine:
             # Apply stylesheet defaults
             if self._stylesheet:
                 node.attributes = apply_stylesheet(self._stylesheet, node)
+
+            # #14: Apply fidelity mode if set on the node
+            if node.fidelity:
+                self._apply_fidelity(ctx, node.fidelity)
 
             # E3: Check goal gates BEFORE executing terminal node handler
             if node.is_terminal:
@@ -160,6 +196,14 @@ class PipelineEngine:
                 "Executing node '%s' (handler: %s)", node.name, node.handler_type
             )
 
+            # Emit node start event
+            await self._emit(PipelineEvent(
+                type=PipelineEventType.NODE_START,
+                node_name=node.name,
+                pipeline_name=pipeline.name,
+                data={"handler_type": node.handler_type},
+            ))
+
             # Dispatch to handler
             handler = registry.get(node.handler_type)
             if handler is None:
@@ -188,6 +232,13 @@ class PipelineEngine:
                         max_attempts,
                         delay,
                     )
+                    # Emit node retry event
+                    await self._emit(PipelineEvent(
+                        type=PipelineEventType.NODE_RETRY,
+                        node_name=node.name,
+                        pipeline_name=pipeline.name,
+                        data={"attempt": attempt + 1, "max_attempts": max_attempts, "delay": delay},
+                    ))
                     await asyncio.sleep(delay)
 
                 # E5: Catch handler exceptions and treat as retriable
@@ -278,6 +329,22 @@ class PipelineEngine:
                 completed.append(node.name)
                 # E9: Track node outcomes
                 node_outcomes[node.name] = result.status
+
+            # Emit node complete or fail event
+            if result.status == OutcomeStatus.FAIL:
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.NODE_FAIL,
+                    node_name=node.name,
+                    pipeline_name=pipeline.name,
+                    data={"failure_reason": result.failure_reason},
+                ))
+            else:
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.NODE_COMPLETE,
+                    node_name=node.name,
+                    pipeline_name=pipeline.name,
+                    data={"status": result.status.value},
+                ))
 
             # E7: Failure routing — do NOT fall through to normal edge selection
             if result.status == OutcomeStatus.FAIL:
@@ -371,6 +438,11 @@ class PipelineEngine:
                     pipeline.name,
                     node.name,
                 )
+                # Emit pipeline complete event
+                await self._emit(PipelineEvent(
+                    type=PipelineEventType.PIPELINE_COMPLETE,
+                    pipeline_name=pipeline.name,
+                ))
                 break
 
             if next_node not in pipeline.nodes:
@@ -406,6 +478,21 @@ class PipelineEngine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_fidelity(ctx: PipelineContext, fidelity: str) -> None:
+        """Record the fidelity mode in context.
+
+        Sets ``_fidelity_mode`` in the pipeline context. Actual
+        truncation/summarization is future work — for now just
+        track and log the mode.
+
+        Args:
+            ctx: The pipeline context to update.
+            fidelity: The fidelity mode string (e.g., "full", "compact").
+        """
+        ctx.set("_fidelity_mode", fidelity)
+        logger.debug("Fidelity mode set to '%s'", fidelity)
 
     @staticmethod
     def _check_goal_gates(
@@ -565,14 +652,25 @@ class PipelineEngine:
         ctx: PipelineContext,
         completed: list[str],
     ) -> None:
+        """Save checkpoint with node_retries extracted from context."""
         if self._checkpoint_dir is None:
             return
+
+        # S3-ckpt: Extract node_retries from context keys
+        node_retries: dict[str, int] = {}
+        for key, value in ctx.to_dict().items():
+            if key.startswith("internal.retry_count."):
+                node_name = key[len("internal.retry_count."):]
+                if isinstance(value, int):
+                    node_retries[node_name] = value
+
         cp = Checkpoint(
             pipeline_name=pipeline_name,
             current_node=current_node,
             context=ctx,
             completed_nodes=list(completed),
             timestamp=time.time(),
+            node_retries=node_retries,
         )
         path = save_checkpoint(cp, self._checkpoint_dir)
         logger.debug("Checkpoint saved to %s", path)

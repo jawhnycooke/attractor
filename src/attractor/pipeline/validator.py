@@ -102,6 +102,19 @@ def validate_pipeline(
     """
     errors: list[ValidationError] = []
 
+    # Apply stylesheet defaults to nodes before validation (S4).
+    # This ensures the validator sees fully resolved node attributes.
+    if pipeline.model_stylesheet:
+        try:
+            from attractor.pipeline.stylesheet import apply_stylesheet, parse_stylesheet
+
+            stylesheet = parse_stylesheet(pipeline.model_stylesheet)
+            if stylesheet.rules:
+                for node in pipeline.nodes.values():
+                    apply_stylesheet(stylesheet, node, pipeline=pipeline)
+        except Exception:
+            pass  # Syntax errors are reported by _check_stylesheet_syntax
+
     _check_start_node(pipeline, errors)
     _check_start_no_incoming(pipeline, errors)
     _check_terminal_nodes(pipeline, errors)

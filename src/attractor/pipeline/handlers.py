@@ -25,6 +25,7 @@ from attractor.pipeline.models import (
     OutcomeStatus,
     Pipeline,
     PipelineContext,
+    PipelineEdge,
     PipelineNode,
 )
 
@@ -44,18 +45,42 @@ class NodeHandler(Protocol):
     ) -> NodeResult: ...
 
 
+@runtime_checkable
+class HandlerHook(Protocol):
+    """Hook protocol for pre/post handler execution.
+
+    Hooks are called by :meth:`HandlerRegistry.dispatch` around each
+    handler execution, enabling logging, auditing, and tool-call
+    interception per spec §9.7.
+    """
+
+    async def before_execute(
+        self, node: PipelineNode, context: PipelineContext
+    ) -> None: ...
+
+    async def after_execute(
+        self, node: PipelineNode, context: PipelineContext, result: NodeResult
+    ) -> None: ...
+
+
 class HandlerRegistry:
     """Registry mapping handler-type strings to handler instances.
 
     Used by :class:`PipelineEngine` to dispatch node execution to the
     appropriate handler based on the node's ``handler_type`` attribute.
 
-    Supports a ``default_handler`` fallback for unknown handler types.
+    Supports a ``default_handler`` fallback for unknown handler types
+    and optional :class:`HandlerHook` instances called around execution.
     """
 
-    def __init__(self, default_handler: NodeHandler | None = None) -> None:
+    def __init__(
+        self,
+        default_handler: NodeHandler | None = None,
+        hooks: list[HandlerHook] | None = None,
+    ) -> None:
         self._handlers: dict[str, NodeHandler] = {}
         self._default_handler = default_handler
+        self._hooks: list[HandlerHook] = list(hooks) if hooks else []
 
     @property
     def default_handler(self) -> NodeHandler | None:
@@ -66,6 +91,19 @@ class HandlerRegistry:
     def default_handler(self, handler: NodeHandler | None) -> None:
         """Set the default fallback handler."""
         self._default_handler = handler
+
+    @property
+    def hooks(self) -> list[HandlerHook]:
+        """Return the list of registered hooks."""
+        return list(self._hooks)
+
+    def add_hook(self, hook: HandlerHook) -> None:
+        """Append a hook to the registry.
+
+        Args:
+            hook: The hook instance to add.
+        """
+        self._hooks.append(hook)
 
     def register(self, handler_type: str, handler: NodeHandler) -> None:
         """Register a *handler* under *handler_type*.
@@ -102,6 +140,47 @@ class HandlerRegistry:
     def registered_types(self) -> list[str]:
         """Return a list of all registered handler type strings."""
         return list(self._handlers.keys())
+
+    async def dispatch(
+        self,
+        handler_type: str,
+        node: PipelineNode,
+        context: PipelineContext,
+        graph: Pipeline | None = None,
+        logs_root: Path | None = None,
+    ) -> NodeResult:
+        """Look up and execute a handler with hook invocation.
+
+        Runs all registered :class:`HandlerHook` ``before_execute``
+        callbacks before the handler and ``after_execute`` callbacks
+        after.
+
+        Args:
+            handler_type: The handler key to dispatch.
+            node: The pipeline node being executed.
+            context: Shared pipeline context.
+            graph: The full pipeline graph.
+            logs_root: Filesystem path for this run's log/artifact directory.
+
+        Returns:
+            The :class:`NodeResult` from the handler execution.
+        """
+        handler = self.get(handler_type)
+        if handler is None:
+            return NodeResult(
+                status=OutcomeStatus.FAIL,
+                failure_reason=f"No handler for '{handler_type}'",
+            )
+
+        for hook in self._hooks:
+            await hook.before_execute(node, context)
+
+        result = await handler.execute(node, context, graph, logs_root)
+
+        for hook in self._hooks:
+            await hook.after_execute(node, context, result)
+
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +220,32 @@ def _expand_goal(prompt: str, graph: Pipeline | None) -> str:
         goal = graph.metadata.get("goal", graph.goal or "")
         prompt = prompt.replace("$goal", str(goal))
     return prompt
+
+
+def _write_status_file(
+    logs_root: Path,
+    node: PipelineNode,
+    status: str,
+    reason: str | None = None,
+) -> None:
+    """Write a standardized ``status.json`` to the node's stage directory.
+
+    Args:
+        logs_root: Root log directory for the current run.
+        node: The pipeline node being executed.
+        status: Outcome status string (``"success"`` or ``"fail"``).
+        reason: Optional failure reason.
+    """
+    stage_dir = logs_root / node.name
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    data: dict[str, str] = {
+        "status": status,
+        "node": node.name,
+        "handler": node.handler_type,
+    }
+    if reason:
+        data["reason"] = reason
+    (stage_dir / "status.json").write_text(json.dumps(data))
 
 
 class CodergenHandler:
@@ -319,6 +424,13 @@ class WaitHumanHandler:
         Uses outgoing edge targets as ``suggested_next_ids`` and sets
         ``human_choice`` / ``selected_edge_id`` context keys per spec.
 
+        H7: Parses accelerator keys from edge labels and passes them
+        to the interviewer alongside the labels.
+
+        H8: Wraps interviewer calls with ``asyncio.wait_for`` when
+        ``node.timeout`` is set.  On timeout, checks
+        ``human.default_choice``; on SKIPPED, returns FAIL.
+
         Args:
             node: The pipeline node being executed.
             context: Shared pipeline context.
@@ -337,6 +449,8 @@ class WaitHumanHandler:
                 failure_reason="No interviewer configured for wait.human node",
             )
 
+        timeout = node.timeout
+
         # H6: Use outgoing edges from the graph parameter (preferred) or stored pipeline
         active_graph = graph or self._pipeline
 
@@ -345,11 +459,35 @@ class WaitHumanHandler:
             if edges:
                 # H7: Parse accelerator keys from edge labels
                 edge_labels = [e.label or e.target for e in edges]
+                accelerator_keys = [
+                    _parse_accelerator_key(label) for label in edge_labels
+                ]
 
                 await interviewer.inform(f"Node '{node.name}': {prompt}")
 
                 if hasattr(interviewer, "ask"):
-                    answer = await interviewer.ask(prompt, options=edge_labels)
+                    # H8: Wrap with timeout if configured
+                    try:
+                        ask_coro = interviewer.ask(
+                            prompt,
+                            options=edge_labels,
+                            accelerators=accelerator_keys,
+                        )
+                        if timeout is not None:
+                            answer = await asyncio.wait_for(
+                                ask_coro, timeout=timeout
+                            )
+                        else:
+                            answer = await ask_coro
+                    except asyncio.TimeoutError:
+                        return self._handle_timeout(node, edges)
+
+                    # H8: Handle SKIPPED
+                    if answer == "SKIPPED":
+                        return NodeResult(
+                            status=OutcomeStatus.FAIL,
+                            failure_reason="human skipped interaction",
+                        )
 
                     # Find the matching edge
                     selected_edge = None
@@ -373,10 +511,78 @@ class WaitHumanHandler:
         await interviewer.inform(f"Node '{node.name}': {prompt}")
 
         # Fallback: simple confirm
-        approved = await interviewer.confirm(prompt)
+        # H8: Wrap with timeout if configured
+        try:
+            confirm_coro = interviewer.confirm(prompt)
+            if timeout is not None:
+                approved = await asyncio.wait_for(confirm_coro, timeout=timeout)
+            else:
+                approved = await confirm_coro
+        except asyncio.TimeoutError:
+            default_choice = node.attributes.get("human.default_choice")
+            if default_choice:
+                return NodeResult(
+                    status=OutcomeStatus.SUCCESS,
+                    context_updates={
+                        "approved": True,
+                        "human_choice": default_choice,
+                    },
+                )
+            return NodeResult(
+                status=OutcomeStatus.RETRY,
+                failure_reason="human gate timeout, no default",
+            )
+
+        # H8: Handle SKIPPED
+        if approved == "SKIPPED":
+            return NodeResult(
+                status=OutcomeStatus.FAIL,
+                failure_reason="human skipped interaction",
+            )
+
         return NodeResult(
             status=OutcomeStatus.SUCCESS,
             context_updates={"approved": approved},
+        )
+
+    @staticmethod
+    def _handle_timeout(
+        node: PipelineNode,
+        edges: list[PipelineEdge],
+    ) -> NodeResult:
+        """Handle timeout for the ask path.
+
+        Args:
+            node: The pipeline node being executed.
+            edges: Outgoing edges from the node.
+
+        Returns:
+            A :class:`NodeResult` using the default choice or RETRY.
+        """
+        default_choice = node.attributes.get("human.default_choice")
+        if default_choice:
+            for e in edges:
+                if e.target == default_choice:
+                    return NodeResult(
+                        status=OutcomeStatus.SUCCESS,
+                        suggested_next_ids=[e.target],
+                        context_updates={
+                            "human_choice": e.label or e.target,
+                            "selected_edge_id": e.target,
+                        },
+                    )
+            # default_choice didn't match any edge target, use it directly
+            return NodeResult(
+                status=OutcomeStatus.SUCCESS,
+                suggested_next_ids=[default_choice],
+                context_updates={
+                    "human_choice": default_choice,
+                    "selected_edge_id": default_choice,
+                },
+            )
+        return NodeResult(
+            status=OutcomeStatus.RETRY,
+            failure_reason="human gate timeout, no default",
         )
 
 
@@ -634,7 +840,7 @@ class ToolHandler:
                 timeout=float(node.attributes.get("timeout", 300)),
             )
             success = proc.returncode == 0
-            return NodeResult(
+            result = NodeResult(
                 status=OutcomeStatus.SUCCESS if success else OutcomeStatus.FAIL,
                 output=proc.stdout,
                 failure_reason=proc.stderr if not success else None,
@@ -645,25 +851,46 @@ class ToolHandler:
                     "stderr": proc.stderr,
                 },
             )
+            # #12: Write status file
+            if logs_root is not None:
+                _write_status_file(
+                    logs_root,
+                    node,
+                    "success" if success else "fail",
+                    proc.stderr if not success else None,
+                )
+            return result
         except subprocess.TimeoutExpired:
+            reason = f"Command timed out: {command}"
+            if logs_root is not None:
+                _write_status_file(logs_root, node, "fail", reason)
             return NodeResult(
                 status=OutcomeStatus.FAIL,
-                failure_reason=f"Command timed out: {command}",
+                failure_reason=reason,
                 context_updates={"exit_code": -1},
             )
         except Exception as exc:
             logger.exception("Handler failed on node '%s'", node.name)
+            reason = str(exc)
+            if logs_root is not None:
+                _write_status_file(logs_root, node, "fail", reason)
             return NodeResult(
-                status=OutcomeStatus.FAIL, failure_reason=str(exc)
+                status=OutcomeStatus.FAIL, failure_reason=reason
             )
 
 
 class ManagerLoopHandler:
-    """Iterative refinement loop.
+    """Iterative refinement loop with supervisor pattern.
 
     Executes a sub-pipeline (identified by the ``sub_pipeline`` attribute)
-    repeatedly until a ``done_condition`` evaluates to True or
-    ``max_iterations`` is reached.
+    repeatedly until a ``done_condition`` evaluates to True,
+    ``max_iterations`` is reached, or the sub-pipeline fails repeatedly
+    (H14: ``max_consecutive_failures``).
+
+    After each iteration the handler evaluates the sub-pipeline outcome,
+    sets ``_supervisor_feedback`` and ``_supervisor_assessment`` context
+    keys for feedback between iterations, and writes ``status.json``
+    when ``logs_root`` is provided (#12).
     """
 
     def __init__(self, engine: Any = None) -> None:
@@ -680,7 +907,8 @@ class ManagerLoopHandler:
 
         Args:
             node: The manager loop node with ``sub_pipeline``,
-                ``done_condition``, and ``max_iterations`` attributes.
+                ``done_condition``, ``max_iterations``, and optional
+                ``max_consecutive_failures`` attributes.
             context: Shared pipeline context.
             graph: The full pipeline graph.
             logs_root: Filesystem path for this run's log/artifact directory.
@@ -691,12 +919,17 @@ class ManagerLoopHandler:
         """
         max_iterations = int(node.attributes.get("max_iterations", 5))
         done_condition = node.attributes.get("done_condition", "")
+        max_consecutive_failures = int(
+            node.attributes.get("max_consecutive_failures", 3)
+        )
 
         if self._engine is None:
             return NodeResult(
                 status=OutcomeStatus.FAIL,
                 failure_reason="No engine configured for manager_loop handler",
             )
+
+        consecutive_failures = 0
 
         for i in range(max_iterations):
             context.set("_supervisor_iteration", i + 1)
@@ -712,13 +945,53 @@ class ManagerLoopHandler:
             # Delegate to engine (which will call back with the sub-pipeline)
             await self._engine.run_sub_pipeline(sub_pipeline_name, context)
 
+            # H14: Evaluate sub-pipeline results after each iteration
+            sub_status = context.get("_sub_pipeline_status", "")
+            sub_outcome = context.get("_sub_pipeline_outcome", "")
+
+            if sub_status == "failed" or sub_outcome == "fail":
+                consecutive_failures += 1
+                context.set(
+                    "_supervisor_assessment",
+                    f"iteration {i + 1} failed",
+                )
+                context.set(
+                    "_supervisor_feedback",
+                    f"Sub-pipeline failed on iteration {i + 1}",
+                )
+            else:
+                consecutive_failures = 0
+                context.set(
+                    "_supervisor_assessment",
+                    f"iteration {i + 1} succeeded",
+                )
+                context.set("_supervisor_feedback", "")
+
+            # H14: Early termination on repeated failures
+            if consecutive_failures >= max_consecutive_failures:
+                reason = (
+                    f"Sub-pipeline failed {consecutive_failures} "
+                    f"consecutive times"
+                )
+                if logs_root is not None:
+                    _write_status_file(logs_root, node, "fail", reason)
+                return NodeResult(
+                    status=OutcomeStatus.FAIL,
+                    failure_reason=reason,
+                    context_updates={"_supervisor_iterations": i + 1},
+                )
+
             if done_condition and evaluate_condition(done_condition, context):
+                if logs_root is not None:
+                    _write_status_file(logs_root, node, "success")
                 return NodeResult(
                     status=OutcomeStatus.SUCCESS,
                     output=f"Manager loop done after {i + 1} iterations",
                     context_updates={"_supervisor_iterations": i + 1},
                 )
 
+        if logs_root is not None:
+            _write_status_file(logs_root, node, "success")
         return NodeResult(
             status=OutcomeStatus.SUCCESS,
             output=f"Manager loop reached max iterations ({max_iterations})",

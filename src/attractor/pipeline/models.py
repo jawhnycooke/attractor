@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import enum
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -221,6 +222,10 @@ class PipelineContext:
     """
 
     _data: dict[str, Any] = field(default_factory=dict)
+    _logs: list[dict[str, Any]] = field(default_factory=list)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def get(self, key: str, default: Any = None) -> Any:
         """Return the value for *key*, or *default* if absent.
@@ -232,7 +237,24 @@ class PipelineContext:
         Returns:
             The stored value or *default*.
         """
-        return self._data.get(key, default)
+        with self._lock:
+            return self._data.get(key, default)
+
+    def get_string(self, key: str, default: str = "") -> str:
+        """Return the value for *key* coerced to ``str``.
+
+        Args:
+            key: The context key to look up.
+            default: Value returned when *key* is not present.
+
+        Returns:
+            The stored value as a string, or *default*.
+        """
+        with self._lock:
+            value = self._data.get(key)
+        if value is None:
+            return default
+        return str(value)
 
     def set(self, key: str, value: Any) -> None:
         """Store *value* under *key*.
@@ -241,7 +263,8 @@ class PipelineContext:
             key: The context key.
             value: The value to store.
         """
-        self._data[key] = value
+        with self._lock:
+            self._data[key] = value
 
     def has(self, key: str) -> bool:
         """Return ``True`` if *key* exists in the context.
@@ -252,7 +275,8 @@ class PipelineContext:
         Returns:
             Whether the key is present.
         """
-        return key in self._data
+        with self._lock:
+            return key in self._data
 
     def delete(self, key: str) -> None:
         """Remove *key* from the context if present.
@@ -260,7 +284,8 @@ class PipelineContext:
         Args:
             key: The context key to remove.
         """
-        self._data.pop(key, None)
+        with self._lock:
+            self._data.pop(key, None)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a shallow copy of all context data.
@@ -268,7 +293,21 @@ class PipelineContext:
         Returns:
             A new ``dict`` with all key-value pairs.
         """
-        return dict(self._data)
+        with self._lock:
+            return dict(self._data)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a deep copy of all context data.
+
+        Unlike :meth:`to_dict` which returns a shallow copy, this method
+        performs a deep copy so mutations to nested structures in the
+        returned dict do not affect the context.
+
+        Returns:
+            A deep-copied ``dict`` with all key-value pairs.
+        """
+        with self._lock:
+            return copy.deepcopy(self._data)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PipelineContext:
@@ -288,11 +327,13 @@ class PipelineContext:
         """Create a deep copy of this context for parallel branch isolation.
 
         Returns:
-            A new :class:`PipelineContext` with deep-copied data.
+            A new :class:`PipelineContext` with deep-copied data and logs.
         """
-        ctx = PipelineContext()
-        ctx._data = copy.deepcopy(self._data)
-        return ctx
+        with self._lock:
+            ctx = PipelineContext()
+            ctx._data = copy.deepcopy(self._data)
+            ctx._logs = copy.deepcopy(self._logs)
+            return ctx
 
     def create_scope(self, prefix: str) -> PipelineContext:
         """Create a child context whose keys are prefixed on merge-back.
@@ -324,7 +365,26 @@ class PipelineContext:
         Args:
             updates: Key-value pairs to merge.
         """
-        self._data.update(updates)
+        with self._lock:
+            self._data.update(updates)
+
+    def append_log(self, entry: dict[str, Any]) -> None:
+        """Append a structured log entry.
+
+        Args:
+            entry: A dictionary representing a log entry.
+        """
+        with self._lock:
+            self._logs.append(entry)
+
+    def get_logs(self) -> list[dict[str, Any]]:
+        """Return a copy of all log entries.
+
+        Returns:
+            A list of log entry dictionaries.
+        """
+        with self._lock:
+            return list(self._logs)
 
 
 @dataclass

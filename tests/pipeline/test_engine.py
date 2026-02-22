@@ -1,13 +1,16 @@
 """Tests for the pipeline execution engine."""
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
-from attractor.pipeline.engine import EngineError, PipelineEngine
+from attractor.pipeline.engine import EngineError, PipelineEngine, create_stage_dir
+from attractor.pipeline.events import PipelineEvent, PipelineEventEmitter, PipelineEventType
 from attractor.pipeline.handlers import HandlerRegistry
 from attractor.pipeline.models import (
+    Checkpoint,
     NodeResult,
     OutcomeStatus,
     Pipeline,
@@ -1300,3 +1303,468 @@ class TestContextCloneIsolation:
 
         # Parent context is unchanged
         assert parent_ctx.get("x") == "parent"
+
+
+class TestCheckpointNodeRetries:
+    """Tests for S3-ckpt: node_retries populated in checkpoints."""
+
+    async def test_checkpoint_contains_node_retries(self, tmp_path: Path) -> None:
+        """S3-ckpt: node_retries extracted from context retry keys."""
+        retry_handler = RetryHandler(retries_before_success=2)
+        registry = HandlerRegistry()
+        registry.register("retry", retry_handler)
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="ckpt_retries",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="retry", is_start=True, max_retries=3
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, checkpoint_dir=str(tmp_path))
+        await engine.run(pipeline)
+
+        cp_files = sorted(tmp_path.glob("checkpoint_*.json"))
+        assert len(cp_files) >= 1
+
+        # Check the last checkpoint
+        last_cp = json.loads(cp_files[-1].read_text())
+        assert "node_retries" in last_cp
+        # "start" had 2 retries before success → retry_count = 2
+        assert last_cp["node_retries"]["start"] == 2
+
+    async def test_checkpoint_retries_zero_for_no_retry(self, tmp_path: Path) -> None:
+        """Nodes without retries get retry_count=0 in checkpoint."""
+        registry = HandlerRegistry()
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="no_retry",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="echo", is_start=True),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, checkpoint_dir=str(tmp_path))
+        await engine.run(pipeline)
+
+        cp_files = sorted(tmp_path.glob("checkpoint_*.json"))
+        assert len(cp_files) >= 1
+
+        last_cp = json.loads(cp_files[-1].read_text())
+        # Nodes completed on first attempt have retry_count = 0
+        assert last_cp["node_retries"].get("start") == 0
+        assert last_cp["node_retries"].get("end") == 0
+
+
+class TestCreateStageDir:
+    """Tests for #13: create_stage_dir utility."""
+
+    def test_creates_directory(self, tmp_path: Path) -> None:
+        stage_dir = create_stage_dir(tmp_path, "my_node")
+        assert stage_dir.exists()
+        assert stage_dir.is_dir()
+        assert stage_dir == tmp_path / "my_node"
+
+    def test_creates_nested_directory(self, tmp_path: Path) -> None:
+        logs_root = tmp_path / "runs" / "2026-01-01"
+        stage_dir = create_stage_dir(logs_root, "build")
+        assert stage_dir.exists()
+        assert stage_dir == logs_root / "build"
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        """Calling twice doesn't raise."""
+        create_stage_dir(tmp_path, "node1")
+        create_stage_dir(tmp_path, "node1")
+        assert (tmp_path / "node1").exists()
+
+    def test_returns_correct_path(self, tmp_path: Path) -> None:
+        result = create_stage_dir(tmp_path, "code_review")
+        assert result.name == "code_review"
+        assert result.parent == tmp_path
+
+
+class TestFidelityModes:
+    """Tests for #14: context fidelity mode tracking."""
+
+    async def test_fidelity_mode_recorded_in_context(self) -> None:
+        """When a node has fidelity set, _fidelity_mode is set in context."""
+        registry = HandlerRegistry()
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="fidelity_test",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    fidelity="compact",
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert ctx.get("_fidelity_mode") == "compact"
+
+    async def test_fidelity_mode_changes_with_nodes(self) -> None:
+        """Each node with fidelity updates _fidelity_mode."""
+        registry = HandlerRegistry()
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="fidelity_multi",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="echo",
+                    is_start=True,
+                    fidelity="full",
+                ),
+                "middle": PipelineNode(
+                    name="middle",
+                    handler_type="echo",
+                    fidelity="truncate",
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[
+                PipelineEdge(source="start", target="middle"),
+                PipelineEdge(source="middle", target="end"),
+            ],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        # Last node with fidelity was "middle" with "truncate"
+        assert ctx.get("_fidelity_mode") == "truncate"
+
+    async def test_no_fidelity_does_not_set_key(self) -> None:
+        """Nodes without fidelity don't set _fidelity_mode."""
+        registry = HandlerRegistry()
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="no_fidelity",
+            nodes={
+                "start": PipelineNode(
+                    name="start", handler_type="echo", is_start=True
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert not ctx.has("_fidelity_mode")
+
+    def test_apply_fidelity_sets_context(self) -> None:
+        """_apply_fidelity static method sets the context key."""
+        ctx = PipelineContext()
+        PipelineEngine._apply_fidelity(ctx, "summary:high")
+        assert ctx.get("_fidelity_mode") == "summary:high"
+
+
+class TestPipelineEvents:
+    """Tests for #15: pipeline event system."""
+
+    async def test_event_emitter_fires_events(self) -> None:
+        """PipelineEventEmitter calls registered callbacks."""
+        received: list[PipelineEvent] = []
+
+        async def on_event(event: PipelineEvent) -> None:
+            received.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.NODE_START, on_event)
+
+        event = PipelineEvent(
+            type=PipelineEventType.NODE_START,
+            node_name="test",
+            pipeline_name="pipe",
+        )
+        await emitter.emit(event)
+
+        assert len(received) == 1
+        assert received[0].node_name == "test"
+
+    async def test_event_emitter_multiple_listeners(self) -> None:
+        """Multiple listeners for the same event type are all called."""
+        calls: list[str] = []
+
+        async def listener_a(event: PipelineEvent) -> None:
+            calls.append("a")
+
+        async def listener_b(event: PipelineEvent) -> None:
+            calls.append("b")
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.NODE_COMPLETE, listener_a)
+        emitter.on(PipelineEventType.NODE_COMPLETE, listener_b)
+
+        await emitter.emit(PipelineEvent(type=PipelineEventType.NODE_COMPLETE))
+        assert calls == ["a", "b"]
+
+    async def test_event_emitter_different_types_isolated(self) -> None:
+        """Listeners only receive events of their registered type."""
+        received_starts: list[PipelineEvent] = []
+        received_completes: list[PipelineEvent] = []
+
+        async def on_start(event: PipelineEvent) -> None:
+            received_starts.append(event)
+
+        async def on_complete(event: PipelineEvent) -> None:
+            received_completes.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.NODE_START, on_start)
+        emitter.on(PipelineEventType.NODE_COMPLETE, on_complete)
+
+        await emitter.emit(PipelineEvent(type=PipelineEventType.NODE_START))
+        assert len(received_starts) == 1
+        assert len(received_completes) == 0
+
+    async def test_event_emitter_callback_error_does_not_block_others(self) -> None:
+        """An error in one callback does not prevent others from firing."""
+        calls: list[str] = []
+
+        async def failing(event: PipelineEvent) -> None:
+            raise RuntimeError("callback error")
+
+        async def succeeding(event: PipelineEvent) -> None:
+            calls.append("ok")
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.NODE_START, failing)
+        emitter.on(PipelineEventType.NODE_START, succeeding)
+
+        await emitter.emit(PipelineEvent(type=PipelineEventType.NODE_START))
+        assert calls == ["ok"]
+
+    async def test_event_emitter_listeners_property(self) -> None:
+        """The listeners property returns the mapping."""
+        emitter = PipelineEventEmitter()
+
+        async def noop(event: PipelineEvent) -> None:
+            pass
+
+        emitter.on(PipelineEventType.PIPELINE_START, noop)
+        listeners = emitter.listeners
+        assert PipelineEventType.PIPELINE_START in listeners
+        assert len(listeners[PipelineEventType.PIPELINE_START]) == 1
+
+    async def test_engine_emits_pipeline_start_and_complete(self) -> None:
+        """Engine emits PIPELINE_START and PIPELINE_COMPLETE events."""
+        received: list[PipelineEvent] = []
+
+        async def recorder(event: PipelineEvent) -> None:
+            received.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.PIPELINE_START, recorder)
+        emitter.on(PipelineEventType.PIPELINE_COMPLETE, recorder)
+
+        registry = HandlerRegistry()
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="event_test",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="echo", is_start=True),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, event_emitter=emitter)
+        await engine.run(pipeline)
+
+        event_types = [e.type for e in received]
+        assert PipelineEventType.PIPELINE_START in event_types
+        assert PipelineEventType.PIPELINE_COMPLETE in event_types
+        assert received[0].pipeline_name == "event_test"
+
+    async def test_engine_emits_node_start_and_complete(self) -> None:
+        """Engine emits NODE_START and NODE_COMPLETE for each node."""
+        received: list[PipelineEvent] = []
+
+        async def recorder(event: PipelineEvent) -> None:
+            received.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.NODE_START, recorder)
+        emitter.on(PipelineEventType.NODE_COMPLETE, recorder)
+
+        registry = HandlerRegistry()
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="node_events",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="echo", is_start=True),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, event_emitter=emitter)
+        await engine.run(pipeline)
+
+        node_starts = [e for e in received if e.type == PipelineEventType.NODE_START]
+        node_completes = [e for e in received if e.type == PipelineEventType.NODE_COMPLETE]
+
+        assert len(node_starts) == 2  # start + end
+        assert len(node_completes) == 2
+        assert node_starts[0].node_name == "start"
+        assert node_starts[1].node_name == "end"
+
+    async def test_engine_emits_node_fail_event(self) -> None:
+        """Engine emits NODE_FAIL when a handler fails."""
+        received: list[PipelineEvent] = []
+
+        async def recorder(event: PipelineEvent) -> None:
+            received.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.NODE_FAIL, recorder)
+
+        registry = HandlerRegistry()
+        registry.register("fail", FailHandler())
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="fail_event",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="fail",
+                    is_start=True,
+                    retry_target="recovery",
+                ),
+                "recovery": PipelineNode(
+                    name="recovery", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, event_emitter=emitter)
+        await engine.run(pipeline)
+
+        assert len(received) == 1
+        assert received[0].type == PipelineEventType.NODE_FAIL
+        assert received[0].node_name == "start"
+        assert received[0].data["failure_reason"] == "intentional failure"
+
+    async def test_engine_emits_node_retry_event(self) -> None:
+        """Engine emits NODE_RETRY on retry attempts."""
+        received: list[PipelineEvent] = []
+
+        async def recorder(event: PipelineEvent) -> None:
+            received.append(event)
+
+        emitter = PipelineEventEmitter()
+        emitter.on(PipelineEventType.NODE_RETRY, recorder)
+
+        retry_handler = RetryHandler(retries_before_success=1)
+        registry = HandlerRegistry()
+        registry.register("retry", retry_handler)
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="retry_event",
+            nodes={
+                "start": PipelineNode(
+                    name="start",
+                    handler_type="retry",
+                    is_start=True,
+                    max_retries=2,
+                ),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry, event_emitter=emitter)
+        await engine.run(pipeline)
+
+        assert len(received) == 1
+        assert received[0].type == PipelineEventType.NODE_RETRY
+        assert received[0].node_name == "start"
+        assert received[0].data["attempt"] == 2
+
+    async def test_engine_no_emitter_doesnt_error(self) -> None:
+        """Engine runs without an event emitter."""
+        registry = HandlerRegistry()
+        registry.register("echo", EchoHandler())
+
+        pipeline = Pipeline(
+            name="no_emitter",
+            nodes={
+                "start": PipelineNode(name="start", handler_type="echo", is_start=True),
+                "end": PipelineNode(
+                    name="end", handler_type="echo", is_terminal=True
+                ),
+            },
+            edges=[PipelineEdge(source="start", target="end")],
+            start_node="start",
+        )
+
+        engine = PipelineEngine(registry=registry)
+        ctx = await engine.run(pipeline)
+        assert ctx.get("end_done") is True
+
+    async def test_pipeline_event_type_values(self) -> None:
+        """PipelineEventType enum has expected values."""
+        assert PipelineEventType.PIPELINE_START == "pipeline_start"
+        assert PipelineEventType.PIPELINE_COMPLETE == "pipeline_complete"
+        assert PipelineEventType.PIPELINE_FAILED == "pipeline_failed"
+        assert PipelineEventType.NODE_START == "node_start"
+        assert PipelineEventType.NODE_COMPLETE == "node_complete"
+        assert PipelineEventType.NODE_RETRY == "node_retry"
+        assert PipelineEventType.NODE_FAIL == "node_fail"
+        assert PipelineEventType.CHECKPOINT_SAVED == "checkpoint_saved"
+
+    async def test_pipeline_event_defaults(self) -> None:
+        """PipelineEvent has sensible defaults."""
+        event = PipelineEvent(type=PipelineEventType.PIPELINE_START)
+        assert event.node_name == ""
+        assert event.pipeline_name == ""
+        assert isinstance(event.timestamp, float)
+        assert event.data == {}

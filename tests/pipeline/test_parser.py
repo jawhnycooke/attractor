@@ -572,9 +572,35 @@ digraph g {
 }
 """
         pipeline = parse_dot_string(dot)
-        assert any(e.source == "a" and e.target == "b" for e in pipeline.edges)
-        assert any(e.source == "b" and e.target == "c" for e in pipeline.edges)
-        assert any(e.source == "c" and e.target == "d" for e in pipeline.edges)
+        assert len(pipeline.edges) == 3
+        ab = next(
+            (e for e in pipeline.edges if e.source == "a" and e.target == "b"),
+            None,
+        )
+        bc = next(
+            (e for e in pipeline.edges if e.source == "b" and e.target == "c"),
+            None,
+        )
+        cd = next(
+            (e for e in pipeline.edges if e.source == "c" and e.target == "d"),
+            None,
+        )
+        assert ab is not None
+        assert bc is not None
+        assert cd is not None
+
+    def test_chained_edge_count(self) -> None:
+        """Chain of N nodes produces exactly N-1 edges."""
+        dot = """\
+digraph g {
+    a [shape=Mdiamond]
+    b [shape=box]
+    c [shape=Msquare]
+    a -> b -> c
+}
+"""
+        pipeline = parse_dot_string(dot)
+        assert len(pipeline.edges) == 2
 
 
 class TestGraphLabel:

@@ -1,5 +1,6 @@
 """Tests for pipeline node handlers."""
 
+import asyncio
 import builtins
 import json
 import logging
@@ -13,18 +14,22 @@ from attractor.pipeline.handlers import (
     ConditionalHandler,
     ExitHandler,
     FanInHandler,
+    HandlerHook,
     HandlerRegistry,
     HumanGateHandler,
     ManagerLoopHandler,
+    NodeHandler,
     ParallelHandler,
     StartHandler,
     SupervisorHandler,
     ToolHandler,
     WaitHumanHandler,
     _parse_accelerator_key,
+    _write_status_file,
     create_default_registry,
 )
 from attractor.pipeline.models import (
+    NodeResult,
     OutcomeStatus,
     Pipeline,
     PipelineContext,
@@ -334,6 +339,51 @@ class TestToolHandler:
         assert result.success is False
         assert "No tool_command" in (result.failure_reason or "")
 
+    @pytest.mark.asyncio
+    async def test_tool_handler_writes_status_file_on_success(self, tmp_path) -> None:
+        """#12: ToolHandler writes status.json on success."""
+        handler = ToolHandler()
+        node = _make_node(handler_type="tool", tool_command="echo ok")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx, logs_root=tmp_path)
+        assert result.success is True
+
+        status_path = tmp_path / "test_node" / "status.json"
+        assert status_path.exists()
+        status = json.loads(status_path.read_text())
+        assert status["status"] == "success"
+        assert status["node"] == "test_node"
+        assert status["handler"] == "tool"
+
+    @pytest.mark.asyncio
+    async def test_tool_handler_writes_status_file_on_failure(self, tmp_path) -> None:
+        """#12: ToolHandler writes status.json on failure."""
+        handler = ToolHandler()
+        node = _make_node(handler_type="tool", tool_command="exit 1")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx, logs_root=tmp_path)
+        assert result.success is False
+
+        status_path = tmp_path / "test_node" / "status.json"
+        assert status_path.exists()
+        status = json.loads(status_path.read_text())
+        assert status["status"] == "fail"
+        assert status["node"] == "test_node"
+        assert status["handler"] == "tool"
+
+    @pytest.mark.asyncio
+    async def test_tool_handler_no_status_file_without_logs_root(self) -> None:
+        """#12: No status.json when logs_root is None."""
+        handler = ToolHandler()
+        node = _make_node(handler_type="tool", tool_command="echo ok")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+        # No crash, no file written (no logs_root to write to)
+
 
 # ---------------------------------------------------------------------------
 # WaitHumanHandler (formerly HumanGateHandler)
@@ -449,6 +499,236 @@ class TestWaitHumanHandler:
     async def test_backward_compat_alias(self) -> None:
         """HumanGateHandler alias should still work."""
         assert HumanGateHandler is WaitHumanHandler
+
+    @pytest.mark.asyncio
+    async def test_accelerator_keys_passed_to_interviewer(self) -> None:
+        """H7: Accelerator keys should be parsed and passed to interviewer.ask."""
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+        # Return the exact label for the first edge so selection works
+        interviewer.ask = AsyncMock(return_value="[Y] Yes, deploy")
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(
+                    source="gate", target="deploy", label="[Y] Yes, deploy"
+                ),
+                PipelineEdge(
+                    source="gate", target="cancel", label="[N] No, cancel"
+                ),
+            ],
+        )
+
+        handler = WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Deploy?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+        assert result.suggested_next_ids == ["deploy"]
+
+        # Verify accelerator keys were passed
+        call_args = interviewer.ask.call_args
+        accelerators = call_args[1].get("accelerators", [])
+        # Edges sorted by (weight desc, target asc), so cancel < deploy
+        assert set(accelerators) == {"Y", "N"}
+        assert len(accelerators) == 2
+        # Options should include the full labels
+        options = call_args[1].get("options", [])
+        assert "[Y] Yes, deploy" in options
+        assert "[N] No, cancel" in options
+
+    @pytest.mark.asyncio
+    async def test_timeout_with_default_choice(self) -> None:
+        """H8: On timeout, use human.default_choice edge target if set."""
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+
+        # Make ask raise TimeoutError
+        async def slow_ask(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        interviewer.ask = slow_ask
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="approve_node", label="approve"),
+                PipelineEdge(source="gate", target="reject_node", label="reject"),
+            ],
+        )
+
+        handler = WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+        node = PipelineNode(
+            name="gate",
+            handler_type="wait.human",
+            attributes={
+                "prompt": "Approve?",
+                "human.default_choice": "approve_node",
+            },
+            timeout=0.01,  # Very short timeout
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+        assert result.status == OutcomeStatus.SUCCESS
+        assert result.suggested_next_ids == ["approve_node"]
+        assert result.context_updates["selected_edge_id"] == "approve_node"
+
+    @pytest.mark.asyncio
+    async def test_timeout_without_default_choice_returns_retry(self) -> None:
+        """H8: On timeout with no default, return RETRY."""
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+
+        async def slow_ask(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        interviewer.ask = slow_ask
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="next"),
+            ],
+        )
+
+        handler = WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+        node = PipelineNode(
+            name="gate",
+            handler_type="wait.human",
+            attributes={"prompt": "Approve?"},
+            timeout=0.01,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is False
+        assert result.status == OutcomeStatus.RETRY
+        assert "timeout" in (result.failure_reason or "").lower()
+        assert "no default" in (result.failure_reason or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_skipped_answer_returns_fail(self) -> None:
+        """H8: SKIPPED answer should return FAIL."""
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+        interviewer.ask = AsyncMock(return_value="SKIPPED")
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="proceed"),
+            ],
+        )
+
+        handler = WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Approve?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is False
+        assert result.status == OutcomeStatus.FAIL
+        assert "skipped" in (result.failure_reason or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_confirm_timeout_with_default_choice(self) -> None:
+        """H8: Confirm path timeout with default choice returns SUCCESS."""
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+
+        async def slow_confirm(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        interviewer.confirm = slow_confirm
+
+        handler = WaitHumanHandler(interviewer=interviewer)
+        node = PipelineNode(
+            name="gate",
+            handler_type="wait.human",
+            attributes={
+                "prompt": "Continue?",
+                "human.default_choice": "yes",
+            },
+            timeout=0.01,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+        assert result.context_updates["approved"] is True
+        assert result.context_updates["human_choice"] == "yes"
+
+    @pytest.mark.asyncio
+    async def test_confirm_timeout_without_default_returns_retry(self) -> None:
+        """H8: Confirm path timeout with no default returns RETRY."""
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+
+        async def slow_confirm(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        interviewer.confirm = slow_confirm
+
+        handler = WaitHumanHandler(interviewer=interviewer)
+        node = PipelineNode(
+            name="gate",
+            handler_type="wait.human",
+            attributes={"prompt": "Continue?"},
+            timeout=0.01,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is False
+        assert result.status == OutcomeStatus.RETRY
+        assert "timeout" in (result.failure_reason or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_confirm_skipped_returns_fail(self) -> None:
+        """H8: SKIPPED on confirm path returns FAIL."""
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+        interviewer.confirm = AsyncMock(return_value="SKIPPED")
+
+        handler = WaitHumanHandler(interviewer=interviewer)
+        node = _make_node(handler_type="wait.human", prompt="Continue?")
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is False
+        assert result.status == OutcomeStatus.FAIL
+        assert "skipped" in (result.failure_reason or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_when_node_timeout_is_none(self) -> None:
+        """H8: No timeout wrapping when node.timeout is None."""
+        interviewer = AsyncMock()
+        interviewer.inform = AsyncMock()
+        interviewer.ask = AsyncMock(return_value="go")
+
+        pipeline = Pipeline(
+            name="test",
+            nodes={"gate": PipelineNode(name="gate", handler_type="wait.human")},
+            edges=[
+                PipelineEdge(source="gate", target="next", label="go"),
+            ],
+        )
+
+        handler = WaitHumanHandler(interviewer=interviewer, pipeline=pipeline)
+        node = _make_node(name="gate", handler_type="wait.human", prompt="Choose?")
+        assert node.timeout is None  # Confirm timeout not set
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+        assert result.suggested_next_ids == ["next"]
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +899,175 @@ class TestManagerLoopHandler:
         """SupervisorHandler alias should still work."""
         assert SupervisorHandler is ManagerLoopHandler
 
+    @pytest.mark.asyncio
+    async def test_manager_loop_sets_supervisor_feedback_on_success(self) -> None:
+        """H14: Sets _supervisor_assessment and _supervisor_feedback context keys."""
+        engine = AsyncMock()
+        engine.run_sub_pipeline = AsyncMock()
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            sub_pipeline="inner",
+            max_iterations=2,
+            done_condition="done = true",
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+
+        # After iterations, supervisor context keys should be set
+        assert ctx.get("_supervisor_assessment") is not None
+        assert ctx.get("_supervisor_feedback") == ""
+        assert "succeeded" in ctx.get("_supervisor_assessment")
+
+    @pytest.mark.asyncio
+    async def test_manager_loop_sets_feedback_on_failure(self) -> None:
+        """H14: Sets failure feedback when sub-pipeline fails."""
+        engine = AsyncMock()
+
+        async def mock_run_sub(name, context):
+            context.set("_sub_pipeline_status", "failed")
+            context.set("_sub_pipeline_outcome", "fail")
+
+        engine.run_sub_pipeline = mock_run_sub
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            sub_pipeline="inner",
+            max_iterations=5,
+            max_consecutive_failures=3,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is False
+        assert result.status == OutcomeStatus.FAIL
+        assert "3 consecutive" in (result.failure_reason or "")
+        assert "failed" in ctx.get("_supervisor_assessment", "")
+        assert "Sub-pipeline failed" in ctx.get("_supervisor_feedback", "")
+
+    @pytest.mark.asyncio
+    async def test_manager_loop_early_termination_on_repeated_failures(self) -> None:
+        """H14: Early termination after max_consecutive_failures."""
+        call_count = 0
+        engine = AsyncMock()
+
+        async def mock_run_sub(name, context):
+            nonlocal call_count
+            call_count += 1
+            context.set("_sub_pipeline_outcome", "fail")
+
+        engine.run_sub_pipeline = mock_run_sub
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            sub_pipeline="inner",
+            max_iterations=10,
+            max_consecutive_failures=2,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is False
+        assert result.status == OutcomeStatus.FAIL
+        assert call_count == 2  # Should stop after 2 consecutive failures
+        assert result.context_updates["_supervisor_iterations"] == 2
+
+    @pytest.mark.asyncio
+    async def test_manager_loop_resets_consecutive_failures_on_success(self) -> None:
+        """H14: Consecutive failure count resets on successful iteration."""
+        iteration = 0
+        engine = AsyncMock()
+
+        async def mock_run_sub(name, context):
+            nonlocal iteration
+            iteration += 1
+            if iteration == 1:
+                context.set("_sub_pipeline_outcome", "fail")
+            elif iteration == 2:
+                # Success resets consecutive failure count
+                context.set("_sub_pipeline_outcome", "success")
+                context.set("_sub_pipeline_status", "completed")
+            elif iteration == 3:
+                context.set("_sub_pipeline_outcome", "fail")
+            elif iteration == 4:
+                # Clear the fail outcome and set done condition
+                context.set("_sub_pipeline_outcome", "success")
+                context.set("done", "true")
+
+        engine.run_sub_pipeline = mock_run_sub
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            sub_pipeline="inner",
+            max_iterations=10,
+            max_consecutive_failures=2,
+            done_condition="done = true",
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx)
+        assert result.success is True
+        assert iteration == 4  # All 4 iterations ran (no early termination)
+
+    @pytest.mark.asyncio
+    async def test_manager_loop_writes_status_file_on_success(self, tmp_path) -> None:
+        """#12: ManagerLoopHandler writes status.json on success."""
+        engine = AsyncMock()
+        engine.run_sub_pipeline = AsyncMock()
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            sub_pipeline="inner",
+            max_iterations=1,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx, logs_root=tmp_path)
+        assert result.success is True
+
+        status_path = tmp_path / "test_node" / "status.json"
+        assert status_path.exists()
+        status = json.loads(status_path.read_text())
+        assert status["status"] == "success"
+        assert status["node"] == "test_node"
+        assert status["handler"] == "stack.manager_loop"
+
+    @pytest.mark.asyncio
+    async def test_manager_loop_writes_status_file_on_failure(self, tmp_path) -> None:
+        """#12: ManagerLoopHandler writes status.json on consecutive failure."""
+        engine = AsyncMock()
+
+        async def mock_run_sub(name, context):
+            context.set("_sub_pipeline_outcome", "fail")
+
+        engine.run_sub_pipeline = mock_run_sub
+
+        handler = ManagerLoopHandler(engine=engine)
+        node = _make_node(
+            handler_type="stack.manager_loop",
+            sub_pipeline="inner",
+            max_iterations=10,
+            max_consecutive_failures=2,
+        )
+        ctx = PipelineContext()
+
+        result = await handler.execute(node, ctx, logs_root=tmp_path)
+        assert result.success is False
+
+        status_path = tmp_path / "test_node" / "status.json"
+        assert status_path.exists()
+        status = json.loads(status_path.read_text())
+        assert status["status"] == "fail"
+        assert "reason" in status
+        assert "consecutive" in status["reason"]
+
 
 # ---------------------------------------------------------------------------
 # HandlerRegistry
@@ -653,6 +1102,113 @@ class TestHandlerRegistry:
         registry.default_handler = handler
         assert registry.default_handler is handler
 
+    def test_handler_registry_hooks_init_empty(self) -> None:
+        """#16: Hooks list defaults to empty."""
+        registry = HandlerRegistry()
+        assert registry.hooks == []
+
+    def test_handler_registry_hooks_init_with_list(self) -> None:
+        """#16: Hooks can be passed at construction time."""
+        hook = AsyncMock(spec=HandlerHook)
+        registry = HandlerRegistry(hooks=[hook])
+        assert len(registry.hooks) == 1
+
+    def test_handler_registry_add_hook(self) -> None:
+        """#16: Hooks can be added after construction."""
+        registry = HandlerRegistry()
+        hook = AsyncMock(spec=HandlerHook)
+        registry.add_hook(hook)
+        assert len(registry.hooks) == 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_calls_handler(self) -> None:
+        """#16: dispatch() should call the correct handler."""
+        registry = HandlerRegistry()
+        registry.register("start", StartHandler())
+        node = _make_node(handler_type="start")
+        ctx = PipelineContext()
+
+        result = await registry.dispatch("start", node, ctx)
+        assert result.success is True
+        assert result.status == OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_dispatch_returns_fail_for_unknown_type(self) -> None:
+        """#16: dispatch() returns FAIL for unregistered handler types."""
+        registry = HandlerRegistry()
+        node = _make_node(handler_type="unknown")
+        ctx = PipelineContext()
+
+        result = await registry.dispatch("unknown", node, ctx)
+        assert result.success is False
+        assert "No handler" in (result.failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_calls_hooks_in_order(self) -> None:
+        """#16: dispatch() calls before_execute and after_execute hooks."""
+        call_order: list[str] = []
+
+        class TrackingHook:
+            def __init__(self, name: str) -> None:
+                self._name = name
+
+            async def before_execute(self, node, context):
+                call_order.append(f"{self._name}_before")
+
+            async def after_execute(self, node, context, result):
+                call_order.append(f"{self._name}_after")
+
+        hook1 = TrackingHook("hook1")
+        hook2 = TrackingHook("hook2")
+
+        registry = HandlerRegistry(hooks=[hook1, hook2])
+        registry.register("start", StartHandler())
+        node = _make_node(handler_type="start")
+        ctx = PipelineContext()
+
+        result = await registry.dispatch("start", node, ctx)
+        assert result.success is True
+        assert call_order == [
+            "hook1_before",
+            "hook2_before",
+            "hook1_after",
+            "hook2_after",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_hook_receives_result(self) -> None:
+        """#16: after_execute hook receives the handler result."""
+        captured_results: list[NodeResult] = []
+
+        class CapturingHook:
+            async def before_execute(self, node, context):
+                pass
+
+            async def after_execute(self, node, context, result):
+                captured_results.append(result)
+
+        registry = HandlerRegistry(hooks=[CapturingHook()])
+        registry.register("start", StartHandler())
+        node = _make_node(handler_type="start")
+        ctx = PipelineContext()
+
+        result = await registry.dispatch("start", node, ctx)
+        assert len(captured_results) == 1
+        assert captured_results[0] is result
+        assert captured_results[0].status == OutcomeStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_dispatch_no_hooks_still_works(self) -> None:
+        """#16: dispatch() works correctly without any hooks."""
+        registry = HandlerRegistry()
+        registry.register("exit", ExitHandler())
+        node = _make_node(handler_type="exit")
+        ctx = PipelineContext()
+
+        result = await registry.dispatch("exit", node, ctx)
+        assert result.success is True
+        assert result.notes == "Pipeline exiting"
+
 
 # ---------------------------------------------------------------------------
 # Accelerator key parsing
@@ -674,6 +1230,78 @@ class TestParseAcceleratorKey:
 
     def test_empty_string(self) -> None:
         assert _parse_accelerator_key("") == ""
+
+
+# ---------------------------------------------------------------------------
+# _write_status_file
+# ---------------------------------------------------------------------------
+
+
+class TestWriteStatusFile:
+    def test_writes_success_status(self, tmp_path) -> None:
+        """#12: _write_status_file writes correct success format."""
+        node = _make_node(name="my_node", handler_type="tool")
+        _write_status_file(tmp_path, node, "success")
+
+        status_path = tmp_path / "my_node" / "status.json"
+        assert status_path.exists()
+        data = json.loads(status_path.read_text())
+        assert data["status"] == "success"
+        assert data["node"] == "my_node"
+        assert data["handler"] == "tool"
+        assert "reason" not in data
+
+    def test_writes_fail_status_with_reason(self, tmp_path) -> None:
+        """#12: _write_status_file includes reason on failure."""
+        node = _make_node(name="my_node", handler_type="codergen")
+        _write_status_file(tmp_path, node, "fail", "something broke")
+
+        data = json.loads(
+            (tmp_path / "my_node" / "status.json").read_text()
+        )
+        assert data["status"] == "fail"
+        assert data["reason"] == "something broke"
+        assert data["handler"] == "codergen"
+
+    def test_creates_stage_directory(self, tmp_path) -> None:
+        """#12: _write_status_file creates the stage directory if needed."""
+        node = _make_node(name="new_stage", handler_type="tool")
+        _write_status_file(tmp_path, node, "success")
+
+        assert (tmp_path / "new_stage").is_dir()
+        assert (tmp_path / "new_stage" / "status.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# HandlerHook protocol
+# ---------------------------------------------------------------------------
+
+
+class TestHandlerHookProtocol:
+    def test_handler_hook_is_runtime_checkable(self) -> None:
+        """#16: HandlerHook should be a runtime_checkable Protocol."""
+
+        class MyHook:
+            async def before_execute(self, node, context):
+                pass
+
+            async def after_execute(self, node, context, result):
+                pass
+
+        assert isinstance(MyHook(), HandlerHook)
+
+    def test_non_hook_is_not_handler_hook(self) -> None:
+        """#16: Classes missing methods should not pass isinstance check."""
+
+        class NotAHook:
+            pass
+
+        assert not isinstance(NotAHook(), HandlerHook)
+
+    def test_node_handler_protocol_is_runtime_checkable(self) -> None:
+        """NodeHandler should be a runtime_checkable Protocol."""
+        assert isinstance(StartHandler(), NodeHandler)
+        assert isinstance(ExitHandler(), NodeHandler)
 
 
 # ---------------------------------------------------------------------------
