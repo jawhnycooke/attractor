@@ -82,6 +82,6 @@ API keys are loaded from the environment (or `.env` file):
 
 - **Adapter lazy-loading**: `LLMClient._default_adapters()` silently skips providers whose SDK isn't installed. If a model fails to route, check that the provider package is installed.
 - **Anthropic message alternation**: The Anthropic adapter inserts synthetic placeholder messages to enforce the strict user/assistant alternation the API requires.
-- **Start node detection**: Pipeline parser auto-detects start nodes by `start=true` attribute or node named `"start"`. If neither exists, validation fails.
+- **Start node detection**: Pipeline parser auto-detects start nodes by shape=Mdiamond (handler_type "start") or case-insensitive name match for "start". If neither exists, validation fails.
 - **CodergenHandler fallback**: If `agent.Session` can't be imported, the handler falls back to an echo stub — useful for pipeline-only testing.
 - **Checkpoint naming**: Files use `checkpoint_{timestamp_ms}.json`. The `resume` command finds the latest automatically.

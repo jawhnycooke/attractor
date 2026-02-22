@@ -12,7 +12,8 @@ The LLM subsystem provides a provider-agnostic interface for Anthropic (Claude),
 | `streaming.py` | `StreamCollector` — aggregates `StreamEvent`s into a final `Response`. |
 | `adapters/base.py` | `ProviderAdapter` protocol: `detect_model`, `complete`, `stream`. |
 | `adapters/anthropic_adapter.py` | Anthropic Messages API. Enforces user/assistant alternation, maps reasoning effort to thinking budget. |
-| `adapters/openai_adapter.py` | OpenAI ChatCompletions API. |
+| `catalog.py` | Model catalog: maps model IDs to provider metadata, capabilities, and context window sizes. |
+| `adapters/openai_adapter.py` | OpenAI Responses API (`client.responses.create()`). |
 | `adapters/gemini_adapter.py` | Google Gemini API. |
 
 ## Key Patterns
@@ -20,7 +21,7 @@ The LLM subsystem provides a provider-agnostic interface for Anthropic (Claude),
 - **Adapter lazy-loading**: `LLMClient._default_adapters()` tries to import each adapter; silently skips on `ImportError`. No hard dependency on any provider SDK.
 - **Model detection**: Each adapter's `detect_model(model_str)` checks if the model string belongs to that provider (e.g., `claude-*` → Anthropic, `gpt-*` → OpenAI).
 - **Middleware pipeline**: `before_request` applied in order, `after_response` in reverse order. Used for logging, caching, content filtering.
-- **Retry policy**: `RetryPolicy` with exponential backoff. Applied at the adapter level, transparent to callers.
+- **Retry policy**: `RetryPolicy` with exponential backoff. Applied at the **client level** (`LLMClient._complete_with_retry`), transparent to callers.
 - **Concurrent tool execution**: `generate()` dispatches multiple tool calls per round via `asyncio.gather`, feeds results back, loops up to `max_tool_rounds`.
 - **Streaming**: `stream()` returns `AsyncIterator[StreamEvent]`. `StreamCollector` can aggregate into a `Response`. `stream_generate()` is single-round only (no tool loop).
 - **Structured output**: `generate_object()` uses `response_format` with JSON schema for constrained generation.
