@@ -32,6 +32,7 @@ class QuestionType(str, enum.Enum):
 
     YES_NO = "yes_no"
     MULTIPLE_CHOICE = "multiple_choice"
+    MULTI_SELECT = "multi_select"
     FREEFORM = "freeform"
     CONFIRMATION = "confirmation"
 
@@ -65,12 +66,14 @@ class Answer:
     Attributes:
         value: The answer value — a string or AnswerValue enum member.
         selected_option: The full Option if this was a multiple-choice answer.
+        selected_options: List of selected Options for MULTI_SELECT answers.
         text: Free text response for FREEFORM questions.
         metadata: Arbitrary context about the answer.
     """
 
     value: str | AnswerValue
     selected_option: Option | None = None
+    selected_options: list[Option] = field(default_factory=list)
     text: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -82,7 +85,7 @@ class Question:
     Attributes:
         text: The question text displayed to the human.
         type: Determines the UI and valid answer format.
-        options: Available choices for MULTIPLE_CHOICE questions.
+        options: Available choices for MULTIPLE_CHOICE and MULTI_SELECT questions.
         default: Fallback answer on timeout or skip.
         timeout_seconds: Maximum wait time before timeout.
         stage: Name of the originating pipeline stage.
@@ -151,7 +154,7 @@ class CLIInterviewer:
 
         if question.type == QuestionType.MULTIPLE_CHOICE and question.options:
             self._console.print(Panel(question.text, title=title))
-            for i, opt in enumerate(question.options, 1):
+            for opt in question.options:
                 self._console.print(f"  [{opt.key}] {opt.label}")
             choice = await asyncio.to_thread(
                 Prompt.ask,
@@ -163,6 +166,29 @@ class CLIInterviewer:
                 (o for o in question.options if o.key == choice), question.options[0]
             )
             return Answer(value=selected.key, selected_option=selected)
+
+        if question.type == QuestionType.MULTI_SELECT and question.options:
+            self._console.print(Panel(question.text, title=title))
+            for opt in question.options:
+                self._console.print(f"  [{opt.key}] {opt.label}")
+            raw = await asyncio.to_thread(
+                Prompt.ask,
+                "Select options (comma-separated keys)",
+                console=self._console,
+            )
+            keys = [k.strip() for k in raw.split(",") if k.strip()]
+            valid_keys = {o.key for o in question.options}
+            selected_opts = [
+                o for o in question.options if o.key in keys and o.key in valid_keys
+            ]
+            if not selected_opts:
+                selected_opts = [question.options[0]]
+            value = ",".join(o.key for o in selected_opts)
+            return Answer(
+                value=value,
+                selected_options=selected_opts,
+                selected_option=selected_opts[0],
+            )
 
         if question.type in (QuestionType.YES_NO, QuestionType.CONFIRMATION):
             self._console.print(Panel(question.text, title=title))
@@ -229,6 +255,7 @@ class AutoApproveInterviewer:
     Behavior:
     - YES_NO / CONFIRMATION: returns YES
     - MULTIPLE_CHOICE: selects the first option
+    - MULTI_SELECT: selects the first option
     - FREEFORM: returns default if set, otherwise SKIPPED
     """
 
@@ -239,6 +266,13 @@ class AutoApproveInterviewer:
         if question.type == QuestionType.MULTIPLE_CHOICE and question.options:
             opt = question.options[0]
             return Answer(value=opt.key, selected_option=opt)
+        if question.type == QuestionType.MULTI_SELECT and question.options:
+            opt = question.options[0]
+            return Answer(
+                value=opt.key,
+                selected_option=opt,
+                selected_options=[opt],
+            )
         if question.default is not None:
             return question.default
         return Answer(value=AnswerValue.SKIPPED)

@@ -27,6 +27,7 @@ class TestQuestionAnswerTypes:
     def test_question_type_values(self) -> None:
         assert QuestionType.YES_NO == "yes_no"
         assert QuestionType.MULTIPLE_CHOICE == "multiple_choice"
+        assert QuestionType.MULTI_SELECT == "multi_select"
         assert QuestionType.FREEFORM == "freeform"
         assert QuestionType.CONFIRMATION == "confirmation"
 
@@ -74,6 +75,36 @@ class TestQuestionAnswerTypes:
     def test_answer_with_text(self) -> None:
         a = Answer(value="custom text", text="custom text")
         assert a.text == "custom text"
+
+    def test_question_with_multi_select(self) -> None:
+        opts = [
+            Option(key="A", label="Alpha"),
+            Option(key="B", label="Beta"),
+            Option(key="C", label="Charlie"),
+        ]
+        q = Question(
+            text="Select features",
+            type=QuestionType.MULTI_SELECT,
+            options=opts,
+        )
+        assert q.type == QuestionType.MULTI_SELECT
+        assert len(q.options) == 3
+
+    def test_answer_with_selected_options(self) -> None:
+        opts = [Option(key="A", label="Alpha"), Option(key="B", label="Beta")]
+        a = Answer(
+            value="A,B",
+            selected_option=opts[0],
+            selected_options=opts,
+        )
+        assert len(a.selected_options) == 2
+        assert a.selected_options[0].key == "A"
+        assert a.selected_options[1].key == "B"
+        assert a.selected_option is opts[0]
+
+    def test_answer_selected_options_default_empty(self) -> None:
+        a = Answer(value=AnswerValue.YES)
+        assert a.selected_options == []
 
     def test_option_fields(self) -> None:
         opt = Option(key="Y", label="Yes, deploy")
@@ -143,6 +174,18 @@ class TestQueueInterviewer:
         assert results[1].value == AnswerValue.SKIPPED
         assert results[2].value == AnswerValue.SKIPPED
 
+    async def test_ask_multi_select_returns_queued_answer(self) -> None:
+        qi = QueueInterviewer()
+        opts = [Option(key="A", label="Alpha"), Option(key="B", label="Beta")]
+        answer = Answer(value="A,B", selected_options=opts, selected_option=opts[0])
+        await qi.responses.put(answer)
+
+        q = Question(text="Pick features", type=QuestionType.MULTI_SELECT, options=opts)
+        result = await qi.ask(q)
+        assert result.value == "A,B"
+        assert len(result.selected_options) == 2
+        assert result.selected_option is opts[0]
+
     async def test_ask_empty_queue_does_not_block(self) -> None:
         """Verify ask() on empty queue returns immediately without blocking."""
         import asyncio
@@ -182,6 +225,19 @@ class TestAutoApproveInterviewer:
         result = await aai.ask(q)
         assert result.value == "A"
         assert result.selected_option is opts[0]
+
+    async def test_multi_select_selects_first(self) -> None:
+        aai = AutoApproveInterviewer()
+        opts = [
+            Option(key="A", label="Alpha"),
+            Option(key="B", label="Beta"),
+            Option(key="C", label="Charlie"),
+        ]
+        q = Question(text="Pick features", type=QuestionType.MULTI_SELECT, options=opts)
+        result = await aai.ask(q)
+        assert result.value == "A"
+        assert result.selected_option is opts[0]
+        assert result.selected_options == [opts[0]]
 
     async def test_freeform_returns_default(self) -> None:
         aai = AutoApproveInterviewer()
