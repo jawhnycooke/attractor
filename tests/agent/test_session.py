@@ -445,10 +445,12 @@ class TestAbort:
         """Abort during processing should skip queued follow-ups."""
         import asyncio
 
+        llm_called = asyncio.Event()
+
         class SlowClient(MockLLMClient):
             async def complete(self, request: Request) -> Response:
-                # Simulate a slow first response
-                await asyncio.sleep(0.05)
+                llm_called.set()
+                await asyncio.sleep(0.5)
                 return _text_response("first done")
 
         client = SlowClient()
@@ -464,13 +466,18 @@ class TestAbort:
 
         task = asyncio.create_task(_consume())
 
-        # Wait for first LLM call to start, then abort
-        await asyncio.sleep(0.02)
+        # Wait until the LLM call is actually in-flight, then abort.
+        # This avoids a race where a fixed sleep resolves before the
+        # task enters the loop (causing abort to fire pre-emptively
+        # and produce 0 events instead of 1).
+        await llm_called.wait()
         session.abort()
         await asyncio.wait_for(task, timeout=3.0)
 
         assert session.state == SessionState.CLOSED
-        # The follow-up's text should NOT have been processed
+        # The first call completes (already in-flight when abort was
+        # set — abort is only checked at loop checkpoints, not mid-await).
+        # The follow-up should NOT have been processed.
         text_ends = [e for e in events if e.type == AgentEventType.ASSISTANT_TEXT_END]
         assert len(text_ends) == 1
 

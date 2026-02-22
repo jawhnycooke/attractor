@@ -315,7 +315,7 @@ class GeminiAdapter:
             schema = json_schema_block.get("schema", {})
             if schema:
                 config["response_mime_type"] = "application/json"
-                config["response_schema"] = schema
+                config["response_schema"] = self._strip_unsupported_schema_keys(schema)
 
         # Reasoning effort → thinking_config
         if request.reasoning_effort and "thinking_config" not in config:
@@ -356,6 +356,31 @@ class GeminiAdapter:
             kwargs["config"] = config
 
         return kwargs
+
+    @staticmethod
+    def _strip_unsupported_schema_keys(schema: dict[str, Any]) -> dict[str, Any]:
+        """Remove JSON Schema keys not supported by the Gemini API.
+
+        Gemini rejects ``additionalProperties`` (converted to
+        ``additional_properties`` internally). This method recursively
+        strips such keys from the schema and any nested sub-schemas.
+        """
+        _UNSUPPORTED = {"additionalProperties"}
+        cleaned: dict[str, Any] = {}
+        for key, value in schema.items():
+            if key in _UNSUPPORTED:
+                continue
+            if isinstance(value, dict):
+                cleaned[key] = GeminiAdapter._strip_unsupported_schema_keys(value)
+            elif key == "properties" and isinstance(value, dict):
+                cleaned[key] = {
+                    k: GeminiAdapter._strip_unsupported_schema_keys(v)
+                    if isinstance(v, dict) else v
+                    for k, v in value.items()
+                }
+            else:
+                cleaned[key] = value
+        return cleaned
 
     @staticmethod
     def _map_tool_choice(

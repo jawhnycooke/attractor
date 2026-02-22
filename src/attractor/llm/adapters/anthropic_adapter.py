@@ -52,6 +52,20 @@ _THINKING_BUDGET = {
 }
 
 
+def _inject_additional_properties(schema: dict[str, Any]) -> None:
+    """Recursively inject ``additionalProperties: false`` into object schemas."""
+    if schema.get("type") == "object" and "additionalProperties" not in schema:
+        schema["additionalProperties"] = False
+    # Recurse into properties
+    for prop in schema.get("properties", {}).values():
+        if isinstance(prop, dict):
+            _inject_additional_properties(prop)
+    # Recurse into items (for array types)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _inject_additional_properties(items)
+
+
 def _extract_retry_after(exc: Any) -> float | None:
     """Extract Retry-After header from an SDK exception's response."""
     response = getattr(exc, "response", None)
@@ -85,6 +99,20 @@ class AnthropicAdapter:
             The string ``"anthropic"``.
         """
         return "anthropic"
+
+    @staticmethod
+    def _ensure_additional_properties(schema: dict[str, Any]) -> dict[str, Any]:
+        """Recursively set ``additionalProperties: false`` on object schemas.
+
+        Anthropic requires this field on all ``"type": "object"`` schemas
+        when using structured output. This method deep-copies and patches
+        the schema so the caller's original dict is not mutated.
+        """
+        import copy
+
+        schema = copy.deepcopy(schema)
+        _inject_additional_properties(schema)
+        return schema
 
     @staticmethod
     def _supports_adaptive_thinking(model: str) -> bool:
@@ -361,7 +389,7 @@ class AnthropicAdapter:
             output_config = kwargs.setdefault("output_config", {})
             output_config["format"] = {
                 "type": "json_schema",
-                "schema": schema,
+                "schema": self._ensure_additional_properties(schema),
             }
 
         # Auto-inject cache_control for prompt caching

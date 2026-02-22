@@ -63,9 +63,8 @@ class TestAgentSmoke:
         hello = tmp_path / "hello.py"
         assert hello.exists(), "Expected hello.py to be created"
         content = hello.read_text()
-        assert "hello" in content.lower() or "Hello" in content, (
-            "Expected file to contain a hello-related string"
-        )
+        assert "print" in content.lower(), "Expected a print statement in hello.py"
+        assert "hello" in content.lower(), "Expected 'hello' in the file content"
 
     # §9.13 step 2 — read and edit an existing file
     async def test_read_and_edit(
@@ -133,16 +132,18 @@ class TestAgentSmoke:
             if e.type == AgentEventType.TOOL_CALL_END
             and e.data.get("tool_name") == "read_file"
         ]
-        if read_ends:
-            full_output = read_ends[0].data.get("output", "")
-            truncated_output = read_ends[0].data.get("truncated_output", "")
-            # The full output should contain the file content
-            assert len(full_output) > 0, "Expected non-empty output"
-            # If truncation was applied, the LLM-facing version should be shorter
-            if truncated_output and len(full_output) > 10_000:
-                assert len(truncated_output) < len(full_output), (
-                    "Expected truncated_output to be shorter than full output"
-                )
+        assert len(read_ends) > 0, (
+            "Expected at least one read_file TOOL_CALL_END event"
+        )
+        full_output = read_ends[0].data.get("output", "")
+        truncated_output = read_ends[0].data.get("truncated_output", "")
+        assert len(full_output) > 0, "Expected non-empty output"
+        assert truncated_output, (
+            "Expected truncated_output to be present for 100KB file"
+        )
+        assert len(truncated_output) < len(full_output), (
+            "Expected truncated_output to be shorter than full output"
+        )
 
     # §9.13 step 5 — steering injection
     async def test_steering(
@@ -171,12 +172,14 @@ class TestAgentSmoke:
                 )
                 steered = True
 
-        if steered:
-            steering_events = [
-                e
-                for e in events
-                if e.type == AgentEventType.STEERING_INJECTED
-            ]
-            assert len(steering_events) > 0, (
-                "Expected STEERING_INJECTED event after calling steer()"
-            )
+        assert steered, (
+            "Expected at least one TOOL_CALL_END event to trigger steering"
+        )
+        steering_events = [
+            e
+            for e in events
+            if e.type == AgentEventType.STEERING_INJECTED
+        ]
+        assert len(steering_events) > 0, (
+            "Expected STEERING_INJECTED event after calling steer()"
+        )

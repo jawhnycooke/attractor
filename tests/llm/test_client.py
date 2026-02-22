@@ -2781,7 +2781,11 @@ class TestAnthropicAdaptiveThinking:
         # Both effort and format should coexist in output_config
         assert kwargs["output_config"]["effort"] == "high"
         assert kwargs["output_config"]["format"]["type"] == "json_schema"
-        assert kwargs["output_config"]["format"]["schema"] == schema
+        # The adapter injects additionalProperties: false for object schemas
+        result_schema = kwargs["output_config"]["format"]["schema"]
+        assert result_schema["type"] == schema["type"]
+        assert result_schema["properties"] == schema["properties"]
+        assert result_schema["additionalProperties"] is False
 
     def test_provider_thinking_override_still_wins(self) -> None:
         """Explicit provider_options.anthropic.thinking should override reasoning_effort."""

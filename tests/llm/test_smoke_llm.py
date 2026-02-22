@@ -114,6 +114,12 @@ class TestLLMSmoke:
 
         result = await llm_client.generate(prompt=[msg], model=SMOKE_MODEL)
         assert len(result.text) > 0, "Expected non-empty response for image input"
+        # The 1x1 red PNG should elicit a description mentioning color or image
+        text_lower = result.text.lower()
+        assert any(
+            word in text_lower
+            for word in ("red", "pixel", "small", "1x1", "image", "color", "single")
+        ), f"Expected image description to reference the red pixel; got: {result.text[:200]}"
 
     # §8.10 step 5 — structured output via generate_object()
     async def test_structured_output(self, llm_client: LLMClient) -> None:
@@ -136,12 +142,18 @@ class TestLLMSmoke:
 
         assert result.output is not None, "Expected parsed JSON object"
         assert isinstance(result.output, dict)
-        assert "name" in result.output
-        assert "age" in result.output
+        assert result.output.get("name") == "John", (
+            f"Expected name='John', got {result.output.get('name')!r}"
+        )
+        assert result.output.get("age") == 30, (
+            f"Expected age=30, got {result.output.get('age')!r}"
+        )
 
     # §8.10 step 6 — error handling for invalid model
     async def test_error_handling(self, llm_client: LLMClient) -> None:
-        with pytest.raises(Exception):
+        from attractor.llm.errors import SDKError
+
+        with pytest.raises(SDKError):
             await llm_client.generate(
                 prompt="Hello",
                 model="nonexistent-model-xyz",

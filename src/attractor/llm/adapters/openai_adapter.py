@@ -37,6 +37,31 @@ from attractor.llm.models import (
 logger = logging.getLogger(__name__)
 
 
+def _inject_additional_properties(schema: dict[str, Any]) -> None:
+    """Recursively inject ``additionalProperties: false`` into object schemas."""
+    if schema.get("type") == "object" and "additionalProperties" not in schema:
+        schema["additionalProperties"] = False
+    for prop in schema.get("properties", {}).values():
+        if isinstance(prop, dict):
+            _inject_additional_properties(prop)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _inject_additional_properties(items)
+
+
+def _ensure_additional_properties(schema: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy and inject ``additionalProperties: false`` on all object schemas.
+
+    OpenAI requires this field on all ``"type": "object"`` schemas when
+    ``strict: true`` is set for structured output.
+    """
+    import copy
+
+    schema = copy.deepcopy(schema)
+    _inject_additional_properties(schema)
+    return schema
+
+
 def _extract_retry_after(exc: Any) -> float | None:
     """Extract Retry-After header from an SDK exception's response."""
     response = getattr(exc, "response", None)
@@ -230,7 +255,24 @@ class OpenAIAdapter:
             kwargs["reasoning"] = {"effort": request.reasoning_effort.value}
 
         if request.response_format:
-            kwargs["text"] = {"format": request.response_format}
+            fmt = request.response_format
+            if fmt.get("type") == "json_schema":
+                # Flatten the json_schema block for the Responses API
+                json_schema_block = fmt.get("json_schema", {})
+                schema = json_schema_block.get("schema", {})
+                strict = json_schema_block.get("strict", True)
+                if strict:
+                    schema = _ensure_additional_properties(schema)
+                kwargs["text"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": json_schema_block.get("name", "response"),
+                        "schema": schema,
+                        "strict": strict,
+                    }
+                }
+            else:
+                kwargs["text"] = {"format": fmt}
 
         # Tool choice mapping
         if request.tool_choice and kwargs.get("tools"):

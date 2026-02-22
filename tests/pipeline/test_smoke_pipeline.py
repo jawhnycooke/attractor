@@ -113,12 +113,11 @@ class TestPipelineSmoke:
 
         context = await engine.run(pipeline)
 
-        # The engine should reach the terminal node successfully
-        assert context is not None, "Expected a non-None pipeline context"
         # The last node executed should be 'done' (the exit node)
         completed = context.get("_completed_nodes", [])
-        assert "done" in completed or context.get("outcome") == "success", (
-            f"Expected pipeline to reach exit; completed={completed}"
+        assert "done" in completed, (
+            f"Expected pipeline to reach terminal 'done' node; "
+            f"completed={completed}"
         )
 
     # §11.13 step 4 — verify status artifacts written per node
