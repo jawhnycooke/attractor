@@ -328,10 +328,16 @@ class GeminiAdapter:
                 or getattr(usage_meta, "thoughtsTokenCount", None)
                 or 0
             )
+            cache_read_tokens = (
+                getattr(usage_meta, "cached_content_token_count", None)
+                or getattr(usage_meta, "cachedContentTokenCount", None)
+                or 0
+            )
             usage = TokenUsage(
                 input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
                 output_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
                 reasoning_tokens=thoughts_tokens,
+                cache_read_tokens=cache_read_tokens,
             )
 
         finish = _FINISH_MAP.get(finish_str, FinishReason("stop", raw=finish_str))
@@ -341,6 +347,7 @@ class GeminiAdapter:
         return Response(
             message=Message(role=Role.ASSISTANT, content=content_parts),
             model=raw.model_version if hasattr(raw, "model_version") else "",
+            provider="gemini",
             finish_reason=finish,
             usage=usage,
             latency_ms=latency_ms,
@@ -473,10 +480,22 @@ class GeminiAdapter:
                     usage_meta = getattr(chunk, "usage_metadata", None)
                     usage = None
                     if usage_meta:
+                        thoughts_tokens = (
+                            getattr(usage_meta, "thoughts_token_count", None)
+                            or getattr(usage_meta, "thoughtsTokenCount", None)
+                            or 0
+                        )
+                        cache_read_tokens = (
+                            getattr(usage_meta, "cached_content_token_count", None)
+                            or getattr(usage_meta, "cachedContentTokenCount", None)
+                            or 0
+                        )
                         usage = TokenUsage(
                             input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
                             output_tokens=getattr(usage_meta, "candidates_token_count", 0)
                             or 0,
+                            reasoning_tokens=thoughts_tokens,
+                            cache_read_tokens=cache_read_tokens,
                         )
                     yield StreamEvent(
                         type=StreamEventType.FINISH,

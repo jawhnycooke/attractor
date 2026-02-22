@@ -1,13 +1,29 @@
 """apply_patch tool — v4a format parser for the OpenAI codex profile.
 
-Parses a unified-diff-like patch format into discrete operations
-(AddFile, DeleteFile, UpdateFile, MoveFile) and applies them to the
-filesystem via the ExecutionEnvironment.
+Parses the v4a patch format into discrete operations (AddFile, DeleteFile,
+UpdateFile with optional Move) and applies them to the filesystem via the
+ExecutionEnvironment.
+
+v4a grammar (from spec Appendix A):
+
+    patch       = "*** Begin Patch\n" operations "*** End Patch\n"
+    operations  = (add_file | delete_file | update_file)*
+    add_file    = "*** Add File: " path "\n" added_lines
+    delete_file = "*** Delete File: " path "\n"
+    update_file = "*** Update File: " path "\n" [move_line] hunks
+    move_line   = "*** Move to: " new_path "\n"
+    added_lines = ("+" line "\n")*
+    hunks       = hunk+
+    hunk        = "@@ " [context_hint] "\n" hunk_lines
+    hunk_lines  = (context_line | delete_line | add_line)+
+    context_line = " " line "\n"
+    delete_line  = "-" line "\n"
+    add_line     = "+" line "\n"
+    eof_marker   = "*** End of File\n"
 """
 
 from __future__ import annotations
 
-import re
 import shlex
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -33,6 +49,7 @@ class OpKind(Enum):
 class Hunk:
     """A single hunk within an UpdateFile operation."""
 
+    context_hint: str | None = None
     context_before: list[str] = field(default_factory=list)
     removals: list[str] = field(default_factory=list)
     additions: list[str] = field(default_factory=list)
@@ -51,98 +68,105 @@ class PatchOp:
 
 
 # ---------------------------------------------------------------------------
-# Parser
+# v4a Parser
 # ---------------------------------------------------------------------------
 
-_FILE_HEADER_RE = re.compile(
-    r"^---\s+(?:a/)?(.*?)\s*$|"
-    r"^\+\+\+\s+(?:b/)?(.*?)\s*$|"
-    r"^diff\s+--git\s+a/(.*?)\s+b/(.*?)\s*$"
-)
-_HUNK_HEADER_RE = re.compile(r"^@@\s.*?@@")
+_BEGIN_PATCH = "*** Begin Patch"
+_END_PATCH = "*** End Patch"
+_ADD_FILE = "*** Add File: "
+_DELETE_FILE = "*** Delete File: "
+_UPDATE_FILE = "*** Update File: "
+_MOVE_TO = "*** Move to: "
+_HUNK_MARKER = "@@ "
+_EOF_MARKER = "*** End of File"
 
 
 def parse_patch(text: str) -> list[PatchOp]:
-    """Parse v4a-style patch text into a list of PatchOp."""
+    """Parse v4a-format patch text into a list of PatchOp."""
     ops: list[PatchOp] = []
-    lines = text.splitlines(keepends=True)
+    lines = text.splitlines()
     i = 0
 
+    # Advance past optional leading whitespace / the Begin Patch marker
     while i < len(lines):
-        line = lines[i].rstrip("\n\r")
-
-        # --- new file ---
-        if line.startswith("--- /dev/null"):
+        stripped = lines[i].strip()
+        if stripped == _BEGIN_PATCH:
             i += 1
-            if i < len(lines) and lines[i].rstrip("\n\r").startswith("+++ "):
-                path = lines[i].rstrip("\n\r").split("+++ ", 1)[1]
-                path = re.sub(r"^b/", "", path).strip()
+            break
+        if stripped.startswith("*** ") or stripped.startswith("@@ "):
+            # No explicit Begin Patch but looks like v4a content
+            break
+        i += 1
+
+    while i < len(lines):
+        line = lines[i].rstrip()
+
+        if line.strip() == _END_PATCH:
+            break
+
+        # --- Add File ---
+        if line.startswith(_ADD_FILE):
+            path = line[len(_ADD_FILE) :].strip()
+            i += 1
+            content_lines: list[str] = []
+            while i < len(lines):
+                raw = lines[i].rstrip()
+                if raw.startswith("*** ") or raw.strip() == _END_PATCH:
+                    break
+                if raw.startswith("+"):
+                    content_lines.append(raw[1:])
                 i += 1
-                # skip hunk header
-                if i < len(lines) and _HUNK_HEADER_RE.match(lines[i].rstrip("\n\r")):
-                    i += 1
-                content_lines: list[str] = []
-                while i < len(lines):
-                    raw_line = lines[i].rstrip("\n\r")
-                    if raw_line.startswith("diff ") or raw_line.startswith("--- "):
-                        break
-                    if raw_line.startswith("+"):
-                        content_lines.append(raw_line[1:])
-                    i += 1
-                ops.append(
-                    PatchOp(
-                        kind=OpKind.ADD_FILE,
-                        path=path,
-                        content="\n".join(content_lines)
-                        + ("\n" if content_lines else ""),
-                    )
+            ops.append(
+                PatchOp(
+                    kind=OpKind.ADD_FILE,
+                    path=path,
+                    content="\n".join(content_lines)
+                    + ("\n" if content_lines else ""),
                 )
+            )
             continue
 
-        # --- delete file ---
-        if line.startswith("+++ /dev/null"):
-            # previous line should have been --- a/path
-            if ops or (i > 0 and lines[i - 1].rstrip("\n\r").startswith("--- ")):
-                prev = lines[i - 1].rstrip("\n\r")
-                path = re.sub(r"^---\s+a/", "", prev).strip()
-                ops.append(PatchOp(kind=OpKind.DELETE_FILE, path=path))
+        # --- Delete File ---
+        if line.startswith(_DELETE_FILE):
+            path = line[len(_DELETE_FILE) :].strip()
             i += 1
-            # skip remaining hunk lines for the delete
-            while i < len(lines):
-                raw_line = lines[i].rstrip("\n\r")
-                if raw_line.startswith("diff ") or raw_line.startswith("--- "):
-                    break
+            ops.append(PatchOp(kind=OpKind.DELETE_FILE, path=path))
+            continue
+
+        # --- Update File (possibly with Move) ---
+        if line.startswith(_UPDATE_FILE):
+            path = line[len(_UPDATE_FILE) :].strip()
+            i += 1
+            new_path: str | None = None
+
+            # Check for optional Move line
+            if i < len(lines) and lines[i].rstrip().startswith(_MOVE_TO):
+                new_path = lines[i].rstrip()[len(_MOVE_TO) :].strip()
                 i += 1
-            continue
 
-        # --- diff header for update/move ---
-        diff_match = re.match(r"^diff\s+--git\s+a/(.*?)\s+b/(.*?)\s*$", line)
-        if diff_match:
-            old_path = diff_match.group(1)
-            new_path = diff_match.group(2)
-            i += 1
-
-            # skip --- and +++ lines
-            while i < len(lines):
-                raw_line = lines[i].rstrip("\n\r")
-                if raw_line.startswith("--- ") or raw_line.startswith("+++ "):
-                    i += 1
-                else:
-                    break
-
-            # parse hunks
+            # Parse hunks
             hunks: list[Hunk] = []
             while i < len(lines):
-                raw_line = lines[i].rstrip("\n\r")
-                if raw_line.startswith("diff "):
+                raw = lines[i].rstrip()
+                if raw.startswith("*** ") and not raw.startswith(_EOF_MARKER):
                     break
-                if _HUNK_HEADER_RE.match(raw_line):
+                if raw.strip() == _END_PATCH:
+                    break
+                if raw.startswith(_HUNK_MARKER):
+                    hint_text = raw[len(_HUNK_MARKER) :].strip() or None
                     i += 1
-                    hunk = Hunk()
+                    hunk = Hunk(context_hint=hint_text)
                     in_changes = False
                     while i < len(lines):
-                        hl = lines[i].rstrip("\n\r")
-                        if hl.startswith("diff ") or _HUNK_HEADER_RE.match(hl):
+                        hl = lines[i].rstrip()
+                        if (
+                            hl.startswith(_HUNK_MARKER)
+                            or (hl.startswith("*** ") and not hl.startswith(_EOF_MARKER))
+                            or hl.strip() == _END_PATCH
+                        ):
+                            break
+                        if hl.startswith(_EOF_MARKER):
+                            i += 1
                             break
                         if hl.startswith("-"):
                             hunk.removals.append(hl[1:])
@@ -150,21 +174,27 @@ def parse_patch(text: str) -> list[PatchOp]:
                         elif hl.startswith("+"):
                             hunk.additions.append(hl[1:])
                             in_changes = True
-                        elif hl.startswith(" "):
+                        elif hl.startswith(" ") or hl == "":
+                            # Space-prefixed = context line; empty = empty context
+                            ctx_line = hl[1:] if hl.startswith(" ") else ""
                             if in_changes:
-                                hunk.context_after.append(hl[1:])
+                                hunk.context_after.append(ctx_line)
                             else:
-                                hunk.context_before.append(hl[1:])
+                                hunk.context_before.append(ctx_line)
+                        else:
+                            # Unknown prefix — skip
+                            i += 1
+                            continue
                         i += 1
                     hunks.append(hunk)
                 else:
                     i += 1
 
-            if old_path != new_path:
+            if new_path:
                 ops.append(
                     PatchOp(
                         kind=OpKind.MOVE_FILE,
-                        path=old_path,
+                        path=path,
                         new_path=new_path,
                         hunks=hunks,
                     )
@@ -173,7 +203,7 @@ def parse_patch(text: str) -> list[PatchOp]:
                 ops.append(
                     PatchOp(
                         kind=OpKind.UPDATE_FILE,
-                        path=old_path,
+                        path=path,
                         hunks=hunks,
                     )
                 )
@@ -189,19 +219,57 @@ def parse_patch(text: str) -> list[PatchOp]:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_whitespace(s: str) -> str:
+    """Collapse all whitespace runs to a single space and strip."""
+    return " ".join(s.split())
+
+
 def _find_hunk_location(file_lines: list[str], hunk: Hunk) -> int | None:
     """Find where a hunk's context lines match in the file.
 
-    Returns the index of the first line of the context_before match,
-    or the first line of the removals if no context_before.
+    Uses context_before + removals as the search pattern. If exact match
+    fails, tries fuzzy matching via whitespace normalization.
+
+    Returns the index of the first line of the match, or None if not found.
     """
     search_lines = hunk.context_before + hunk.removals
     if not search_lines:
         return 0
 
+    # --- Exact match ---
     for i in range(len(file_lines)):
         if file_lines[i : i + len(search_lines)] == search_lines:
             return i
+
+    # --- Fuzzy match: whitespace normalization ---
+    normalized_search = [_normalize_whitespace(s) for s in search_lines]
+    for i in range(len(file_lines)):
+        candidate = [_normalize_whitespace(fl) for fl in file_lines[i : i + len(search_lines)]]
+        if candidate == normalized_search:
+            return i
+
+    # --- Context hint match: use hint to narrow search area ---
+    if hunk.context_hint:
+        hint_norm = _normalize_whitespace(hunk.context_hint)
+        for i in range(len(file_lines)):
+            if _normalize_whitespace(file_lines[i]) == hint_norm:
+                # Found hint line — try matching removals starting near here
+                if hunk.removals:
+                    norm_removals = [_normalize_whitespace(r) for r in hunk.removals]
+                    # Search forward from hint location
+                    for j in range(i, min(i + 20, len(file_lines))):
+                        candidate = [
+                            _normalize_whitespace(fl)
+                            for fl in file_lines[j : j + len(hunk.removals)]
+                        ]
+                        if candidate == norm_removals:
+                            # Adjust for context_before
+                            start = j - len(hunk.context_before)
+                            return max(0, start)
+                elif hunk.additions:
+                    # Pure addition — insert after context_before near hint
+                    return i
+
     return None
 
 
@@ -231,8 +299,7 @@ async def apply_ops(ops: list[PatchOp], environment: ExecutionEnvironment) -> li
                 await environment.write_file(op.path, op.content or "")
 
             elif op.kind == OpKind.DELETE_FILE:
-                # Write empty to effectively "delete" — real delete would need
-                # an env method; for now we clear it.
+                # Use rm to delete the file
                 result = await environment.exec_command(f"rm -f {shlex.quote(op.path)}")
                 if result.exit_code != 0:
                     errors.append(f"Failed to delete {op.path}: {result.stderr}")
@@ -315,13 +382,23 @@ async def apply_patch(
 
 APPLY_PATCH_DEF = ToolDefinition(
     name="apply_patch",
-    description=("Apply a v4a-format patch to create, modify, delete, or move files."),
+    description=(
+        "Apply a v4a-format patch to create, modify, delete, or move files. "
+        "The patch must be wrapped in '*** Begin Patch' / '*** End Patch' markers. "
+        "Supported operations: '*** Add File: <path>' (all lines prefixed with +), "
+        "'*** Delete File: <path>', '*** Update File: <path>' with @@ hunks "
+        "(space=context, -=remove, +=add), and optional '*** Move to: <path>' "
+        "for renames. Show ~3 lines of context around each change."
+    ),
     parameters={
         "type": "object",
         "properties": {
             "patch": {
                 "type": "string",
-                "description": "The patch text in v4a unified diff format.",
+                "description": (
+                    "The patch text in v4a format. Must start with "
+                    "'*** Begin Patch' and end with '*** End Patch'."
+                ),
             },
         },
         "required": ["patch"],

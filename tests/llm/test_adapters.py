@@ -24,6 +24,11 @@ from attractor.llm.models import (
 # ---------------------------------------------------------------
 
 
+async def _async_return(value):
+    """Wrap a value in an awaitable for mocking async SDK calls."""
+    return value
+
+
 def _simple_request(**overrides: object) -> Request:
     """Build a minimal Request with optional overrides."""
     defaults = {
@@ -261,6 +266,36 @@ class TestOpenAIProviderOptions:
         assert "extra_headers" not in kwargs
 
 
+class TestOpenAIProviderField:
+    """L-F03: Verify Response.provider is populated by the OpenAI adapter."""
+
+    def _mock_response(self):
+        text_content = MagicMock()
+        text_content.type = "output_text"
+        text_content.text = "hello"
+
+        message_item = MagicMock()
+        message_item.type = "message"
+        message_item.content = [text_content]
+
+        raw = MagicMock()
+        raw.output = [message_item]
+        raw.model = "gpt-4o"
+        raw.id = "resp_123"
+        raw.status = "completed"
+        raw.usage.input_tokens = 10
+        raw.usage.output_tokens = 5
+        raw.usage.output_tokens_details = None
+        raw.usage.input_tokens_details = None
+        return raw
+
+    def test_provider_is_openai(self) -> None:
+        adapter = _make_openai_adapter()
+        raw = self._mock_response()
+        response = adapter._map_response(raw, latency_ms=50.0)
+        assert response.provider == "openai"
+
+
 class TestOpenAIReasoningTokens:
     """Verify existing reasoning token extraction in _map_response."""
 
@@ -387,6 +422,31 @@ class TestGeminiProviderOptions:
         assert "cached_content" not in kwargs
 
 
+class TestGeminiProviderField:
+    """L-F03: Verify Response.provider is populated by the Gemini adapter."""
+
+    def _mock_response(self):
+        text_part = MagicMock()
+        text_part.function_call = None
+        text_part.text = "hello"
+
+        candidate = MagicMock()
+        candidate.finish_reason = "STOP"
+        candidate.content.parts = [text_part]
+
+        raw = MagicMock()
+        raw.candidates = [candidate]
+        raw.model_version = "gemini-2.0-flash"
+        raw.usage_metadata = None
+        return raw
+
+    def test_provider_is_gemini(self) -> None:
+        adapter = _make_gemini_adapter()
+        raw = self._mock_response()
+        response = adapter._map_response(raw, latency_ms=50.0)
+        assert response.provider == "gemini"
+
+
 class TestGeminiReasoningTokens:
     """Verify _map_response extracts reasoning tokens from usage_metadata."""
 
@@ -411,6 +471,8 @@ class TestGeminiReasoningTokens:
             usage_meta.thoughts_token_count = thoughts_token_count
             # Ensure camelCase fallback isn't hit when snake_case is present
             usage_meta.thoughtsTokenCount = None
+            usage_meta.cached_content_token_count = None
+            usage_meta.cachedContentTokenCount = None
             raw.usage_metadata = usage_meta
         else:
             raw.usage_metadata = None
@@ -445,6 +507,137 @@ class TestGeminiReasoningTokens:
         response = adapter._map_response(raw, latency_ms=50.0)
         assert response.usage.input_tokens == 100
         assert response.usage.output_tokens == 50
+
+
+class TestGeminiCacheReadTokens:
+    """L-F01: Verify cache_read_tokens mapped from cachedContentTokenCount."""
+
+    def _mock_response(self, cached_tokens: int = 0):
+        text_part = MagicMock()
+        text_part.function_call = None
+        text_part.text = "response"
+
+        candidate = MagicMock()
+        candidate.finish_reason = "STOP"
+        candidate.content.parts = [text_part]
+
+        raw = MagicMock()
+        raw.candidates = [candidate]
+        raw.model_version = "gemini-2.0-flash"
+
+        usage_meta = MagicMock()
+        usage_meta.prompt_token_count = 100
+        usage_meta.candidates_token_count = 50
+        usage_meta.thoughts_token_count = None
+        usage_meta.thoughtsTokenCount = None
+        usage_meta.cached_content_token_count = cached_tokens if cached_tokens else None
+        usage_meta.cachedContentTokenCount = None
+        raw.usage_metadata = usage_meta
+        return raw
+
+    def test_cache_read_tokens_mapped(self) -> None:
+        adapter = _make_gemini_adapter()
+        raw = self._mock_response(cached_tokens=500)
+        response = adapter._map_response(raw, latency_ms=40.0)
+        assert response.usage.cache_read_tokens == 500
+
+    def test_no_cached_tokens_yields_zero(self) -> None:
+        adapter = _make_gemini_adapter()
+        raw = self._mock_response(cached_tokens=0)
+        response = adapter._map_response(raw, latency_ms=40.0)
+        assert response.usage.cache_read_tokens == 0
+
+    def test_camel_case_fallback_for_cache(self) -> None:
+        adapter = _make_gemini_adapter()
+        raw = self._mock_response(cached_tokens=0)
+        raw.usage_metadata.cached_content_token_count = None
+        raw.usage_metadata.cachedContentTokenCount = 300
+        response = adapter._map_response(raw, latency_ms=40.0)
+        assert response.usage.cache_read_tokens == 300
+
+
+class TestGeminiStreamingTokens:
+    """L-F02: Verify streaming path captures reasoning_tokens and cache_read_tokens."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_reasoning_tokens(self) -> None:
+        adapter = _make_gemini_adapter()
+
+        # Build mock streaming chunks
+        text_part = MagicMock()
+        text_part.function_call = None
+        text_part.text = "streamed text"
+
+        candidate = MagicMock()
+        candidate.finish_reason = "STOP"
+        candidate.content.parts = [text_part]
+
+        chunk = MagicMock()
+        chunk.candidates = [candidate]
+
+        usage_meta = MagicMock()
+        usage_meta.prompt_token_count = 80
+        usage_meta.candidates_token_count = 30
+        usage_meta.thoughts_token_count = 120
+        usage_meta.thoughtsTokenCount = None
+        usage_meta.cached_content_token_count = 200
+        usage_meta.cachedContentTokenCount = None
+        chunk.usage_metadata = usage_meta
+
+        # Mock the async stream
+        async def mock_stream():
+            yield chunk
+
+        adapter._client.aio.models.generate_content_stream = (
+            lambda **kw: _async_return(mock_stream())
+        )
+
+        request = _simple_request(model="gemini-2.0-flash")
+        events = []
+        async for event in adapter.stream(request):
+            events.append(event)
+
+        # Find the FINISH event
+        finish_events = [e for e in events if e.type.value == "finish"]
+        assert len(finish_events) == 1
+        usage = finish_events[0].usage
+        assert usage is not None
+        assert usage.reasoning_tokens == 120
+        assert usage.cache_read_tokens == 200
+        assert usage.input_tokens == 80
+        assert usage.output_tokens == 30
+
+    @pytest.mark.asyncio
+    async def test_streaming_no_usage_metadata(self) -> None:
+        adapter = _make_gemini_adapter()
+
+        text_part = MagicMock()
+        text_part.function_call = None
+        text_part.text = "text"
+
+        candidate = MagicMock()
+        candidate.finish_reason = "STOP"
+        candidate.content.parts = [text_part]
+
+        chunk = MagicMock()
+        chunk.candidates = [candidate]
+        chunk.usage_metadata = None
+
+        async def mock_stream():
+            yield chunk
+
+        adapter._client.aio.models.generate_content_stream = (
+            lambda **kw: _async_return(mock_stream())
+        )
+
+        request = _simple_request(model="gemini-2.0-flash")
+        events = []
+        async for event in adapter.stream(request):
+            events.append(event)
+
+        finish_events = [e for e in events if e.type.value == "finish"]
+        assert len(finish_events) == 1
+        assert finish_events[0].usage is None
 
 
 class TestGeminiSystemInstruction:
