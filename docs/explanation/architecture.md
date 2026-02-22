@@ -10,13 +10,13 @@
 
 Attractor is a non-interactive coding agent designed for use in software factories — automated environments where code is generated, tested, reviewed, and deployed without human intervention on every step. The name "attractor" comes from dynamical systems theory: a basin of attraction is a region toward which a system naturally evolves. Attractor pipelines are designed to pull a codebase toward a desired state through repeated, directed LLM-driven transformations.
 
-```
-DOT File (workflow definition)
-  └─ PipelineEngine (orchestrates the workflow)
-       └─ NodeHandlers (what each step does)
-            └─ agent.Session (autonomous LLM-driven execution)
-                 └─ LLMClient (routes to the right provider)
-                      └─ Provider Adapter (Anthropic / OpenAI / Gemini)
+```mermaid
+graph TD
+    DOT["DOT File<br/>workflow definition"] --> Engine["PipelineEngine<br/>orchestrates the workflow"]
+    Engine --> Handlers["NodeHandlers<br/>what each step does"]
+    Handlers --> Session["agent.Session<br/>autonomous LLM-driven execution"]
+    Session --> Client["LLMClient<br/>routes to the right provider"]
+    Client --> Adapter["Provider Adapter<br/>Anthropic / OpenAI / Gemini"]
 ```
 
 This is a composition of three concerns kept deliberately separate: the shape of the workflow (pipeline), the act of autonomous coding (agent), and the mechanics of talking to language models (LLM). Each layer knows about the layer below it and nothing about the layer above. This directionality keeps each layer independently testable and replaceable.
@@ -71,11 +71,14 @@ The tradeoff is that DOT is not a standard configuration format and is unfamilia
 
 Attractor separates its concerns into three layers with a strict dependency direction:
 
-```
-pipeline/  ──knows about──>  agent/  ──knows about──>  llm/  ──knows about──>  Provider SDKs
+```mermaid
+graph LR
+    Pipeline["pipeline/"] -->|"knows about"| Agent["agent/"]
+    Agent -->|"knows about"| LLM["llm/"]
+    LLM -->|"knows about"| SDKs["Provider SDKs"]
 
-pipeline/  does NOT know about  llm/
-agent/     does NOT know about  pipeline/
+    Pipeline -.-x LLM
+    Agent -.-x Pipeline
 ```
 
 **Mental Model**: Think of the layers like a restaurant. The `llm/` layer is the kitchen — it produces responses when given requests. The `agent/` layer is the waiter — it takes a customer's goal, places orders with the kitchen, collects results, and keeps the conversation going until the customer is satisfied. The `pipeline/` layer is the restaurant manager — it decides which tables (nodes) get served in which order, and ensures the customer journey (workflow) completes according to the reservation (DOT file).
@@ -116,13 +119,13 @@ The `PipelineEngine` walks the pipeline graph sequentially, one node at a time, 
 
 ```mermaid
 graph TD
-    Start(["Start"]) --> Style["Apply stylesheet\nto current node"]
-    Style --> Dispatch["Dispatch to handler\n→ NodeResult"]
-    Dispatch --> Merge["Merge context_updates\ninto PipelineContext"]
+    Start(["Start"]) --> Style["Apply stylesheet<br/>to current node"]
+    Style --> Dispatch["Dispatch to handler<br/>→ NodeResult"]
+    Dispatch --> Merge["Merge context_updates<br/>into PipelineContext"]
     Merge --> Checkpoint["Save checkpoint"]
-    Checkpoint --> Evaluate["Evaluate outgoing edges\n→ pick next_node"]
+    Checkpoint --> Evaluate["Evaluate outgoing edges<br/>→ pick next_node"]
     Evaluate -->|"next_node exists"| Style
-    Evaluate -->|"terminal node\nor no match"| Stop(["Stop"])
+    Evaluate -->|"terminal node<br/>or no match"| Stop(["Stop"])
 ```
 
 **Why single-threaded?** Because the pipeline's value is its predictability. Parallel execution of pipeline nodes would create race conditions on the shared `PipelineContext`, complicate checkpointing (which snapshot do you save?), and make debugging much harder. The tool-level parallelism that matters — the concurrent execution of multiple tool calls within a single agent invocation — happens inside the agent layer, where the scope is well-defined.
@@ -135,9 +138,9 @@ After each node completes, the engine evaluates outgoing edges to determine the 
 
 ```mermaid
 graph LR
-    Review["review"] -->|"weight=2\ntests_passed = true"| Done["done"]
-    Review -->|"weight=1\ntests_passed = false"| Fix["fix"]
-    Review -.->|"unconditional\nfallback"| Done
+    Review["review"] -->|"weight=2<br/>tests_passed = true"| Done["done"]
+    Review -->|"weight=1<br/>tests_passed = false"| Fix["fix"]
+    Review -.->|"unconditional<br/>fallback"| Done
 ```
 
 A handler can bypass this mechanism entirely by returning a `NodeResult` with `next_node` set. This allows handlers that understand the workflow shape (like `ConditionalHandler`) to perform their own routing logic before the engine's edge evaluation runs.
@@ -210,9 +213,9 @@ With stylesheets, the DOT file describes the workflow's intent, and the styleshe
 
 ```mermaid
 graph LR
-    DOT["DOT file\ngenerate_fix\ntype=codergen\nprompt='Fix the bug'"]
-    Sheet["Stylesheet rule\n.codergen →\nmodel=claude-3-5-sonnet\ntemperature=0.2"]
-    Result["Resolved node\nmodel + temperature applied\nwithout DOT mentioning them"]
+    DOT["DOT file<br/>generate_fix<br/>type=codergen<br/>prompt='Fix the bug'"]
+    Sheet["Stylesheet rule<br/>.codergen →<br/>model=claude-3-5-sonnet<br/>temperature=0.2"]
+    Result["Resolved node<br/>model + temperature applied<br/>without DOT mentioning them"]
 
     DOT --> Result
     Sheet --> Result
@@ -230,15 +233,15 @@ The core mechanism of the agent layer is a loop that repeats until the LLM produ
 
 ```mermaid
 graph TD
-    A["1. Append user message\nto conversation history"] --> B["2. Build Request\nhistory + system prompt + tool definitions"]
+    A["1. Append user message<br/>to conversation history"] --> B["2. Build Request<br/>history + system prompt + tool definitions"]
     B --> C["3. Call LLM → Response"]
-    C --> D["4. Append assistant message\nto history"]
+    C --> D["4. Append assistant message<br/>to history"]
     D --> E{"Has tool calls?"}
-    E -->|"Yes"| F["5a. Execute tool calls\n(possibly concurrently)"]
-    F --> G["5b. Append tool results\nto history"]
-    G --> H["5c. Check for\nloop patterns"]
+    E -->|"Yes"| F["5a. Execute tool calls<br/>concurrently"]
+    F --> G["5b. Append tool results<br/>to history"]
+    G --> H["5c. Check for<br/>loop patterns"]
     H --> B
-    E -->|"No (text-only)"| I["6. Emit final text, return"]
+    E -->|"No, text-only"| I["6. Emit final text, return"]
 ```
 
 Each iteration of this loop is called a "turn." The conversation history grows with each turn — user input, assistant response, tool calls, tool results, the next assistant response, and so on. The model sees the entire conversation on every LLM call, which is how it accumulates knowledge about the work it has done.
@@ -277,7 +280,7 @@ graph LR
     subgraph "Call sequence"
         A1["A"] --> B1["B"] --> C1["C"] --> A2["A"] --> B2["B"] --> C2["C"] --> A3["A"] --> B3["B"] --> C3["C"]
     end
-    C3 --> D["LOOP DETECTED\nPattern length: 3\nRepetitions: 3"]
+    C3 --> D["LOOP DETECTED<br/>Pattern length: 3<br/>Repetitions: 3"]
 
     style D fill:#f66,color:#fff
 ```
@@ -352,9 +355,9 @@ Model detection is string-based and prefix-driven:
 
 ```mermaid
 graph LR
-    Claude["claude-3-5-sonnet-20241022"] --> Anthropic["AnthropicAdapter\ndetect_model → True"]
-    GPT["gpt-4o"] --> OpenAI["OpenAIAdapter\ndetect_model → True"]
-    Gemini["gemini-1.5-pro"] --> Google["GeminiAdapter\ndetect_model → True"]
+    Claude["claude-3-5-sonnet-20241022"] --> Anthropic["AnthropicAdapter<br/>detect_model → True"]
+    GPT["gpt-4o"] --> OpenAI["OpenAIAdapter<br/>detect_model → True"]
+    Gemini["gemini-1.5-pro"] --> Google["GeminiAdapter<br/>detect_model → True"]
 ```
 
 The `LLMClient` iterates through registered adapters in order, returning the first one that claims the model. This means adapters are ordered (OpenAI, then Anthropic, then Gemini in the default list), and that order matters for ambiguous model strings — though in practice, current model naming conventions are unambiguous.

@@ -6,11 +6,11 @@
 Attractor is a non-interactive coding agent for software factories. It orchestrates LLM-driven workflows defined as GraphViz DOT pipelines, executing them through an autonomous agent with tool-use capabilities.
 
 **Architecture**:
-```
-CLI (click)
- └─ pipeline/ ── Parses DOT → validates → executes node graph
-      └─ agent/ ── CodergenHandler invokes Session for LLM-driven coding
-           └─ llm/ ── Routes requests to provider adapters (Anthropic, OpenAI, Gemini)
+```mermaid
+graph TD
+    CLI["CLI (click)"] --> Pipeline["pipeline/<br/>Parses DOT → validates → executes node graph"]
+    Pipeline --> Agent["agent/<br/>CodergenHandler invokes Session for LLM-driven coding"]
+    Agent --> LLM["llm/<br/>Routes requests to provider adapters<br/>Anthropic, OpenAI, Gemini"]
 ```
 
 ---
@@ -1157,9 +1157,13 @@ class Session:
 | `AWAITING_INPUT` | Reserved for future human-in-the-loop use. |
 | `CLOSED` | Session ended via `abort()` or `shutdown()`. |
 
-```
-IDLE ──submit()──> PROCESSING ──loop complete──> IDLE
-                              ──abort()──────> CLOSED
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> PROCESSING : submit()
+    PROCESSING --> IDLE : loop complete
+    IDLE --> CLOSED : abort()
+    PROCESSING --> CLOSED : abort()
 ```
 
 **Methods**:
